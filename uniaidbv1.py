@@ -26,7 +26,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 Base = declarative_base()
 
-# --- ORM MODELS ---
+# --- ORM MODELS (Assuming your schema matches) ---
 class Bot(Base):
     __tablename__ = 'bots'
     id = Column(Integer, primary_key=True)
@@ -167,7 +167,6 @@ def save_message(session_id: int, sender_type: str, message: str, meta: Optional
         app.logger.error(f"Error saving message: {e}")
 
 def build_context_messages(session: Session, new_user_input: str) -> List[Dict[str, str]]:
-    # Build the last 10 messages for context
     msgs = db_session.query(Message).filter(Message.session_id == session.id).order_by(Message.created_at.desc()).limit(9).all()
     msgs = list(reversed(msgs))
     history = []
@@ -182,7 +181,7 @@ def call_claude_api(messages: List[Dict[str, str]]) -> str:
         model=CLAUDE_MODEL,
         system="You are an expert sales and service assistant for Ventopia. Respond in the user's language, be polite, and follow the workflow.",
         messages=messages,
-        max_tokens=1024
+        max_tokens=8192
     )
     reply = ''.join(getattr(p, 'text', str(p)) for p in response.content).strip()
     app.logger.debug(f"Claude reply: {reply[:120]}")
@@ -202,7 +201,7 @@ def call_openai_vision(media_url: str) -> str:
                     {"type": "image_url", "image_url": {"url": media_url}}
                 ]}
             ],
-            max_tokens=512
+            max_tokens=8192
         )
         interpretation = result.choices[0].message.content
         app.logger.info(f"OpenAI Vision interpretation: {interpretation[:120]}")
@@ -271,8 +270,45 @@ def webhook():
 
         # Save every incoming user message
         save_message(
-                session.id,
-                'user',
-                msg_text if msg_text else '[media]',
-                {"from": from_number, "type": msg_type, "media_url": media_url}
+            session.id,
+            'user',
+            msg_text if msg_text else '[media]',
+            {"from": from_number, "type": msg_type, "media_url": media_url}
         )
+
+        # ---- ALWAYS REPLY (text, image, video) ----
+        if msg_type == 'text' and msg_text:
+            app.logger.info("Processing text message with Claude...")
+            claude_input = build_context_messages(session, msg_text)
+            reply = call_claude_api(claude_input)
+            send_reply_with_delay(customer.phone_number, reply, device_id)
+            save_message(session.id, 'ai', reply, {"from": "claude"})
+            return jsonify({'status': 'reply_sent'})
+
+        elif msg_type in ['image', 'video'] and media_url:
+            app.logger.info(f"Processing media message with OpenAI Vision: {msg_type}")
+            interpretation = call_openai_vision(media_url)
+            prompt = f"User sent a {msg_type}. Interpretation: {interpretation}"
+            claude_input = build_context_messages(session, prompt)
+            reply = call_claude_api(claude_input)
+            send_reply_with_delay(customer.phone_number, reply, device_id)
+            save_message(session.id, 'ai', reply, {"from": "claude", "media_interpretation": interpretation})
+            return jsonify({'status': 'media_reply_sent'})
+
+        else:
+            app.logger.warning("Unsupported or empty message received.")
+            send_reply_with_delay(customer.phone_number, "Sorry, I didn't understand your message.", device_id)
+            return jsonify({'status': 'unsupported'})
+
+    except Exception as e:
+        app.logger.error(f"Exception in webhook: {e}", exc_info=True)
+        return jsonify({'status': 'error', 'detail': str(e)}), 500
+
+@app.route('/health', methods=['GET'])
+def health():
+    app.logger.debug("Health endpoint called.")
+    return "OK", 200
+
+if __name__ == '__main__':
+    port = int(os.getenv("PORT", 5000))
+    app.run(host='0.0.0.0', port=port, debug=True)
