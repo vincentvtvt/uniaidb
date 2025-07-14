@@ -1,5 +1,6 @@
 Flask
 SQLAlchemy
 psycopg2-binary
-requests
 anthropic
+openai
+requests
