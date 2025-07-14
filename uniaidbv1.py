@@ -276,4 +276,3 @@ def webhook():
                 msg_text if msg_text else '[media]',
                 {"from": from_number, "type": msg_type, "media_url": media_url}
         )
-
