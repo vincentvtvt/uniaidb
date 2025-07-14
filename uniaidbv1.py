@@ -270,4 +270,10 @@ def webhook():
         media_url = message_data.get('media_url')  # Confirm the actual media field from your payload!
 
         # Save every incoming user message
-        save_message(session.id, 'user', msg_text if msg_text else '[media]', {"from": from_number, "type": msg_type, "med_
+        save_message(
+                session.id,
+                'user',
+                msg_text if msg_text else '[media]',
+                {"from": from_number, "type": msg_type, "media_url": media_url}
+        )
+
