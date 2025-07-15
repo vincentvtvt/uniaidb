@@ -243,7 +243,8 @@ def webhook():
         response = client.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=800,
-            messages=[{"role": "system", "content": system_prompt}] + history
+            system=system_prompt,
+            messages=history
         )
         ai_reply = response.content[0].text if isinstance(response.content, list) else response.content
         logger.info(f"Claude AI reply: {ai_reply}")
