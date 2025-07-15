@@ -79,6 +79,31 @@ async def call_tool_action(tool, message, extra=None):
         return "Tool not supported."
 
 # --- WhatsApp sending helper (edit as needed for your actual API) ---
+# 1. Get which tool to use
+tool_chosen = manager_decision.get("TOOLS")
+if tool_chosen == "Default":
+    default_tool = get_default_tool(tools)
+    if not default_tool:
+        ai_reply = "No default tool found for this bot."
+    else:
+        ai_reply = await call_tool_action(default_tool, user_message)
+elif tool_chosen in tool_map:
+    ai_reply = await call_tool_action(tool_map[tool_chosen], user_message)
+else:
+    tool_by_id = get_tool_by_id(tools, tool_chosen)
+    if tool_by_id:
+        ai_reply = await call_tool_action(tool_by_id, user_message)
+    else:
+        ai_reply = f"Tool '{tool_chosen}' not found for this bot."
+
+# 2. Build WhatsApp payload with the *AI reply*, not the manager_decision
+whatsapp_payload = {
+    "phone": phone,
+    "message": ai_reply,  # This is the actual reply to send to customer!
+    "device": device_id
+}
+
+
 async def send_whatsapp_message(phone, message, device):
     # Replace this with your actual API call (e.g., Wassenger, UltraMsg, etc.)
     # Here we just log for demo.
