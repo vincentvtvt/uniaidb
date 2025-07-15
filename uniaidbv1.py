@@ -2,36 +2,74 @@ import os
 import json
 import logging
 import asyncpg
-from fastapi import FastAPI
+import httpx
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import httpx  # For WhatsApp payload sending demo
+from typing import Optional, List
 
-# --- Config ---
-DB_URL = os.environ.get("DATABASE_URL") or "postgresql://uniaidb_user:YOURPASSWORD@dpg-d1q7ef7fte5s73d1fplg-a.singapore-postgres.render.com/uniaidb"
-CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY") or "sk-..."
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") or "sk-..."
+# ENV CONFIG (fail if not set)
+DB_URL = os.environ['DATABASE_URL']
+CLAUDE_API_KEY = os.environ['CLAUDE_API_KEY']
+WASSENGER_API_KEY = os.environ['WASSENGER_API_KEY']
 
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger("ventopia")
+CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
+WASSENGER_API_URL = "https://api.wassenger.com/v1/messages"
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("uniai-prod")
 
 app = FastAPI()
 
-class MessageIn(BaseModel):
-    bot_phone: str   # "+60108273799"
-    from_number: str # customer phone
-    message: str     # incoming message text
 
-# --- DB Helper ---
+class MessageIn(BaseModel):
+    bot_phone: str
+    from_number: str
+    message: str
+
+
+# DB HELPERS
+
 async def get_db():
     return await asyncpg.create_pool(DB_URL, min_size=1, max_size=5)
 
-async def fetch_bot_config(conn, bot_phone):
-    row = await conn.fetchrow("SELECT * FROM bots WHERE phone_number=$1 AND active", bot_phone)
+
+async def get_customer(conn, phone_number) -> int:
+    row = await conn.fetchrow("SELECT id FROM customers WHERE phone_number=$1", phone_number)
+    if row:
+        return row['id']
+    row = await conn.fetchrow(
+        "INSERT INTO customers (phone_number) VALUES ($1) RETURNING id", phone_number)
+    return row['id']
+
+
+async def get_bot(conn, phone_number) -> dict:
+    row = await conn.fetchrow(
+        "SELECT * FROM bots WHERE phone_number=$1", phone_number)
     if not row:
-        raise Exception("Bot not found or inactive!")
+        raise Exception("Bot not found")
     return dict(row)
 
-async def fetch_bot_tools(conn, bot_id):
+
+async def get_open_session(conn, bot_id, customer_id) -> Optional[int]:
+    row = await conn.fetchrow(
+        "SELECT id FROM sessions WHERE bot_id=$1 AND customer_id=$2 AND status='open' ORDER BY started_at DESC LIMIT 1",
+        bot_id, customer_id)
+    if row:
+        return row['id']
+    row = await conn.fetchrow(
+        """INSERT INTO sessions (bot_id, customer_id, status) VALUES ($1, $2, 'open') RETURNING id""",
+        bot_id, customer_id)
+    return row['id']
+
+
+async def save_message(conn, session_id, sender_type, sender_id, msg_text, meta=None, payload=None):
+    await conn.execute("""
+        INSERT INTO messages (session_id, sender_type, sender_id, message, meta, payload)
+        VALUES ($1, $2, $3, $4, $5, $6)
+    """, session_id, sender_type, sender_id, msg_text, json.dumps(meta or {}), json.dumps(payload or {}))
+
+
+async def get_tools(conn, bot_id):
     records = await conn.fetch("""
         SELECT t.*
         FROM bot_tools bt
@@ -40,143 +78,139 @@ async def fetch_bot_tools(conn, bot_id):
     """, bot_id)
     return [dict(r) for r in records]
 
-async def save_message(conn, session_id, sender_type, msg_text, meta=None, payload=None):
-    await conn.execute("""
-        INSERT INTO messages (session_id, sender_type, message, meta, payload)
-        VALUES ($1, $2, $3, $4, $5)
-    """, session_id, sender_type, msg_text, json.dumps(meta or {}), json.dumps(payload or {}))
 
-# --- DYNAMIC TOOL FETCH ---
-def get_default_tool(tools):
-    for t in tools:
-        if str(t.get("tool_id", "")).lower().startswith('default'):
-            return t
-    return None
-
-def get_tool_by_id(tools, tool_id):
-    for t in tools:
-        if t.get("tool_id") == tool_id or str(t.get("id")) == str(tool_id):
-            return t
-    return None
-
-# --- Claude decision (simulate) ---
-async def call_claude_manager(prompt, history=None):
-    # Simulate: should call your real manager Claude with prompt+history
-    # Always returns Default for demo
-    return {"TOOLS": "Default"}
-
-# --- Tool action handler (simulate) ---
-async def call_tool_action(tool, message, extra=None):
-    if tool['action_type'] == "claude_sales":
-        return "Hi! This is a sales reply from Claude."
-    elif tool['action_type'] == "gpt_analyse":
-        return "Here is your SWOT analysis (dummy data)."
-    elif tool['action_type'] == "form_validate":
-        return "Form validated."
-    elif tool['action_type'] == "close_session":
-        return "Session ended, no further action."
-    else:
-        return "Tool not supported."
-
-# --- WhatsApp sending helper (edit as needed for your actual API) ---
-# 1. Get which tool to use
-tool_chosen = manager_decision.get("TOOLS")
-if tool_chosen == "Default":
-    default_tool = get_default_tool(tools)
-    if not default_tool:
-        ai_reply = "No default tool found for this bot."
-    else:
-        ai_reply = await call_tool_action(default_tool, user_message)
-elif tool_chosen in tool_map:
-    ai_reply = await call_tool_action(tool_map[tool_chosen], user_message)
-else:
-    tool_by_id = get_tool_by_id(tools, tool_chosen)
-    if tool_by_id:
-        ai_reply = await call_tool_action(tool_by_id, user_message)
-    else:
-        ai_reply = f"Tool '{tool_chosen}' not found for this bot."
-
-# 2. Build WhatsApp payload with the *AI reply*, not the manager_decision
-whatsapp_payload = {
-    "phone": phone,
-    "message": ai_reply,  # This is the actual reply to send to customer!
-    "device": device_id
-}
+def build_personality_prompt(bot, tools, system_prompt, tool_prompt=None):
+    # Combine bot system_prompt + tools + tool prompt if present
+    tools_desc = "\n".join([f"{t['tool_id']}: {t['description']}" for t in tools])
+    return f"{system_prompt}\n\nAvailable tools:\n{tools_desc}\n{tool_prompt or ''}".strip()
 
 
-async def send_whatsapp_message(phone, message, device):
-    # Replace this with your actual API call (e.g., Wassenger, UltraMsg, etc.)
-    # Here we just log for demo.
-    logger.debug(f"Sending WhatsApp payload: {{'phone': '{phone}', 'message': '{message}', 'device': '{device}'}}")
-    # Example: 
-    # async with httpx.AsyncClient() as client:
-    #     await client.post("https://api.wassenger.com/v1/messages", json={
-    #         "phone": phone,
-    #         "message": message,
-    #         "device": device
-    #     })
+# AI CALLS
 
-# --- Main Webhook ---
+async def call_claude(prompt, history: Optional[List[dict]] = None, max_tokens: int = 1024):
+    headers = {
+        "x-api-key": CLAUDE_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+    }
+    # History should be: [{"role": "user", "content": ...}, {"role": "assistant", "content": ...}, ...]
+    payload = {
+        "model": "claude-3-haiku-20240307",  # Or another model if preferred
+        "max_tokens": max_tokens,
+        "messages": history or [{"role": "user", "content": prompt}]
+    }
+    async with httpx.AsyncClient() as client:
+        r = await client.post(CLAUDE_API_URL, headers=headers, json=payload, timeout=30)
+        r.raise_for_status()
+        result = r.json()
+        return result['content'][0]['text'] if isinstance(result['content'], list) else result['content']
+
+
+async def ai_split_reply(full_reply: str, split_hint: Optional[str] = None) -> List[str]:
+    """
+    Use Claude to propose split points for 2-3 WhatsApp messages.
+    """
+    if len(full_reply) < 700:
+        return [full_reply]
+    prompt = (
+        "Please split the following WhatsApp reply into 2 or 3 natural, human-sounding parts (messages), "
+        "each under 700 characters if possible. Avoid splitting in the middle of a sentence. "
+        "Return as a JSON array of strings.\n\n"
+        f"Text:\n{full_reply}"
+    )
+    split_resp = await call_claude(prompt, max_tokens=1024)
+    # Try to parse as JSON array
+    try:
+        arr = json.loads(split_resp)
+        if isinstance(arr, list) and all(isinstance(x, str) for x in arr):
+            return arr
+    except Exception:
+        pass
+    # fallback: split by sentences to ~700 chars
+    out, current = [], ""
+    for sent in full_reply.split(". "):
+        if len(current) + len(sent) > 680 and current:
+            out.append(current.strip())
+            current = ""
+        current += sent + ". "
+    if current:
+        out.append(current.strip())
+    return out
+
+
+# WhatsApp sending
+async def send_whatsapp(phone: str, text: str, device: str):
+    headers = {
+        "Token": WASSENGER_API_KEY,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "phone": phone,
+        "message": text,
+        "device": device
+    }
+    async with httpx.AsyncClient() as client:
+        r = await client.post(WASSENGER_API_URL, headers=headers, json=payload, timeout=30)
+        if not (200 <= r.status_code < 300):
+            logger.error(f"Wassenger send failed: {r.status_code} {r.text}")
+            raise HTTPException(status_code=500, detail="Failed to send WhatsApp")
+    logger.info(f"Sent WhatsApp to {phone}: {text[:60]}...")
+
+
+# MAIN WEBHOOK
+
 @app.post("/webhook")
 async def webhook(msg: MessageIn):
     async with await get_db() as pool:
         async with pool.acquire() as conn:
-            # 1. Fetch bot config
-            bot = await fetch_bot_config(conn, msg.bot_phone)
+            # 1. Customer and Bot
+            customer_id = await get_customer(conn, msg.from_number)
+            bot = await get_bot(conn, msg.bot_phone)
             bot_id = bot['id']
-            config = json.loads(bot['config'])
-            logger.info(f"Loaded bot config: {config}")
+            bot_cfg = bot['config'] or {}
+            system_prompt = bot_cfg.get('system_prompt') if isinstance(bot_cfg, dict) else json.loads(bot_cfg).get('system_prompt', "You are a helpful, human-like assistant.")
 
-            # 2. Fetch tools for this bot
-            tools = await fetch_bot_tools(conn, bot_id)
-            tool_map = {t['tool_id']: t for t in tools}
+            device_id = bot_cfg.get('device_id') if isinstance(bot_cfg, dict) else json.loads(bot_cfg).get('device_id')
+            if not device_id:
+                raise HTTPException(400, detail="Device ID missing in bot config")
 
-            # 3. Simulate session/customer lookup (or create one for demo)
-            session_id = 1  # For demo
+            # 2. Session handling
+            session_id = await get_open_session(conn, bot_id, customer_id)
 
-            # 4. Save user message
-            await save_message(conn, session_id, 'user', msg.message, {"from": msg.from_number}, {})
+            # 3. Log user message
+            await save_message(conn, session_id, 'user', customer_id, msg.message, meta={"from": msg.from_number}, payload={})
 
-            # 5. Build dynamic <TOOLS> list for Claude manager prompt (optional)
-            tools_desc = "\n".join([f"{t['tool_id']}: {t['description']}" for t in tools])
-            system_prompt = bot.get("system_prompt") or config.get("system_prompt") or "Default system prompt"
-            manager_prompt = f"{system_prompt}\n\n<TOOLS>\n{tools_desc}\n</TOOLS>\nUser message: {msg.message}"
+            # 4. Tools
+            tools = await get_tools(conn, bot_id)
+            active_tools = [t for t in tools if t['active']]
 
-            # 6. Call Claude manager to get tool decision
-            manager_decision = await call_claude_manager(manager_prompt)
-            logger.info(f"Claude manager decision: {manager_decision}")
+            # 5. Tool/personality prompt
+            # (Assume only one tool matches, or pick by logic if multiple)
+            tool_prompt = ""
+            if active_tools:
+                # For now: Just use the first tool's prompt if present.
+                for t in active_tools:
+                    if t.get("prompt"):
+                        tool_prompt = t["prompt"]
+                        break
+            personality = build_personality_prompt(bot, active_tools, system_prompt, tool_prompt)
 
-            # 7. Route to correct tool
-            tool_chosen = manager_decision.get("TOOLS")
-            ai_reply = None
-            if tool_chosen == "Default":
-                default_tool = get_default_tool(tools)
-                if not default_tool:
-                    ai_reply = "No default tool found for this bot."
-                else:
-                    ai_reply = await call_tool_action(default_tool, msg.message)
-            elif tool_chosen in tool_map:
-                ai_reply = await call_tool_action(tool_map[tool_chosen], msg.message)
-            else:
-                tool_by_id = get_tool_by_id(tools, tool_chosen)
-                if tool_by_id:
-                    ai_reply = await call_tool_action(tool_by_id, msg.message)
-                else:
-                    ai_reply = f"Tool '{tool_chosen}' not found for this bot."
+            # 6. AI reply
+            full_reply = await call_claude(f"{personality}\n\nUser: {msg.message}", max_tokens=800)
 
-            logger.info(f"AI reply: {ai_reply}")
+            # 7. Split for WhatsApp
+            reply_chunks = await ai_split_reply(full_reply)
+            logger.info(f"Split reply into {len(reply_chunks)} messages")
 
-            # 8. Save AI reply
-            await save_message(conn, session_id, 'ai', ai_reply, {"to": msg.from_number}, {})
+            # 8. Send each reply and log
+            for chunk in reply_chunks:
+                await send_whatsapp(msg.from_number, chunk, device_id)
+                await save_message(conn, session_id, 'ai', bot_id, chunk, meta={"to": msg.from_number}, payload={})
 
-            # 9. Send WhatsApp message (use your actual integration here)
-            device_id = bot.get("device_id", "")  # Make sure you have device_id
-            await send_whatsapp_message(msg.from_number, ai_reply, device_id)
+            # 9. Done
+            return {"status": "ok", "reply_chunks": reply_chunks}
 
-            # 10. Return real AI reply to user (API)
-            return {"reply": ai_reply}
-
-# --- For local dev: run server
+# --- For local dev only ---
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", port=9000, reload=True)
