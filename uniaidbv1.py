@@ -2,10 +2,10 @@ import os
 import json
 import logging
 import asyncpg
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from pydantic import BaseModel
 
-# --- Claude and OpenAI SDKs ---
+# --- Claude and OpenAI SDKs (dummy for now) ---
 import openai  # For GPT, image/audio, etc.
 
 # --- Config (update accordingly) ---
@@ -20,7 +20,6 @@ logger = logging.getLogger("ventopia")
 # --- FastAPI setup ---
 app = FastAPI()
 
-# --- Message schema for inbound simulation ---
 class MessageIn(BaseModel):
     bot_phone: str   # "+60108273799"
     from_number: str # customer phone
@@ -30,14 +29,12 @@ class MessageIn(BaseModel):
 async def get_db():
     return await asyncpg.create_pool(DB_URL, min_size=1, max_size=5)
 
-# --- Fetch bot config ---
 async def fetch_bot_config(conn, bot_phone):
     row = await conn.fetchrow("SELECT * FROM bots WHERE phone_number=$1 AND active", bot_phone)
     if not row:
         raise Exception("Bot not found or inactive!")
     return dict(row)
 
-# --- Fetch tools for bot ---
 async def fetch_bot_tools(conn, bot_id):
     records = await conn.fetch("""
         SELECT t.*
@@ -47,24 +44,35 @@ async def fetch_bot_tools(conn, bot_id):
     """, bot_id)
     return [dict(r) for r in records]
 
-# --- Save message to DB ---
 async def save_message(conn, session_id, sender_type, msg_text, meta=None, payload=None):
     await conn.execute("""
         INSERT INTO messages (session_id, sender_type, message, meta, payload)
         VALUES ($1, $2, $3, $4, $5)
     """, session_id, sender_type, msg_text, json.dumps(meta or {}), json.dumps(payload or {}))
 
+# --- DYNAMIC TOOL FETCH ---
+def get_default_tool(tools):
+    for t in tools:
+        # Default tool is first tool whose tool_id or name starts with 'default'
+        if str(t.get("tool_id", "")).lower().startswith('default'):
+            return t
+    return None
+
+def get_tool_by_id(tools, tool_id):
+    for t in tools:
+        if t.get("tool_id") == tool_id or str(t.get("id")) == str(tool_id):
+            return t
+    return None
+
 # --- Claude decision (simulate) ---
 async def call_claude_manager(prompt, history=None):
-    # You'd use the real Claude SDK here.
-    # For simulation, let's say Claude replies:
-    # {"TOOLS": "Default"} or {"TOOLS": "MarketingSwot"}
-    # Here we always return Default for demo
+    # Simulate: should call your real manager Claude with prompt+history
+    # Always returns Default for demo
     return {"TOOLS": "Default"}
 
 # --- Tool action handler (simulate) ---
 async def call_tool_action(tool, message, extra=None):
-    # Depending on tool['action_type'] call Claude or OpenAI
+    # Should call Claude/OpenAI or your business logic per tool['action_type']
     if tool['action_type'] == "claude_sales":
         return "Hi! This is a sales reply from Claude."
     elif tool['action_type'] == "gpt_analyse":
@@ -89,42 +97,48 @@ async def webhook(msg: MessageIn):
 
             # 2. Fetch tools for this bot
             tools = await fetch_bot_tools(conn, bot_id)
-            tool_map = {t['tool_id'] if 'tool_id' in t else t['id']: t for t in tools}
+            tool_map = {t['tool_id']: t for t in tools}
 
             # 3. Simulate session/customer lookup (or create one for demo)
-            session_id = 1  # For demo, use 1
+            session_id = 1  # For demo
 
             # 4. Save user message
             await save_message(conn, session_id, 'user', msg.message, {"from": msg.from_number}, {})
 
-            # 5. Compose system prompt for Claude
+            # 5. Build dynamic <TOOLS> list for Claude manager prompt (optional)
+            tools_desc = "\n".join([f"{t['tool_id']}: {t['description']}" for t in tools])
             system_prompt = bot.get("system_prompt") or config.get("system_prompt") or "Default system prompt"
-            manager_decision = await call_claude_manager(system_prompt + "\n\n" + msg.message)
+            manager_prompt = f"{system_prompt}\n\n<TOOLS>\n{tools_desc}\n</TOOLS>\nUser message: {msg.message}"
+
+            # 6. Call Claude manager to get tool decision
+            manager_decision = await call_claude_manager(manager_prompt)
             logger.info(f"Claude manager decision: {manager_decision}")
 
-            # 6. If Default, reply normally
-            if manager_decision.get("TOOLS") == "Default":
-            ai_reply = await call_tool_action(tool_map['defaultvpt'], msg.message)
+            # 7. Route to correct tool
+            tool_chosen = manager_decision.get("TOOLS")
+            ai_reply = None
+            if tool_chosen == "Default":
+                default_tool = get_default_tool(tools)
+                if not default_tool:
+                    ai_reply = "No default tool found for this bot."
+                else:
+                    ai_reply = await call_tool_action(default_tool, msg.message)
+            elif tool_chosen in tool_map:
+                ai_reply = await call_tool_action(tool_map[tool_chosen], msg.message)
             else:
-            tool_name = manager_decision["TOOLS"]
-            # find tool by string ID or integer
-            tool = None
-            for t in tools:
-                if t.get("tool_id") == tool_name or t.get("name") == tool_name or t.get("id") == tool_name:
-                    tool = t
-                    break
-            if not tool:
-                ai_reply = f"Tool '{tool_name}' not found for this bot."
-            else:
-                ai_reply = await call_tool_action(tool, msg.message)
+                # Try matching by integer id just in case
+                tool_by_id = get_tool_by_id(tools, tool_chosen)
+                if tool_by_id:
+                    ai_reply = await call_tool_action(tool_by_id, msg.message)
+                else:
+                    ai_reply = f"Tool '{tool_chosen}' not found for this bot."
 
-
-            # 7. Save AI reply
+            # 8. Save AI reply
             await save_message(conn, session_id, 'ai', ai_reply, {"to": msg.from_number}, {})
 
             logger.info(f"AI reply: {ai_reply}")
 
-            # 8. Return
+            # 9. Return real AI reply to user
             return {"reply": ai_reply}
 
 # --- For local dev: run server
