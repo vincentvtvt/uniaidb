@@ -4,20 +4,16 @@ import logging
 import asyncpg
 from fastapi import FastAPI
 from pydantic import BaseModel
+import httpx  # For WhatsApp payload sending demo
 
-# --- Claude and OpenAI SDKs (dummy for now) ---
-import openai  # For GPT, image/audio, etc.
-
-# --- Config (update accordingly) ---
+# --- Config ---
 DB_URL = os.environ.get("DATABASE_URL") or "postgresql://uniaidb_user:YOURPASSWORD@dpg-d1q7ef7fte5s73d1fplg-a.singapore-postgres.render.com/uniaidb"
-CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY") or "sk-..."  # Claude key if you use their SDK
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") or "sk-..."  # For GPT/image etc
+CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY") or "sk-..."
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") or "sk-..."
 
-# --- Logging ---
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger("ventopia")
 
-# --- FastAPI setup ---
 app = FastAPI()
 
 class MessageIn(BaseModel):
@@ -53,7 +49,6 @@ async def save_message(conn, session_id, sender_type, msg_text, meta=None, paylo
 # --- DYNAMIC TOOL FETCH ---
 def get_default_tool(tools):
     for t in tools:
-        # Default tool is first tool whose tool_id or name starts with 'default'
         if str(t.get("tool_id", "")).lower().startswith('default'):
             return t
     return None
@@ -72,7 +67,6 @@ async def call_claude_manager(prompt, history=None):
 
 # --- Tool action handler (simulate) ---
 async def call_tool_action(tool, message, extra=None):
-    # Should call Claude/OpenAI or your business logic per tool['action_type']
     if tool['action_type'] == "claude_sales":
         return "Hi! This is a sales reply from Claude."
     elif tool['action_type'] == "gpt_analyse":
@@ -83,6 +77,19 @@ async def call_tool_action(tool, message, extra=None):
         return "Session ended, no further action."
     else:
         return "Tool not supported."
+
+# --- WhatsApp sending helper (edit as needed for your actual API) ---
+async def send_whatsapp_message(phone, message, device):
+    # Replace this with your actual API call (e.g., Wassenger, UltraMsg, etc.)
+    # Here we just log for demo.
+    logger.debug(f"Sending WhatsApp payload: {{'phone': '{phone}', 'message': '{message}', 'device': '{device}'}}")
+    # Example: 
+    # async with httpx.AsyncClient() as client:
+    #     await client.post("https://api.wassenger.com/v1/messages", json={
+    #         "phone": phone,
+    #         "message": message,
+    #         "device": device
+    #     })
 
 # --- Main Webhook ---
 @app.post("/webhook")
@@ -126,20 +133,22 @@ async def webhook(msg: MessageIn):
             elif tool_chosen in tool_map:
                 ai_reply = await call_tool_action(tool_map[tool_chosen], msg.message)
             else:
-                # Try matching by integer id just in case
                 tool_by_id = get_tool_by_id(tools, tool_chosen)
                 if tool_by_id:
                     ai_reply = await call_tool_action(tool_by_id, msg.message)
                 else:
                     ai_reply = f"Tool '{tool_chosen}' not found for this bot."
 
+            logger.info(f"AI reply: {ai_reply}")
 
             # 8. Save AI reply
             await save_message(conn, session_id, 'ai', ai_reply, {"to": msg.from_number}, {})
 
-            logger.info(f"AI reply: {ai_reply}")
+            # 9. Send WhatsApp message (use your actual integration here)
+            device_id = bot.get("device_id", "")  # Make sure you have device_id
+            await send_whatsapp_message(msg.from_number, ai_reply, device_id)
 
-            # 9. Return real AI reply to user
+            # 10. Return real AI reply to user (API)
             return {"reply": ai_reply}
 
 # --- For local dev: run server
