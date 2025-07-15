@@ -1,279 +1,132 @@
 import os
-import re
-import time
-import requests
-import logging
 import json
-from typing import Optional, List, Dict, Any
-from flask import Flask, request, jsonify
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, JSON, ForeignKey, Boolean
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, scoped_session
-from datetime import datetime
+import logging
+import asyncpg
+from fastapi import FastAPI, Request
+from pydantic import BaseModel
 
-import anthropic
-import openai
+# --- Claude and OpenAI SDKs ---
+import openai  # For GPT, image/audio, etc.
 
-# --- CONFIGURATION ---
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s [%(levelname)s] %(message)s')
-app = Flask(__name__)
-app.logger.setLevel(logging.DEBUG)
+# --- Config (update accordingly) ---
+DB_URL = os.environ.get("DATABASE_URL") or "postgresql://uniaidb_user:YOURPASSWORD@dpg-d1q7ef7fte5s73d1fplg-a.singapore-postgres.render.com/uniaidb"
+CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY") or "sk-..."  # Claude key if you use their SDK
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") or "sk-..."  # For GPT/image etc
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY")
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-3-7-sonnet-20250219")
-WASSENGER_API_KEY = os.getenv("WASSENGER_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# --- Logging ---
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger("ventopia")
 
-Base = declarative_base()
+# --- FastAPI setup ---
+app = FastAPI()
 
-# --- ORM MODELS (Simplified) ---
-class Bot(Base):
-    __tablename__ = 'bots'
-    id = Column(Integer, primary_key=True)
-    name = Column(String(50))
-    phone_number = Column(String(30), unique=True)
-    config = Column(JSON)
-    created_at = Column(DateTime, default=datetime.utcnow)
+# --- Message schema for inbound simulation ---
+class MessageIn(BaseModel):
+    bot_phone: str   # "+60108273799"
+    from_number: str # customer phone
+    message: str     # incoming message text
 
-class Customer(Base):
-    __tablename__ = 'customers'
-    id = Column(Integer, primary_key=True)
-    phone_number = Column(String(30), unique=True)
-    name = Column(String(50))
-    language = Column(String(10))
-    meta = Column(JSON)
-    created_at = Column(DateTime, default=datetime.utcnow)
+# --- DB Helper ---
+async def get_db():
+    return await asyncpg.create_pool(DB_URL, min_size=1, max_size=5)
 
-class Session(Base):
-    __tablename__ = 'sessions'
-    id = Column(Integer, primary_key=True)
-    customer_id = Column(Integer, ForeignKey('customers.id'))
-    bot_id = Column(Integer, ForeignKey('bots.id'))
-    started_at = Column(DateTime, default=datetime.utcnow)
-    ended_at = Column(DateTime)
-    status = Column(String(20), default='open')
-    goal = Column(String(50))
-    context = Column(JSON)
+# --- Fetch bot config ---
+async def fetch_bot_config(conn, bot_phone):
+    row = await conn.fetchrow("SELECT * FROM bots WHERE phone_number=$1 AND active", bot_phone)
+    if not row:
+        raise Exception("Bot not found or inactive!")
+    return dict(row)
 
-class Message(Base):
-    __tablename__ = 'messages'
-    id = Column(Integer, primary_key=True)
-    session_id = Column(Integer, ForeignKey('sessions.id'))
-    sender_type = Column(String(20))
-    sender_id = Column(Integer)
-    message = Column(Text)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    meta = Column(JSON)
-    payload = Column(JSON)
+# --- Fetch tools for bot ---
+async def fetch_bot_tools(conn, bot_id):
+    records = await conn.fetch("""
+        SELECT t.*
+        FROM bot_tools bt
+        JOIN tools t ON bt.tool_id = t.id
+        WHERE bt.bot_id=$1 AND bt.active AND t.active
+    """, bot_id)
+    return [dict(r) for r in records]
 
-# --- DB SETUP ---
-engine = create_engine(DATABASE_URL)
-Base.metadata.create_all(engine)
-db_session = scoped_session(sessionmaker(bind=engine))
+# --- Save message to DB ---
+async def save_message(conn, session_id, sender_type, msg_text, meta=None, payload=None):
+    await conn.execute("""
+        INSERT INTO messages (session_id, sender_type, message, meta, payload)
+        VALUES ($1, $2, $3, $4, $5)
+    """, session_id, sender_type, msg_text, json.dumps(meta or {}), json.dumps(payload or {}))
 
-# --- Claude & OpenAI Clients ---
-openai.api_key = OPENAI_API_KEY
-claude_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+# --- Claude decision (simulate) ---
+async def call_claude_manager(prompt, history=None):
+    # You'd use the real Claude SDK here.
+    # For simulation, let's say Claude replies:
+    # {"TOOLS": "Default"} or {"TOOLS": "MarketingSwot"}
+    # Here we always return Default for demo
+    return {"TOOLS": "Default"}
 
-# --- Helpers ---
-def detect_language(text: str) -> str:
-    return 'zh' if re.search(r'[\u4e00-\u9fff]', text) else 'en'
+# --- Tool action handler (simulate) ---
+async def call_tool_action(tool, message, extra=None):
+    # Depending on tool['action_type'] call Claude or OpenAI
+    if tool['action_type'] == "claude_sales":
+        return "Hi! This is a sales reply from Claude."
+    elif tool['action_type'] == "gpt_analyse":
+        return "Here is your SWOT analysis (dummy data)."
+    elif tool['action_type'] == "form_validate":
+        return "Form validated."
+    elif tool['action_type'] == "close_session":
+        return "Session ended, no further action."
+    else:
+        return "Tool not supported."
 
-def send_whatsapp_reply(to: str, text: str, device_id: str):
-    url = "https://api.wassenger.com/v1/messages"
-    headers = {"Content-Type": "application/json", "Token": WASSENGER_API_KEY}
-    to_clean = str(to).replace('+','').replace('@c.us','')
-    payload = {"phone": to_clean, "message": text, "device": device_id}
-    app.logger.debug(f"Sending WhatsApp payload: {payload}")
-    try:
-        resp = requests.post(url, json=payload, headers=headers)
-        resp.raise_for_status()
-        app.logger.info(f"WhatsApp sent: to={to_clean} device={device_id} text='{text[:50]}'")
-    except Exception as e:
-        app.logger.error(f"Wassenger send error: {e} | Payload: {payload}")
+# --- Main Webhook ---
+@app.post("/webhook")
+async def webhook(msg: MessageIn):
+    async with await get_db() as pool:
+        async with pool.acquire() as conn:
+            # 1. Fetch bot config
+            bot = await fetch_bot_config(conn, msg.bot_phone)
+            bot_id = bot['id']
+            config = json.loads(bot['config'])
+            logger.info(f"Loaded bot config: {config}")
 
-def send_reply_with_delay(receiver: str, text: str, device_id: str, max_parts: int = 3):
-    paras = [p.strip() for p in text.split("\n\n") if p.strip()]
-    for part in paras[:max_parts]:
-        send_whatsapp_reply(receiver, part, device_id)
-        time.sleep(1)
+            # 2. Fetch tools for this bot
+            tools = await fetch_bot_tools(conn, bot_id)
+            tool_map = {t['tool_id'] if 'tool_id' in t else t['id']: t for t in tools}
 
-def get_active_bot(phone_number: str) -> Optional[Bot]:
-    pn = phone_number.lstrip('+')
-    bot = db_session.query(Bot).filter(Bot.phone_number.like(f"%{pn}")).first()
-    app.logger.debug(f"get_active_bot({phone_number}) -> {bot}")
-    return bot
+            # 3. Simulate session/customer lookup (or create one for demo)
+            session_id = 1  # For demo, use 1
 
-def get_customer_by_phone(phone_number: str) -> Optional[Customer]:
-    cust = db_session.query(Customer).filter(Customer.phone_number == phone_number).first()
-    app.logger.debug(f"get_customer_by_phone({phone_number}) -> {cust}")
-    return cust
+            # 4. Save user message
+            await save_message(conn, session_id, 'user', msg.message, {"from": msg.from_number}, {})
 
-def get_latest_session(customer_id: int, bot_id: int) -> Optional[Session]:
-    session = db_session.query(Session).filter(Session.customer_id == customer_id, Session.bot_id == bot_id).order_by(Session.started_at.desc()).first()
-    app.logger.debug(f"get_latest_session({customer_id}, {bot_id}) -> {session}")
-    return session
+            # 5. Compose system prompt for Claude
+            system_prompt = bot.get("system_prompt") or config.get("system_prompt") or "Default system prompt"
+            manager_decision = await call_claude_manager(system_prompt + "\n\n" + msg.message)
+            logger.info(f"Claude manager decision: {manager_decision}")
 
-def save_message(session_id: int, sender_type: str, message: str, meta: Optional[Dict[str, Any]] = None):
-    try:
-        msg = Message(
-            session_id=session_id,
-            sender_type=sender_type,
-            message=message,
-            meta=meta or {}
-        )
-        db_session.add(msg)
-        db_session.commit()
-        app.logger.info(f"Message saved: {sender_type} session_id={session_id}")
-    except Exception as e:
-        app.logger.error(f"Error saving message: {e}")
+            # 6. If Default, reply normally
+            if manager_decision.get("TOOLS") == "Default":
+                ai_reply = await call_tool_action(tool_map['defaultvpt'], msg.message)
+            else:
+                tool_name = manager_decision["TOOLS"]
+                # find tool by string ID or integer
+                tool = None
+                for t in tools:
+                    if t.get("tool_id") == tool_name or t.get("name") == tool_name or t.get("id") == tool_name:
+                        tool = t
+                        break
+                if not tool:
+                    ai_reply = f"Tool '{tool_name}' not found for this bot."
+                else:
+                    ai_reply = await call_tool_action(tool, msg.message)
 
-def build_context_messages(session: Session, new_user_input: str) -> List[Dict[str, str]]:
-    msgs = db_session.query(Message).filter(Message.session_id == session.id).order_by(Message.created_at.desc()).limit(9).all()
-    msgs = list(reversed(msgs))
-    history = []
-    for m in msgs:
-        role = 'user' if m.sender_type == 'user' else 'assistant'
-        history.append({"role": role, "content": m.message})
-    history.append({"role": "user", "content": new_user_input})
-    return history
+            # 7. Save AI reply
+            await save_message(conn, session_id, 'ai', ai_reply, {"to": msg.from_number}, {})
 
-def call_claude_tools(messages: list[dict[str, str]], system_prompt: str) -> dict[str, str]:
-    response = claude_client.messages.create(
-        model=CLAUDE_MODEL,
-        system=system_prompt,
-        messages=messages,
-        max_tokens=8192
-    )
-    text = ''.join(getattr(p, 'text', str(p)) for p in response.content).strip()
-    app.logger.debug(f"Claude raw reply: {text}")
-    try:
-        parsed = json.loads(text)
-        app.logger.info(f"Claude JSON reply parsed: {parsed}")
-    except Exception as e:
-        app.logger.error(f"Claude reply not valid JSON! Error: {e} | Raw: {text}")
-        parsed = {"error": "Claude did not return valid JSON", "raw": text}
-    return parsed
+            logger.info(f"AI reply: {ai_reply}")
 
-def call_openai_vision(media_url: str) -> str:
-    """Analyzes image or video via OpenAI Vision (GPT-4V) and returns a summary."""
-    try:
-        result = openai.chat.completions.create(
-            model="gpt-4-vision-preview",
-            messages=[
-                {"role": "user", "content": [
-                    {"type": "text", "text": "Describe and summarize the content of this image or video in 1-2 sentences."},
-                    {"type": "image_url", "image_url": {"url": media_url}}
-                ]}
-            ],
-            max_tokens=8192
-        )
-        interpretation = result.choices[0].message.content
-        app.logger.info(f"OpenAI Vision interpretation: {interpretation[:120]}")
-        return interpretation
-    except Exception as e:
-        app.logger.error(f"OpenAI Vision error: {e}")
-        return "Sorry, failed to interpret your image or video."
+            # 8. Return
+            return {"reply": ai_reply}
 
-def call_openai_whisper(audio_url: str) -> str:
-    """Transcribes audio using OpenAI Whisper API and returns the text."""
-    try:
-        # Download the audio file
-        audio_data = requests.get(audio_url).content
-        with open("/tmp/audio_message.ogg", "wb") as f:
-            f.write(audio_data)
-        with open("/tmp/audio_message.ogg", "rb") as f:
-            transcript = openai.audio.transcriptions.create(
-                model="whisper-1",
-                file=f
-            )
-        transcription = transcript["text"]
-        app.logger.info(f"OpenAI Whisper transcription: {transcription[:120]}")
-        return transcription
-    except Exception as e:
-        app.logger.error(f"OpenAI Whisper error: {e}")
-        return "Sorry, failed to transcribe your audio."
-
-
-# --- WEBHOOK HANDLER ---
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    try:
-        data = request.get_json(force=True)
-        app.logger.debug(f"Incoming payload: {data}")
-
-        event_type = data.get('event')
-        message_data = data.get('data', {})
-
-        # Only handle new inbound messages, not group/system
-        if event_type != 'message:in:new' or message_data.get('meta', {}).get('isGroup'):
-            app.logger.info("Ignored event or group message.")
-            return jsonify({'status': 'ignored'})
-
-        # --- BOT/DEVICE/PROMPT FROM DATABASE ---
-        bot_phone = (message_data.get('toNumber') or message_data.get('to') or "").replace('+', '').replace('@c.us', '')
-        bot = get_active_bot(bot_phone)
-        if not bot or not bot.config:
-            app.logger.error("No bot/config found for phone: " + str(bot_phone))
-            return jsonify({'status': 'no_bot_found'})
-
-        device_id = bot.config.get("device_id")
-        system_prompt = bot.config.get("system_prompt")
-        if not device_id or not system_prompt:
-            app.logger.error(f"device_id or system_prompt missing from bot.config: {bot.config}")
-            return jsonify({'status': 'no_device_or_prompt'})
-
-        # --- CUSTOMER AND SESSION ---
-        from_number = (message_data.get('fromNumber') or message_data.get('from', '').lstrip('+')).replace('@c.us','')
-        customer = get_customer_by_phone(from_number)
-        if not customer:
-            customer = Customer(phone_number=from_number, name=from_number, language=detect_language(message_data.get('body','')))
-            db_session.add(customer)
-            db_session.commit()
-            app.logger.info(f"New customer created: {from_number}")
-
-        session = get_latest_session(customer.id, bot.id)
-        if not session:
-            session = Session(customer_id=customer.id, bot_id=bot.id, goal="lead_generation", context={"bot": bot.name})
-            db_session.add(session)
-            db_session.commit()
-            app.logger.info(f"New session created: {session.id} for customer {customer.id}")
-
-        # --- MESSAGE HANDLING ---
-        msg_type = message_data.get('type', 'text')
-        msg_text = message_data.get('body', '').strip()
-        media_url = message_data.get('media_url')  # Optional, for future media support
-
-        # --- SAVE INCOMING USER MESSAGE ---
-        save_message(
-            session.id,
-            'user',
-            msg_text if msg_text else '[media]',
-            {"from": from_number, "type": msg_type, "media_url": media_url}
-        )
-
-        # --- BUILD CLAUDE CONTEXT & GET TOOL RECOMMENDATION ---
-        messages = build_context_messages(session, msg_text if msg_text else '[media]')
-        tool_result = call_claude_tools(messages, system_prompt)
-
-        # --- REPLY TO USER ---
-        # For now, echo the Claude output (JSON) as WhatsApp message.
-        to_send = json.dumps(tool_result, ensure_ascii=False)
-        send_whatsapp_reply(customer.phone_number, to_send, device_id)
-        save_message(session.id, 'ai', to_send, {"from": "claude", "tool_reply": tool_result})
-
-        return jsonify({'status': 'reply_sent', 'tool': tool_result})
-
-    except Exception as e:
-        app.logger.error(f"Exception in webhook: {e}", exc_info=True)
-        return jsonify({'status': 'error', 'detail': str(e)}), 500
-
-@app.route('/health', methods=['GET'])
-def health():
-    app.logger.debug("Health endpoint called.")
-    return "OK", 200
-
-if __name__ == '__main__':
-    port = int(os.getenv("PORT", 5000))
-    app.run(host='0.0.0.0', port=port, debug=True)
+# --- For local dev: run server
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", port=9000, reload=True)
