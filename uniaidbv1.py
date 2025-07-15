@@ -157,7 +157,7 @@ async def send_whatsapp(phone: str, text: str, device: str):
     logger.info(f"Sent WhatsApp to {phone}: {text[:60]}...")
 
 
-# MAIN WEBHOOK
+#  WEBHOOK
 
 @app.post("/webhook")
 async def webhook(msg: MessageIn):
@@ -211,6 +211,6 @@ async def webhook(msg: MessageIn):
             return {"status": "ok", "reply_chunks": reply_chunks}
 
 # --- For local dev only ---
-if __name__ == "__main__":
+if __name__ == "____":
     import uvicorn
-    uvicorn.run("main:app", port=9000, reload=True)
+    uvicorn.run("uniaidbv1:app", port=9000, reload=True)
