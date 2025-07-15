@@ -1,216 +1,222 @@
 import os
-import json
-import logging
-import asyncpg
-import httpx
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import Optional, List
+import re
+import time
+import requests
+from flask import Flask, request, jsonify
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, JSON, ForeignKey, Boolean
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, scoped_session
+from datetime import datetime
+import anthropic
 
-# ENV CONFIG (fail if not set)
-DB_URL = os.environ['DATABASE_URL']
-CLAUDE_API_KEY = os.environ['CLAUDE_API_KEY']
-WASSENGER_API_KEY = os.environ['WASSENGER_API_KEY']
+# ---- CONFIG ----
+DATABASE_URL = os.getenv("DATABASE_URL")
+CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY")
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-3-7-sonnet-20250219")
+WASSENGER_API_KEY = os.getenv("WASSENGER_API_KEY")
 
-CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
-WASSENGER_API_URL = "https://api.wassenger.com/v1/messages"
+app = Flask(__name__)
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("uniai-prod")
+Base = declarative_base()
 
-app = FastAPI()
+# ---- ORM MODELS ----
 
+class Bot(Base):
+    __tablename__ = 'bots'
+    id = Column(Integer, primary_key=True)
+    name = Column(String(50))
+    phone_number = Column(String(30), unique=True)
+    config = Column(JSON)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
-class MessageIn(BaseModel):
-    bot_phone: str
-    from_number: str
-    message: str
+class Agent(Base):
+    __tablename__ = 'agents'
+    id = Column(Integer, primary_key=True)
+    name = Column(String(50))
+    agent_type = Column(String(30))
+    config = Column(JSON)
+    active = Column(Boolean, default=True)
 
+class Workflow(Base):
+    __tablename__ = 'workflows'
+    id = Column(Integer, primary_key=True)
+    bot_id = Column(Integer, ForeignKey('bots.id'))
+    agent_id = Column(Integer, ForeignKey('agents.id'))
+    name = Column(String(100))
+    flow_config = Column(JSON)
+    active = Column(Boolean, default=True)
 
-# DB HELPERS
+class Session(Base):
+    __tablename__ = 'sessions'
+    id = Column(Integer, primary_key=True)
+    customer_id = Column(Integer, ForeignKey('customers.id'))
+    bot_id = Column(Integer, ForeignKey('bots.id'))
+    started_at = Column(DateTime, default=datetime.utcnow)
+    ended_at = Column(DateTime)
+    status = Column(String(20), default='open')
+    goal = Column(String(50))
+    context = Column(JSON)
 
-async def get_db():
-    return await asyncpg.create_pool(DB_URL, min_size=1, max_size=5)
+class Customer(Base):
+    __tablename__ = 'customers'
+    id = Column(Integer, primary_key=True)
+    phone_number = Column(String(30), unique=True)
+    name = Column(String(50))
+    language = Column(String(10))
+    meta = Column(JSON)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
+class Message(Base):
+    __tablename__ = 'messages'
+    id = Column(Integer, primary_key=True)
+    session_id = Column(Integer, ForeignKey('sessions.id'))
+    sender_type = Column(String(20))
+    sender_id = Column(Integer)
+    message = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    meta = Column(JSON)
+    payload = Column(JSON)
 
-async def get_customer(conn, phone_number) -> int:
-    row = await conn.fetchrow("SELECT id FROM customers WHERE phone_number=$1", phone_number)
-    if row:
-        return row['id']
-    row = await conn.fetchrow(
-        "INSERT INTO customers (phone_number) VALUES ($1) RETURNING id", phone_number)
-    return row['id']
+class Task(Base):
+    __tablename__ = 'tasks'
+    id = Column(Integer, primary_key=True)
+    session_id = Column(Integer, ForeignKey('sessions.id'))
+    customer_id = Column(Integer, ForeignKey('customers.id'))
+    agent_id = Column(Integer)
+    type = Column(String(30))
+    description = Column(Text)
+    due_time = Column(DateTime)
+    status = Column(String(20), default='pending')
+    meta = Column(JSON)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
+# ---- DB SETUP ----
+engine = create_engine(DATABASE_URL)
+Base.metadata.create_all(engine)
+db_session = scoped_session(sessionmaker(bind=engine))
 
-async def get_bot(conn, phone_number) -> dict:
-    row = await conn.fetchrow(
-        "SELECT * FROM bots WHERE phone_number=$1", phone_number)
-    if not row:
-        raise Exception("Bot not found")
-    return dict(row)
+# ---- UTILS ----
 
+def detect_language(text):
+    if re.search(r'[\u4e00-\u9fff]', text):
+        return 'zh'
+    return 'en'
 
-async def get_open_session(conn, bot_id, customer_id) -> Optional[int]:
-    row = await conn.fetchrow(
-        "SELECT id FROM sessions WHERE bot_id=$1 AND customer_id=$2 AND status='open' ORDER BY started_at DESC LIMIT 1",
-        bot_id, customer_id)
-    if row:
-        return row['id']
-    row = await conn.fetchrow(
-        """INSERT INTO sessions (bot_id, customer_id, status) VALUES ($1, $2, 'open') RETURNING id""",
-        bot_id, customer_id)
-    return row['id']
-
-
-async def save_message(conn, session_id, sender_type, sender_id, msg_text, meta=None, payload=None):
-    await conn.execute("""
-        INSERT INTO messages (session_id, sender_type, sender_id, message, meta, payload)
-        VALUES ($1, $2, $3, $4, $5, $6)
-    """, session_id, sender_type, sender_id, msg_text, json.dumps(meta or {}), json.dumps(payload or {}))
-
-
-async def get_tools(conn, bot_id):
-    records = await conn.fetch("""
-        SELECT t.*
-        FROM bot_tools bt
-        JOIN tools t ON bt.tool_id = t.id
-        WHERE bt.bot_id=$1 AND bt.active AND t.active
-    """, bot_id)
-    return [dict(r) for r in records]
-
-
-def build_personality_prompt(bot, tools, system_prompt, tool_prompt=None):
-    # Combine bot system_prompt + tools + tool prompt if present
-    tools_desc = "\n".join([f"{t['tool_id']}: {t['description']}" for t in tools])
-    return f"{system_prompt}\n\nAvailable tools:\n{tools_desc}\n{tool_prompt or ''}".strip()
-
-
-# AI CALLS
-
-async def call_claude(prompt, history: Optional[List[dict]] = None, max_tokens: int = 1024):
-    headers = {
-        "x-api-key": CLAUDE_API_KEY,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json"
-    }
-    # History should be: [{"role": "user", "content": ...}, {"role": "assistant", "content": ...}, ...]
-    payload = {
-        "model": "claude-3-haiku-20240307",  # Or another model if preferred
-        "max_tokens": max_tokens,
-        "messages": history or [{"role": "user", "content": prompt}]
-    }
-    async with httpx.AsyncClient() as client:
-        r = await client.post(CLAUDE_API_URL, headers=headers, json=payload, timeout=30)
-        r.raise_for_status()
-        result = r.json()
-        return result['content'][0]['text'] if isinstance(result['content'], list) else result['content']
-
-
-async def ai_split_reply(full_reply: str, split_hint: Optional[str] = None) -> List[str]:
-    """
-    Use Claude to propose split points for 2-3 WhatsApp messages.
-    """
-    if len(full_reply) < 700:
-        return [full_reply]
-    prompt = (
-        "Please split the following WhatsApp reply into 2 or 3 natural, human-sounding parts (messages), "
-        "each under 700 characters if possible. Avoid splitting in the middle of a sentence. "
-        "Return as a JSON array of strings.\n\n"
-        f"Text:\n{full_reply}"
-    )
-    split_resp = await call_claude(prompt, max_tokens=1024)
-    # Try to parse as JSON array
+def send_whatsapp_reply(to, text, device_id):
+    url = "https://api.wassenger.com/v1/messages"
+    headers = {"Content-Type": "application/json", "Token": WASSENGER_API_KEY}
+    payload = {"phone": to, "message": text, "device": device_id}
+    resp = requests.post(url, json=payload, headers=headers)
     try:
-        arr = json.loads(split_resp)
-        if isinstance(arr, list) and all(isinstance(x, str) for x in arr):
-            return arr
-    except Exception:
-        pass
-    # fallback: split by sentences to ~700 chars
-    out, current = [], ""
-    for sent in full_reply.split(". "):
-        if len(current) + len(sent) > 680 and current:
-            out.append(current.strip())
-            current = ""
-        current += sent + ". "
-    if current:
-        out.append(current.strip())
-    return out
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"Wassenger send error: {e}")
 
+def send_reply_with_delay(receiver, text, device_id, max_parts=3):
+    paras = [p.strip() for p in text.split("\n\n") if p.strip()]
+    for part in paras[:max_parts]:
+        send_whatsapp_reply(receiver, part, device_id)
+        time.sleep(1)
 
-# WhatsApp sending
-async def send_whatsapp(phone: str, text: str, device: str):
-    headers = {
-        "Token": WASSENGER_API_KEY,
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "phone": phone,
-        "message": text,
-        "device": device
-    }
-    async with httpx.AsyncClient() as client:
-        r = await client.post(WASSENGER_API_URL, headers=headers, json=payload, timeout=30)
-        if not (200 <= r.status_code < 300):
-            logger.error(f"Wassenger send failed: {r.status_code} {r.text}")
-            raise HTTPException(status_code=500, detail="Failed to send WhatsApp")
-    logger.info(f"Sent WhatsApp to {phone}: {text[:60]}...")
+# ---- MAIN CHAT HANDLER ----
 
+def get_active_bot(phone_number):
+    # Accepts formats like "+60108273799" or "60108273799"
+    pn = phone_number.lstrip('+')
+    return db_session.query(Bot).filter(Bot.phone_number.like(f"%{pn}")).first()
 
-#  WEBHOOK
+def get_active_workflow(bot_id):
+    return db_session.query(Workflow).filter(Workflow.bot_id == bot_id, Workflow.active == True).first()
 
-@app.post("/webhook")
-async def webhook(msg: MessageIn):
-    async with await get_db() as pool:
-        async with pool.acquire() as conn:
-            # 1. Customer and Bot
-            customer_id = await get_customer(conn, msg.from_number)
-            bot = await get_bot(conn, msg.bot_phone)
-            bot_id = bot['id']
-            bot_cfg = bot['config'] or {}
-            system_prompt = bot_cfg.get('system_prompt') if isinstance(bot_cfg, dict) else json.loads(bot_cfg).get('system_prompt', "You are a helpful, human-like assistant.")
+def get_agent(agent_id):
+    return db_session.query(Agent).filter(Agent.id == agent_id, Agent.active == True).first()
 
-            device_id = bot_cfg.get('device_id') if isinstance(bot_cfg, dict) else json.loads(bot_cfg).get('device_id')
-            if not device_id:
-                raise HTTPException(400, detail="Device ID missing in bot config")
+def get_customer_by_phone(phone_number):
+    return db_session.query(Customer).filter(Customer.phone_number == phone_number).first()
 
-            # 2. Session handling
-            session_id = await get_open_session(conn, bot_id, customer_id)
+def get_latest_session(customer_id, bot_id):
+    return db_session.query(Session).filter(Session.customer_id == customer_id, Session.bot_id == bot_id).order_by(Session.started_at.desc()).first()
 
-            # 3. Log user message
-            await save_message(conn, session_id, 'user', customer_id, msg.message, meta={"from": msg.from_number}, payload={})
+def save_message(session_id, sender_type, message, meta=None):
+    msg = Message(
+        session_id=session_id,
+        sender_type=sender_type,
+        message=message,
+        meta=meta or {}
+    )
+    db_session.add(msg)
+    db_session.commit()
 
-            # 4. Tools
-            tools = await get_tools(conn, bot_id)
-            active_tools = [t for t in tools if t['active']]
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    data = request.get_json(force=True)
+    event_type = data.get('event')
+    message_data = data.get('data', {})
 
-            # 5. Tool/personality prompt
-            # (Assume only one tool matches, or pick by logic if multiple)
-            tool_prompt = ""
-            if active_tools:
-                # For now: Just use the first tool's prompt if present.
-                for t in active_tools:
-                    if t.get("prompt"):
-                        tool_prompt = t["prompt"]
-                        break
-            personality = build_personality_prompt(bot, active_tools, system_prompt, tool_prompt)
+    # Only handle new inbound messages, not system/group
+    if event_type != 'message:in:new' or message_data.get('meta', {}).get('isGroup'):
+        return jsonify({'status': 'ignored'})
 
-            # 6. AI reply
-            full_reply = await call_claude(f"{personality}\n\nUser: {msg.message}", max_tokens=800)
+    # Find the bot by device phone number
+    bot_phone = (message_data.get('toNumber') or message_data.get('to') or "").replace('+', '').replace('@c.us', '')
+    bot = get_active_bot(bot_phone)
+    if not bot:
+        return jsonify({'status': 'no_bot_found'})
 
-            # 7. Split for WhatsApp
-            reply_chunks = await ai_split_reply(full_reply)
-            logger.info(f"Split reply into {len(reply_chunks)} messages")
+    # --- Get device_id from DB for sending reply ---
+    device_id = bot.config.get("device_id") if bot and bot.config else None
+    if not device_id:
+        return jsonify({'status': 'no_device_id'})
 
-            # 8. Send each reply and log
-            for chunk in reply_chunks:
-                await send_whatsapp(msg.from_number, chunk, device_id)
-                await save_message(conn, session_id, 'ai', bot_id, chunk, meta={"to": msg.from_number}, payload={})
+    # Get workflow and agent
+    workflow = get_active_workflow(bot.id)
+    if not workflow:
+        return jsonify({'status': 'no_workflow_found'})
+    agent = get_agent(workflow.agent_id)
+    if not agent:
+        return jsonify({'status': 'no_agent_found'})
 
-            # 9. Done
-            return {"status": "ok", "reply_chunks": reply_chunks}
+    # Get customer info (or create if not exists)
+    from_number = (message_data.get('fromNumber') or message_data.get('from', '').lstrip('+')).replace('@c.us','')
+    customer = get_customer_by_phone(from_number)
+    if not customer:
+        customer = Customer(phone_number=from_number, name=from_number, language=detect_language(message_data.get('body','')))
+        db_session.add(customer)
+        db_session.commit()
 
-# --- For local dev only ---
-if __name__ == "____":
-    import uvicorn
-    uvicorn.run("uniaidbv1:app", port=9000, reload=True)
+    # Find latest session or create a new one
+    session = get_latest_session(customer.id, bot.id)
+    if not session:
+        session = Session(customer_id=customer.id, bot_id=bot.id, goal=workflow.flow_config.get('goal','lead_generation'), context={"workflow": workflow.name})
+        db_session.add(session)
+        db_session.commit()
+
+    msg_text = message_data.get('body', '').strip()
+    save_message(session.id, 'user', msg_text, {"from": from_number})
+
+    # Get workflow steps/prompts from DB
+    flow_steps = workflow.flow_config.get('steps', [])
+    intro_prompt = next((s["prompt"] for s in flow_steps if s["type"] == "intro"), "Hi, how can I help you?")
+    service_menu_prompt = next((s["prompt"] for s in flow_steps if "menu" in s.get("prompt", "").lower()), None)
+
+    # If new session or first message, send intro + menu
+    messages = db_session.query(Message).filter(Message.session_id == session.id).order_by(Message.created_at).all()
+    if len(messages) == 1:
+        send_reply_with_delay(customer.phone_number, intro_prompt, device_id)
+        # Send service menu if available (or you can add a separate "menu" step)
+        service_menu = db_session.query(Message).filter(Message.session_id == session.id, Message.sender_type == 'ai').first()
+        if service_menu:
+            send_reply_with_delay(customer.phone_number, service_menu.message, device_id)
+        return jsonify({'status': 'intro_sent'})
+
+    # Otherwise, here you can add Claude/AI reply logic using workflow config...
+
+    return jsonify({'status': 'ok'})
+
+@app.route('/health', methods=['GET'])
+def health():
+    return "OK", 200
+
+if __name__ == '__main__':
+    port = int(os.getenv("PORT", 5000))
+    app.run(host='0.0.0.0', port=port, debug=True)
