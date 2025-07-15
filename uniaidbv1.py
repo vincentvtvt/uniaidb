@@ -104,19 +104,20 @@ async def webhook(msg: MessageIn):
 
             # 6. If Default, reply normally
             if manager_decision.get("TOOLS") == "Default":
-                ai_reply = await call_tool_action(tool_map['defaultvpt'], msg.message)
+            ai_reply = await call_tool_action(tool_map['defaultvpt'], msg.message)
             else:
-                tool_name = manager_decision["TOOLS"]
-                # find tool by string ID or integer
-                tool = None
-                for t in tools:
-                    if t.get("tool_id") == tool_name or t.get("name") == tool_name or t.get("id") == tool_name:
-                        tool = t
-                        break
-                if not tool:
-                    ai_reply = f"Tool '{tool_name}' not found for this bot."
-                else:
-                    ai_reply = await call_tool_action(tool, msg.message)
+            tool_name = manager_decision["TOOLS"]
+            # find tool by string ID or integer
+            tool = None
+            for t in tools:
+                if t.get("tool_id") == tool_name or t.get("name") == tool_name or t.get("id") == tool_name:
+                    tool = t
+                    break
+            if not tool:
+                ai_reply = f"Tool '{tool_name}' not found for this bot."
+            else:
+                ai_reply = await call_tool_action(tool, msg.message)
+
 
             # 7. Save AI reply
             await save_message(conn, session_id, 'ai', ai_reply, {"to": msg.from_number}, {})
