@@ -14,7 +14,7 @@ import anthropic
 # ---- CONFIG ----
 DATABASE_URL = os.getenv("DATABASE_URL")
 CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY")
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-3-haiku-20240307")
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-3-7-sonnet-20250219")
 WASSENGER_API_KEY = os.getenv("WASSENGER_API_KEY")
 WASSENGER_API_URL = "https://api.wassenger.com/v1/messages"
 
