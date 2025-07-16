@@ -109,25 +109,11 @@ def send_whatsapp_reply(to, text, device_id):
     except Exception as e:
         print(f"Wassenger send error: {e}")
 
-def split_message(text, max_parts=3, max_length=350):
-    # Smart split for Chinese/English
-    blocks = re.split(r'([。！？\!?.]\s*)', text)
-    parts = []
-    temp = ""
-    for i in range(0, len(blocks), 2):
-        seg = blocks[i]
-        if i+1 < len(blocks):
-            seg += blocks[i+1]
-        if len(temp) + len(seg) > max_length and temp:
-            parts.append(temp)
-            temp = seg
-        else:
-            temp += seg
-    if temp:
-        parts.append(temp)
-    if len(parts) > max_parts:
-        parts = parts[:max_parts-1] + [''.join(parts[max_parts-1:])]
-    return parts
+def send_split_messages(to, full_text, device_id, max_parts=3):
+    parts = [p.strip() for p in full_text.split('\n\n') if p.strip()]
+    for part in parts[:max_parts]:
+        send_whatsapp_reply(to, part, device_id)
+
 
 def send_reply_with_delay(receiver, text, device_id, max_parts=3):
     for part in split_message(text, max_parts=max_parts):
