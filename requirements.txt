@@ -8,3 +8,4 @@ asyncpg
 fastapi
 datetime
 tiktoken
+flask_sqlalchemy
