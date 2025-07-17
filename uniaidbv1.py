@@ -279,6 +279,7 @@ def webhook():
         ai_result = json.loads(ai_result_raw)
     except Exception as e:
         ai_result = {}
+        print(f"[Claude Raw Output] {ai_result_raw}")
 
     # ---- Template (multi-part) reply ----
     if "template" in ai_result:
