@@ -6,3 +6,5 @@ openai
 requests
 asyncpg
 fastapi
+datetime
+tiktoken
