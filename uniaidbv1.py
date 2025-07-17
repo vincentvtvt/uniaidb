@@ -4,7 +4,7 @@ import time
 import json
 from flask import Flask, request, jsonify
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, JSON, ForeignKey, Boolean
-from sqlalchemy.orm import declarative_base
+from sqlalchemy.orm import declarative_base  # updated for SQLAlchemy 2.0+
 from sqlalchemy.orm import sessionmaker, scoped_session
 from datetime import datetime, timedelta
 import requests
@@ -146,13 +146,12 @@ def send_whatsapp_image(to, image_url, device_id):
         print(f"Wassenger send error (image): {e}")
 
 def send_structured_template(to, template_content, device_id):
-    # template_content: list of {"type": "text"|"image"|"video", "content": "..."}
     for item in template_content:
         if item["type"] == "text":
             send_whatsapp_reply(to, item["content"], device_id)
         elif item["type"] == "image":
             send_whatsapp_image(to, item["content"], device_id)
-        # Extend here for "video", "file", etc.
+        # Add more: "video", "file", etc as needed
         time.sleep(1)  # Avoid spamming user
 
 def get_tools_table_prompt(bot_id):
@@ -210,12 +209,21 @@ def call_claude(system_prompt, user_message):
 def build_system_prompt(config, bot_id, context_history=None):
     # Insert dynamic macros into your prompt (e.g., TOOLS_TABLE)
     system_prompt = config.get("system_prompt", "")
+    # Strongly enforce JSON output at the end of the prompt:
+    json_instruction = """
+IMPORTANT: Only reply with valid JSON in the following format. Do not include markdown or commentary, do not include explanations, only output JSON:
+{ "template": "template_id", "message": ["text1", "text2"] }
+or
+{ "message": ["text1", "text2"] }
+If no template is used, omit the template field entirely. Only use the message field. 
+"""
     if "{{TOOLS_TABLE}}" in system_prompt:
         tools_table = get_tools_table_prompt(bot_id)
         system_prompt = system_prompt.replace("{{TOOLS_TABLE}}", tools_table)
-    # Add context if given
     if context_history:
-        system_prompt = f"[Conversation History:]\n{context_history}\n\n{system_prompt}"
+        system_prompt = f"[Conversation History:]\n{context_history}\n\n{system_prompt}\n\n{json_instruction}"
+    else:
+        system_prompt = f"{system_prompt}\n\n{json_instruction}"
     return system_prompt
 
 # ---- MAIN CHAT HANDLER ----
@@ -275,12 +283,13 @@ def webhook():
 
     # ---- Claude call ----
     ai_result_raw = call_claude(manager_prompt, msg_text)
-    print(f"[Claude Raw Output] {ai_result_raw}")
+    print(f"[Claude Raw Output] {ai_result_raw}")  # LOG RAW CLAUDE OUTPUT
+
     try:
         ai_result = json.loads(ai_result_raw)
     except Exception as e:
+        print(f"[Claude JSON error] {e} | Output: {ai_result_raw}")  # LOG JSON ERROR
         ai_result = {}
-
 
     # ---- Template (multi-part) reply ----
     if "template" in ai_result:
