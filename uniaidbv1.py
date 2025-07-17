@@ -9,17 +9,18 @@ from sqlalchemy.orm import sessionmaker, scoped_session
 from datetime import datetime, timedelta
 import requests
 import anthropic
+import tiktoken
 
 # ---- ENV/CONFIG ----
 DATABASE_URL = os.getenv("DATABASE_URL")
 CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY")
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-3-haiku-20240307")
+CLAUDE_MAX_TOKENS = 4096
 
 app = Flask(__name__)
 Base = declarative_base()
 
 # ---- MODELS ----
-
 class Bot(Base):
     __tablename__ = 'bots'
     id = Column(Integer, primary_key=True)
@@ -87,6 +88,25 @@ class Tool(Base):
     active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+class BotTools(Base):
+    __tablename__ = 'bot_tools'
+    id = Column(Integer, primary_key=True)
+    bot_id = Column(Integer)
+    tool_id = Column(String(50))
+    active = Column(Boolean, default=True)
+
+class Template(Base):
+    __tablename__ = 'templates'
+    id = Column(Integer, primary_key=True)
+    bot_id = Column(Integer)
+    template_id = Column(String(50))
+    description = Column(String(255))
+    content = Column(JSON, nullable=False)  # List of dicts: [{"type": "text", ...}, ...]
+    language = Column(String(10), default='ms')
+    active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
 # ---- DB SETUP ----
 engine = create_engine(DATABASE_URL)
 Base.metadata.create_all(engine)
@@ -94,10 +114,16 @@ db_session = scoped_session(sessionmaker(bind=engine))
 
 # ---- UTILS ----
 
-def detect_language(text):
-    if re.search(r'[\u4e00-\u9fff]', text):
-        return 'zh'
-    return 'en'
+def count_tokens(text, model="claude-3-haiku-20240307"):
+    enc = tiktoken.encoding_for_model("gpt-3.5-turbo")
+    tokens = enc.encode(text)
+    return len(tokens)
+
+def get_last_n_messages(session_id, n=20):
+    msgs = db_session.query(Message).filter(
+        Message.session_id == session_id
+    ).order_by(Message.created_at.desc()).limit(n).all()
+    return list(reversed(msgs))
 
 def send_whatsapp_reply(to, text, device_id):
     url = "https://api.wassenger.com/v1/messages"
@@ -109,22 +135,37 @@ def send_whatsapp_reply(to, text, device_id):
     except Exception as e:
         print(f"Wassenger send error: {e}")
 
-def send_split_messages(to, full_text, device_id, max_parts=3):
-    parts = [p.strip() for p in full_text.split('\n\n') if p.strip()]
-    for part in parts[:max_parts]:
-        send_whatsapp_reply(to, part, device_id)
+def send_whatsapp_image(to, image_url, device_id):
+    url = "https://api.wassenger.com/v1/messages/image"
+    headers = {"Content-Type": "application/json", "Token": os.getenv("WASSENGER_API_KEY")}
+    payload = {"phone": to, "image": image_url, "device": device_id}
+    resp = requests.post(url, json=payload, headers=headers)
+    try:
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"Wassenger send error (image): {e}")
 
+def send_structured_template(to, template_content, device_id):
+    # template_content: list of {"type": "text"|"image"|"video", "content": "..."}
+    for item in template_content:
+        if item["type"] == "text":
+            send_whatsapp_reply(to, item["content"], device_id)
+        elif item["type"] == "image":
+            send_whatsapp_image(to, item["content"], device_id)
+        # Extend here for "video", "file", etc.
+        time.sleep(1)  # Avoid spamming user
 
-def send_reply_with_delay(receiver, text, device_id, max_parts=3):
-    for part in split_message(text, max_parts=max_parts):
-        send_whatsapp_reply(receiver, part, device_id)
-        time.sleep(1)
-
-def get_tools_table_prompt():
-    tools = db_session.query(Tool).filter(Tool.active==True).all()
+def get_tools_table_prompt(bot_id):
+    tool_links = db_session.query(BotTools).filter(
+        BotTools.bot_id == bot_id, BotTools.active == True
+    ).all()
+    tool_ids = [t.tool_id for t in tool_links]
+    tools = db_session.query(Tool).filter(
+        Tool.tool_id.in_(tool_ids), Tool.active == True
+    ).all()
     table = ""
     for t in tools:
-        table += f"{t.tool_id}|{t.description}\n"
+        table += f"{t.tool_id}|{t.name}|{t.description}\n"
     return table.strip()
 
 def get_active_bot(phone_number):
@@ -147,42 +188,35 @@ def save_message(session_id, sender_type, message, meta=None):
     db_session.add(msg)
     db_session.commit()
 
-def notify_sales_group(bot_config, customer, session):
-    # Compose message and send to group
-    group_id = bot_config.get("wassenger_group_id")
-    device_id = bot_config.get("device_id")
-    if not group_id or not device_id:
-        print("No group_id or device_id for sales notify.")
-        return
-    info = (
-        f"🎉 成交通知\n"
-        f"客户姓名: {customer.name}\n"
-        f"手机号: {customer.phone_number}\n"
-        f"产品: {session.goal or '未填写'}\n"
-        f"成交时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
-        f"请尽快跟进！"
-    )
-    send_whatsapp_reply(group_id, info, device_id)
-
-def get_next_weekdays():
-    today = datetime.now()
-    return [
-        (today + timedelta(days=i)).strftime("%m月%d日")
-        for i in range(1, 8)
-    ]
-
-# ---- CLAUDE (ANTHROPIC) ----
+def get_template_content(bot_id, template_id):
+    tpl = db_session.query(Template).filter(
+        Template.bot_id == bot_id,
+        Template.template_id == template_id,
+        Template.active == True
+    ).first()
+    return tpl.content if tpl else None
 
 def call_claude(system_prompt, user_message):
     client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
     message = client.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=4096,
+        max_tokens=CLAUDE_MAX_TOKENS,
         temperature=0.2,
         system=system_prompt,
         messages=[{"role": "user", "content": user_message}]
     )
     return message.content[0].text if message and message.content else ""
+
+def build_system_prompt(config, bot_id, context_history=None):
+    # Insert dynamic macros into your prompt (e.g., TOOLS_TABLE)
+    system_prompt = config.get("system_prompt", "")
+    if "{{TOOLS_TABLE}}" in system_prompt:
+        tools_table = get_tools_table_prompt(bot_id)
+        system_prompt = system_prompt.replace("{{TOOLS_TABLE}}", tools_table)
+    # Add context if given
+    if context_history:
+        system_prompt = f"[Conversation History:]\n{context_history}\n\n{system_prompt}"
+    return system_prompt
 
 # ---- MAIN CHAT HANDLER ----
 
@@ -208,7 +242,7 @@ def webhook():
     from_number = (message_data.get('fromNumber') or message_data.get('from', '').lstrip('+')).replace('@c.us','')
     customer = get_customer_by_phone(from_number)
     if not customer:
-        customer = Customer(phone_number=from_number, name=from_number, language=detect_language(message_data.get('body','')))
+        customer = Customer(phone_number=from_number, name=from_number, language="und")
         db_session.add(customer)
         db_session.commit()
 
@@ -221,33 +255,57 @@ def webhook():
     msg_text = message_data.get('body', '').strip()
     save_message(session.id, 'user', msg_text, {"from": from_number})
 
-    # --- Manager AI picks tool
-    manager_prompt = config.get("manager_system_prompt", "")
-    manager_prompt = manager_prompt.replace("{{TOOLS_TABLE}}", get_tools_table_prompt())
-    tool_pick = call_claude(manager_prompt, msg_text)
+    # ---- Fetch last 20 messages for context ----
+    messages_for_context = get_last_n_messages(session.id, n=20)
+    context_history = ""
+    for m in messages_for_context:
+        sender = "User" if m.sender_type == "user" else "Assistant"
+        context_history += f"{sender}: {m.message}\n"
+
+    # ---- Build prompt with context ----
+    manager_prompt = build_system_prompt(config, bot.id, context_history=context_history)
+
+    # ---- Count tokens and log if over ----
+    user_tokens = count_tokens(msg_text)
+    prompt_tokens = count_tokens(manager_prompt)
+    total_tokens = prompt_tokens + user_tokens
+
+    if total_tokens > CLAUDE_MAX_TOKENS:
+        print(f"[WARNING] Token limit exceeded! Total: {total_tokens} (Prompt: {prompt_tokens}, User: {user_tokens})")
+
+    # ---- Claude call ----
+    ai_result_raw = call_claude(manager_prompt, msg_text)
     try:
-        tool_json = json.loads(tool_pick)
-        tool_id = tool_json.get("TOOLS", "Default")
+        ai_result = json.loads(ai_result_raw)
     except Exception as e:
-        tool_id = "Default"
+        ai_result = {}
 
-    # ---- If "saleswon", notify group
-    if tool_id.lower() == "saleswon":
-        notify_sales_group(config, customer, session)
-        send_whatsapp_reply(customer.phone_number, "感谢您的配合，后续团队会尽快跟进并致电您！", device_id)
-        session.status = "closed"
-        session.ended_at = datetime.now()
-        db_session.commit()
-        return jsonify({'status': 'saleswon_notified'})
+    # ---- Template (multi-part) reply ----
+    if "template" in ai_result:
+        template_id = ai_result["template"]
+        tpl_content = get_template_content(bot.id, template_id)
+        if tpl_content:
+            send_structured_template(customer.phone_number, tpl_content, device_id)
+            save_message(session.id, 'ai', f"[TEMPLATE:{template_id}]", {})
+        else:
+            send_whatsapp_reply(customer.phone_number, "Sorry, template not found.", device_id)
+        return jsonify({'status': 'template_sent', 'template': template_id})
 
-    # ---- Normal agent/AI reply (you can expand this for your specific Claude reply)
-    # This is where your "system_prompt" can be used for natural reply (e.g. for default flow)
-    agent_prompt = config.get("system_prompt", "")
-    ai_reply = call_claude(agent_prompt, msg_text)
-    send_reply_with_delay(customer.phone_number, ai_reply, device_id, max_parts=3)
-    save_message(session.id, 'ai', ai_reply, {})
+    # ---- Normal AI message (split if multi-part) ----
+    messages = ai_result.get("message") or []
+    if isinstance(messages, str):
+        messages = [messages]
+    if messages:
+        for m in messages[:3]:  # Limit to max 3 parts
+            send_whatsapp_reply(customer.phone_number, m, device_id)
+            time.sleep(1)
+        save_message(session.id, 'ai', "\n".join(messages), {})
+        return jsonify({'status': 'message_sent'})
 
-    return jsonify({'status': 'ok', 'tool': tool_id})
+    # ---- Fallback ----
+    send_whatsapp_reply(customer.phone_number, "ok got it, will get back soon", device_id)
+    save_message(session.id, 'ai', "[FALLBACK]", {})
+    return jsonify({'status': 'fallback'})
 
 @app.route('/health', methods=['GET'])
 def health():
