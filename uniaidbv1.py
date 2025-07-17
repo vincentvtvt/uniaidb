@@ -84,23 +84,15 @@ def call_claude(prompt, user_message, max_tokens=256):
     )
     return message.content[0].text if message and message.content else ""
 
-# ---- TWO-STAGE LOGIC ----
-@app.route('/ai-universal', methods=['POST'])
-def ai_universal():
-    data = request.get_json(force=True)
-    user_message = data.get('message')
-    bot_id = data.get('bot_id')
-    if not user_message or not bot_id:
-        return jsonify({'error': 'Missing user_message or bot_id'}), 400
-
+def orchestration_logic(user_message, bot_id):
     bot = db_session.query(Bot).filter(Bot.id == bot_id).first()
     if not bot:
-        return jsonify({'error': 'Invalid bot_id'}), 400
+        return {"error": "Invalid bot_id"}, 400
 
     # --- Stage 1: Tool Selection ---
     tools_table = get_tools_table_prompt(bot_id)
     if "Default" not in tools_table:
-        return jsonify({'error': 'No Default tool linked to this bot'}), 500
+        return {"error": "No Default tool linked to this bot"}, 500
     manager_prompt = build_manager_prompt(bot.manager_system_prompt, tools_table)
     print("[Manager System Prompt]:", manager_prompt)
     print("[User Message]:", user_message)
@@ -111,11 +103,11 @@ def ai_universal():
         print("[Manager AI JSON]:", ai_result)
     except Exception as e:
         print(f"[Manager Claude JSON error]: {e} | Output: {ai_result_raw}")
-        return jsonify({'error': 'Manager Claude returned invalid JSON', 'raw': ai_result_raw}), 500
+        return {"error": "Manager Claude returned invalid JSON", "raw": ai_result_raw}, 500
 
     tool_id = ai_result.get("TOOLS")
     if not tool_id:
-        return jsonify({'error': 'No TOOL selected by manager Claude', 'raw': ai_result_raw}), 500
+        return {"error": "No TOOL selected by manager Claude", "raw": ai_result_raw}, 500
 
     # --- Stage 2: Route Based on Tool ---
     if tool_id == "Default":
@@ -130,10 +122,10 @@ def ai_universal():
         except Exception as e:
             print(f"[Customer Agent JSON error]: {e} | Output: {ai_cust_raw}")
             ai_cust = {}
-        return jsonify({"stage": "default", "customer_agent_reply": ai_cust, "raw": ai_cust_raw})
+        return {"stage": "default", "customer_agent_reply": ai_cust, "raw": ai_cust_raw}, 200
 
     else:
-        # Use the selected tool's prompt (if you want agentic logic for that tool)
+        # Use the selected tool's prompt
         tool = db_session.query(Tool).filter(Tool.tool_id == tool_id).first()
         tool_prompt = tool.prompt if tool and tool.prompt else f"你是一个工具助手，请执行 {tool_id} 对应的操作，输出规范JSON。"
         print(f"[Routing] Manager chose tool {tool_id}; calling tool agent.")
@@ -145,7 +137,32 @@ def ai_universal():
         except Exception as e:
             print(f"[Tool Agent JSON error for {tool_id}]: {e} | Output: {ai_tool_raw}")
             ai_tool = {}
-        return jsonify({"stage": "tool", "tool_id": tool_id, "tool_agent_reply": ai_tool, "raw": ai_tool_raw})
+        return {"stage": "tool", "tool_id": tool_id, "tool_agent_reply": ai_tool, "raw": ai_tool_raw}, 200
+
+@app.route('/ai-universal', methods=['POST'])
+def ai_universal():
+    data = request.get_json(force=True)
+    user_message = data.get('message')
+    bot_id = data.get('bot_id')
+    if not user_message or not bot_id:
+        return jsonify({'error': 'Missing user_message or bot_id'}), 400
+    result, status = orchestration_logic(user_message, bot_id)
+    return jsonify(result), status
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    # Alias for compatibility: same as /ai-universal
+    data = request.get_json(force=True)
+    user_message = data.get('message')
+    bot_id = data.get('bot_id')
+    if not user_message or not bot_id:
+        return jsonify({'error': 'Missing user_message or bot_id'}), 400
+    result, status = orchestration_logic(user_message, bot_id)
+    return jsonify(result), status
+
+@app.route('/')
+def home():
+    return "Universal AI Bot is running.", 200
 
 @app.route('/health', methods=['GET'])
 def health():
