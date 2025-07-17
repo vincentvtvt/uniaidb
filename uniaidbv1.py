@@ -1,202 +1,147 @@
 import os
-import json
+import logging
 from flask import Flask, request, jsonify
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, Text, ForeignKey
-from sqlalchemy.orm import declarative_base, sessionmaker, scoped_session
-import anthropic
-
-DATABASE_URL = os.getenv("DATABASE_URL")
-CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY")
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-3-haiku-20240307")
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import func
+from datetime import datetime
 
 app = Flask(__name__)
-Base = declarative_base()
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv("DATABASE_URL", "postgresql://...")  # Edit!
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
 
-# --- MODELS ---
-class Tool(Base):
-    __tablename__ = 'tools'
-    id = Column(Integer, primary_key=True)
-    tool_id = Column(String(50), unique=True)
-    name = Column(String(100))
-    description = Column(Text)
-    prompt = Column(Text)
-    active = Column(Boolean, default=True)
+# ---------- SQLAlchemy Models ----------
 
-class Bot(Base):
+class Bot(db.Model):
     __tablename__ = 'bots'
-    id = Column(Integer, primary_key=True)
-    name = Column(String(50))
-    phone_number = Column(String(30), unique=True)
-    manager_system_prompt = Column(Text)  # for tool selection
-    system_prompt = Column(Text)          # for default flow (customer reply)
-    config = Column(Text)                 # for other config if needed
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100))
+    system_prompt = db.Column(db.Text)
+    manager_system_prompt = db.Column(db.Text)
 
-class BotTools(Base):
+class Tool(db.Model):
+    __tablename__ = 'tools'
+    id = db.Column(db.Integer, primary_key=True)
+    tool_id = db.Column(db.String(50), unique=True, nullable=False)
+    name = db.Column(db.String(100))
+    description = db.Column(db.Text)
+    prompt = db.Column(db.Text)
+    action_type = db.Column(db.String(30))
+    active = db.Column(db.Boolean)
+    created_at = db.Column(db.DateTime, default=func.now())
+
+class BotTool(db.Model):
     __tablename__ = 'bot_tools'
-    id = Column(Integer, primary_key=True)
-    bot_id = Column(Integer)
-    tool_id = Column(String(50))
-    active = Column(Boolean, default=True)
+    id = db.Column(db.Integer, primary_key=True)
+    bot_id = db.Column(db.Integer)
+    tool_id = db.Column(db.String(50), nullable=False)  # String!
+    active = db.Column(db.Boolean)
 
-# --- DB Setup ---
-engine = create_engine(DATABASE_URL)
-Base.metadata.create_all(engine)
-db_session = scoped_session(sessionmaker(bind=engine))
+class Message(db.Model):
+    __tablename__ = 'messages'
+    id = db.Column(db.Integer, primary_key=True)
+    session_id = db.Column(db.Integer)
+    sender_type = db.Column(db.String(16))
+    sender_id = db.Column(db.String(100), nullable=True)
+    message = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=func.now())
 
-# --- Helpers (same as above, not shown for brevity) ---
-# ... [get_tools_table_prompt, build_manager_prompt, call_claude, orchestration_logic, etc. as in earlier code]
+# ---------- Context Utilities ----------
 
-# (Paste your orchestration_logic, get_tools_table_prompt, etc. here, unchanged!)
+def save_message(session_id, sender_type, text, sender_id=None):
+    m = Message(session_id=session_id, sender_type=sender_type, message=text, sender_id=sender_id)
+    db.session.add(m)
+    db.session.commit()
 
-def get_tools_table_prompt(bot_id):
-    tool_links = db_session.query(BotTools).filter(
-        BotTools.bot_id == bot_id, BotTools.active == True
-    ).all()
-    tool_ids = [t.tool_id for t in tool_links]
-    tools = db_session.query(Tool).filter(
-        Tool.tool_id.in_(tool_ids), Tool.active == True
-    ).all()
-    tools = sorted(tools, key=lambda t: 0 if t.tool_id == "Default" else 1)
-    table = ""
-    for t in tools:
-        table += f"{t.tool_id}|{t.description}\n"
-    return table.strip()
+def get_context(session_id, limit=20):
+    msgs = Message.query.filter_by(session_id=session_id).order_by(Message.created_at.desc()).limit(limit).all()
+    return list(reversed([{"role": m.sender_type, "content": m.message} for m in msgs]))
 
-def build_manager_prompt(manager_system_prompt, tools_table):
-    return f"""{manager_system_prompt}
+# ---------- Tool Utilities ----------
 
-<TOOLS>
-{tools_table}
-</TOOLS>
+def get_tools_for_bot(bot_id):
+    bot_tools = BotTool.query.filter_by(bot_id=bot_id, active=True).all()
+    tool_ids = [bt.tool_id for bt in bot_tools]
+    tools = Tool.query.filter(Tool.tool_id.in_(tool_ids), Tool.active == True).all()
+    return {t.tool_id: t for t in tools}
 
-<ExampleOutput>
-{{
-  "TOOLS": "Default"
-}}
-</ExampleOutput>
+def get_default_prompt(bot_id):
+    bot = Bot.query.get(bot_id)
+    return bot.system_prompt if bot else ""
 
-IMPORTANT: Only output a pure JSON object matching the ExampleOutput, with the selected TOOL ID. No greetings, no explanations, no extra text—just the JSON object.
-"""
+def get_manager_system_prompt(bot_id):
+    bot = Bot.query.get(bot_id)
+    return bot.manager_system_prompt if bot else ""
 
-def call_claude(prompt, user_message, max_tokens=256):
-    client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
-    message = client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=max_tokens,
-        temperature=0.0,
-        system=prompt,
-        messages=[{"role": "user", "content": user_message}]
-    )
-    return message.content[0].text if message and message.content else ""
+# ---------- AI Orchestration Logic ----------
 
-def orchestration_logic(user_message, bot_id):
-    bot = db_session.query(Bot).filter(Bot.id == bot_id).first()
-    if not bot:
-        return {"error": "Invalid bot_id"}, 400
+def orchestrate_ai(msg_text, session_id, bot_id):
+    # Gather context and tool info
+    context = get_context(session_id)
+    tools_dict = get_tools_for_bot(bot_id)
+    manager_prompt = get_manager_system_prompt(bot_id)
+    system_prompt = get_default_prompt(bot_id)
 
-    # --- Stage 1: Tool Selection ---
-    tools_table = get_tools_table_prompt(bot_id)
-    if "Default" not in tools_table:
-        return {"error": "No Default tool linked to this bot"}, 500
-    manager_prompt = build_manager_prompt(bot.manager_system_prompt, tools_table)
-    print("[Manager System Prompt]:", manager_prompt)
-    print("[User Message]:", user_message)
-    ai_result_raw = call_claude(manager_prompt, user_message)
-    print("[Manager Claude Raw Output]:", ai_result_raw)
-    try:
-        ai_result = json.loads(ai_result_raw)
-        print("[Manager AI JSON]:", ai_result)
-    except Exception as e:
-        print(f"[Manager Claude JSON error]: {e} | Output: {ai_result_raw}")
-        return {"error": "Manager Claude returned invalid JSON", "raw": ai_result_raw}, 500
+    # Call your Claude/OpenAI/LLM here (pseudo code)
+    # response = call_claude_or_openai(
+    #     prompt=manager_prompt, tools=tools_dict, context=context, message=msg_text
+    # )
 
-    tool_id = ai_result.get("TOOLS")
-    if not tool_id:
-        return {"error": "No TOOL selected by manager Claude", "raw": ai_result_raw}, 500
+    # For demo, we just echo:
+    response = {
+        "tool_id": "defaultvpt",  # or pick from tools_dict.keys()
+        "reply": f"(AI) You said: {msg_text}"
+    }
 
-    # --- Stage 2: Route Based on Tool ---
-    if tool_id == "Default":
-        # Proceed to customer-facing agent, use system_prompt for reply
-        print("[Routing] Manager chose Default; calling customer agent.")
-        customer_prompt = bot.system_prompt
-        ai_cust_raw = call_claude(customer_prompt, user_message, max_tokens=512)
-        print("[Customer Agent Raw Output]:", ai_cust_raw)
-        try:
-            ai_cust = json.loads(ai_cust_raw)
-            print("[Customer Agent AI JSON]:", ai_cust)
-        except Exception as e:
-            print(f"[Customer Agent JSON error]: {e} | Output: {ai_cust_raw}")
-            ai_cust = {}
-        return {"stage": "default", "customer_agent_reply": ai_cust, "raw": ai_cust_raw}, 200
+    # If tool_id is not found, use system_prompt as fallback
+    if response["tool_id"] not in tools_dict:
+        response["reply"] = system_prompt or "Sorry, no suitable tool. Using default reply."
 
-    else:
-        # Use the selected tool's prompt
-        tool = db_session.query(Tool).filter(Tool.tool_id == tool_id).first()
-        tool_prompt = tool.prompt if tool and tool.prompt else f"你是一个工具助手，请执行 {tool_id} 对应的操作，输出规范JSON。"
-        print(f"[Routing] Manager chose tool {tool_id}; calling tool agent.")
-        ai_tool_raw = call_claude(tool_prompt, user_message, max_tokens=256)
-        print(f"[Tool Agent Raw Output for {tool_id}]:", ai_tool_raw)
-        try:
-            ai_tool = json.loads(ai_tool_raw)
-            print(f"[Tool Agent AI JSON for {tool_id}]:", ai_tool)
-        except Exception as e:
-            print(f"[Tool Agent JSON error for {tool_id}]: {e} | Output: {ai_tool_raw}")
-            ai_tool = {}
-        return {"stage": "tool", "tool_id": tool_id, "tool_agent_reply": ai_tool, "raw": ai_tool_raw}, 200
+    return response
+
+# ---------- Wassenger WhatsApp Integration ----------
+
+def send_whatsapp_reply(phone_number, text, device_id=None):
+    # Wassenger API call (pseudo code)
+    logging.info(f"Send to WhatsApp [{phone_number}]: {text}")
+    # TODO: requests.post('https://api.wassenger.com/v1/messages', ...)
+
+# ---------- Flask Webhook ----------
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    """
-    Universal webhook for Wassenger format. Extracts text, bot number, and calls orchestration.
-    """
-    payload = request.get_json(force=True)
-    print("[Wassenger Payload]:", json.dumps(payload, ensure_ascii=False, indent=2))
+    try:
+        payload = request.json
+        logging.info(f"[Wassenger Payload]: {payload}")
 
-    # Check it's a new inbound message event
-    if not payload or payload.get("event") != "message:in:new":
-        return jsonify({"ignored": True}), 200
+        # Extract phone/session/other info from payload as needed
+        chat = payload.get("data", {}).get("chat", {})
+        phone_number = chat.get("id", "")
+        session_id = 2  # TODO: Your session mapping logic
+        msg_text = payload.get("data", {}).get("body", "")
 
-    data = payload.get("data", {})
-    msg_text = data.get("text") or data.get("body") or ""  # handle text or body
-    bot_phone = (data.get("to") or "").replace("+", "").replace("@c.us", "")  # normalize
-    if not msg_text or not bot_phone:
-        return jsonify({"error": "Missing text or bot phone"}), 400
+        # Get bot_id (you should map phone/device to bot_id)
+        bot_id = 1
 
-    # Lookup bot_id by bot_phone (try with/without "+")
-    bot = db_session.query(Bot).filter(
-        (Bot.phone_number == bot_phone) | 
-        (Bot.phone_number == f"+{bot_phone}")
-    ).first()
-    if not bot:
-        print(f"[Webhook] No bot found for phone: {bot_phone}")
-        return jsonify({"error": "Bot not found for phone", "phone": bot_phone}), 404
+        # Save incoming message
+        save_message(session_id, "user", msg_text)
 
-    bot_id = bot.id
+        # Run AI logic
+        result = orchestrate_ai(msg_text, session_id, bot_id)
 
-    # Pass to orchestration
-    result, status = orchestration_logic(msg_text, bot_id)
-    # Optionally: Send AI result back to WhatsApp here via Wassenger send API
+        # Save AI response
+        save_message(session_id, "ai", result["reply"])
 
-    return jsonify(result), status
+        # Send back to WhatsApp
+        send_whatsapp_reply(phone_number, result["reply"])
 
-@app.route('/ai-universal', methods=['POST'])
-def ai_universal():
-    data = request.get_json(force=True)
-    user_message = data.get('message')
-    bot_id = data.get('bot_id')
-    if not user_message or not bot_id:
-        return jsonify({'error': 'Missing user_message or bot_id'}), 400
-    result, status = orchestration_logic(user_message, bot_id)
-    return jsonify(result), status
+        return jsonify({"status": "ok", "result": result}), 200
 
-@app.route('/')
-def home():
-    return "Universal AI Bot is running.", 200
+    except Exception as e:
+        logging.exception("Webhook error")
+        return jsonify({"status": "error", "reason": str(e)}), 500
 
-@app.route('/health', methods=['GET'])
-def health():
-    return "OK", 200
+# ---------- Run ----------
 
-if __name__ == '__main__':
-    port = int(os.getenv("PORT", 18080))
-    app.run(host='0.0.0.0', port=port, debug=True)
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.I
