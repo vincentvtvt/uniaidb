@@ -43,6 +43,11 @@ engine = create_engine(DATABASE_URL)
 Base.metadata.create_all(engine)
 db_session = scoped_session(sessionmaker(bind=engine))
 
+# --- Helpers (same as above, not shown for brevity) ---
+# ... [get_tools_table_prompt, build_manager_prompt, call_claude, orchestration_logic, etc. as in earlier code]
+
+# (Paste your orchestration_logic, get_tools_table_prompt, etc. here, unchanged!)
+
 def get_tools_table_prompt(bot_id):
     tool_links = db_session.query(BotTools).filter(
         BotTools.bot_id == bot_id, BotTools.active == True
@@ -139,19 +144,43 @@ def orchestration_logic(user_message, bot_id):
             ai_tool = {}
         return {"stage": "tool", "tool_id": tool_id, "tool_agent_reply": ai_tool, "raw": ai_tool_raw}, 200
 
-@app.route('/ai-universal', methods=['POST'])
-def ai_universal():
-    data = request.get_json(force=True)
-    user_message = data.get('message')
-    bot_id = data.get('bot_id')
-    if not user_message or not bot_id:
-        return jsonify({'error': 'Missing user_message or bot_id'}), 400
-    result, status = orchestration_logic(user_message, bot_id)
-    return jsonify(result), status
-
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    # Alias for compatibility: same as /ai-universal
+    """
+    Universal webhook for Wassenger format. Extracts text, bot number, and calls orchestration.
+    """
+    payload = request.get_json(force=True)
+    print("[Wassenger Payload]:", json.dumps(payload, ensure_ascii=False, indent=2))
+
+    # Check it's a new inbound message event
+    if not payload or payload.get("event") != "message:in:new":
+        return jsonify({"ignored": True}), 200
+
+    data = payload.get("data", {})
+    msg_text = data.get("text") or data.get("body") or ""  # handle text or body
+    bot_phone = (data.get("to") or "").replace("+", "").replace("@c.us", "")  # normalize
+    if not msg_text or not bot_phone:
+        return jsonify({"error": "Missing text or bot phone"}), 400
+
+    # Lookup bot_id by bot_phone (try with/without "+")
+    bot = db_session.query(Bot).filter(
+        (Bot.phone_number == bot_phone) | 
+        (Bot.phone_number == f"+{bot_phone}")
+    ).first()
+    if not bot:
+        print(f"[Webhook] No bot found for phone: {bot_phone}")
+        return jsonify({"error": "Bot not found for phone", "phone": bot_phone}), 404
+
+    bot_id = bot.id
+
+    # Pass to orchestration
+    result, status = orchestration_logic(msg_text, bot_id)
+    # Optionally: Send AI result back to WhatsApp here via Wassenger send API
+
+    return jsonify(result), status
+
+@app.route('/ai-universal', methods=['POST'])
+def ai_universal():
     data = request.get_json(force=True)
     user_message = data.get('message')
     bot_id = data.get('bot_id')
