@@ -4,7 +4,7 @@ import time
 import json
 from flask import Flask, request, jsonify
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, JSON, ForeignKey, Boolean
-from sqlalchemy.orm import declarative_base  # updated for SQLAlchemy 2.0+
+from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import sessionmaker, scoped_session
 from datetime import datetime, timedelta
 import requests
@@ -207,9 +207,7 @@ def call_claude(system_prompt, user_message):
     return message.content[0].text if message and message.content else ""
 
 def build_system_prompt(config, bot_id, context_history=None):
-    # Insert dynamic macros into your prompt (e.g., TOOLS_TABLE)
     system_prompt = config.get("system_prompt", "")
-    # Strongly enforce JSON output at the end of the prompt:
     json_instruction = """
 IMPORTANT: Only reply with valid JSON in the following format. Do not include markdown or commentary, do not include explanations, only output JSON:
 { "template": "template_id", "message": ["text1", "text2"] }
@@ -240,11 +238,13 @@ def webhook():
     bot_phone = (message_data.get('toNumber') or message_data.get('to') or "").replace('+', '').replace('@c.us', '')
     bot = get_active_bot(bot_phone)
     if not bot:
+        print(f"[NO BOT FOUND] phone: {bot_phone}")
         return jsonify({'status': 'no_bot_found'})
 
     config = bot.config or {}
     device_id = config.get("device_id")
     if not device_id:
+        print(f"[NO DEVICE ID] Bot {bot.id} missing device_id in config.")
         return jsonify({'status': 'no_device_id'})
 
     from_number = (message_data.get('fromNumber') or message_data.get('from', '').lstrip('+')).replace('@c.us','')
@@ -287,6 +287,7 @@ def webhook():
 
     try:
         ai_result = json.loads(ai_result_raw)
+        print(f"[AI JSON Parsed] {ai_result}")  # LOG PARSED AI JSON
     except Exception as e:
         print(f"[Claude JSON error] {e} | Output: {ai_result_raw}")  # LOG JSON ERROR
         ai_result = {}
@@ -295,10 +296,17 @@ def webhook():
     if "template" in ai_result:
         template_id = ai_result["template"]
         tpl_content = get_template_content(bot.id, template_id)
+        print(f"[AI chose template] bot_id={bot.id}, template_id={template_id}")
         if tpl_content:
+            print(f"[Template found] Sending template: {template_id}")
             send_structured_template(customer.phone_number, tpl_content, device_id)
             save_message(session.id, 'ai', f"[TEMPLATE:{template_id}]", {})
         else:
+            print(f"[TEMPLATE NOT FOUND] bot_id={bot.id}, template_id={template_id}. Existing template_ids for this bot:")
+            available_tpls = db_session.query(Template).filter(
+                Template.bot_id == bot.id, Template.active == True
+            ).all()
+            print("Available:", [t.template_id for t in available_tpls])
             send_whatsapp_reply(customer.phone_number, "Sorry, template not found.", device_id)
         return jsonify({'status': 'template_sent', 'template': template_id})
 
@@ -307,6 +315,7 @@ def webhook():
     if isinstance(messages, str):
         messages = [messages]
     if messages:
+        print(f"[AI sending message(s)] {messages}")
         for m in messages[:3]:  # Limit to max 3 parts
             send_whatsapp_reply(customer.phone_number, m, device_id)
             time.sleep(1)
@@ -314,6 +323,7 @@ def webhook():
         return jsonify({'status': 'message_sent'})
 
     # ---- Fallback ----
+    print("[FALLBACK] No valid AI response, sending fallback.")
     send_whatsapp_reply(customer.phone_number, "ok got it, will get back soon", device_id)
     save_message(session.id, 'ai', "[FALLBACK]", {})
     return jsonify({'status': 'fallback'})
