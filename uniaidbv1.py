@@ -62,9 +62,22 @@ class Message(db.Model):
     raw_media_url = db.Column(db.Text)
     created_at = db.Column(db.DateTime)
 
-# --- Media/Text Extraction ---
+# --- Media URL extraction ---
+def get_media_url(media):
+    """Get public URL or download endpoint for any media."""
+    url = media.get("url")
+    if not url and "links" in media and "download" in media["links"]:
+        url = media["links"]["download"]
+    return url
+
+# --- Download file from URL (with API token if Wassenger endpoint) ---
 def download_file(url):
-    r = requests.get(url)
+    if url and url.startswith("/v1/"):
+        full_url = "https://api.wassenger.com" + url
+        headers = {"Token": WASSENGER_API_KEY}
+        r = requests.get(full_url, headers=headers)
+    else:
+        r = requests.get(url)
     r.raise_for_status()
     return r.content
 
@@ -98,10 +111,13 @@ def transcribe_audio_from_url(audio_url):
 def extract_text_from_message(msg):
     msg_type = msg.get("type", "text")
     logger.info(f"[MEDIA DETECT] Message type: {msg_type}")
+
     if msg_type == "text":
         return msg.get("body", ""), None
+
     elif msg_type == "image":
-        img_url = msg.get("media", {}).get("url")
+        media = msg.get("media", {})
+        img_url = get_media_url(media)
         caption = msg.get("body", "")
         try:
             ocr_text = extract_text_from_image(img_url) if img_url else ""
@@ -110,16 +126,21 @@ def extract_text_from_message(msg):
             ocr_text = ""
         combined = " ".join(filter(None, [caption, ocr_text]))
         return combined.strip() or "[Image received, no text found]", img_url
+
     elif msg_type == "audio":
-        audio_url = msg.get("media", {}).get("url")
+        media = msg.get("media", {})
+        audio_url = get_media_url(media)
         try:
             transcript = transcribe_audio_from_url(audio_url) if audio_url else "[Audio received, no url]"
             return transcript, audio_url
         except Exception as e:
             logger.error(f"[AUDIO TRANSCRIBE] {e}")
             return "[Audio received, transcription failed]", audio_url
+
     elif msg_type == "sticker":
-        img_url = msg.get("media", {}).get("url")
+        logger.info(f"[DEBUG] Sticker payload: {msg}")
+        media = msg.get("media", {})
+        img_url = get_media_url(media)
         if img_url:
             try:
                 meaning = extract_text_from_image(
@@ -130,7 +151,18 @@ def extract_text_from_message(msg):
             except Exception as e:
                 logger.error(f"[STICKER MEANING] {e}")
                 return "[Sticker received]", img_url
+        logger.warning("[STICKER] No media url or download link found in sticker payload.")
         return "[Sticker received]", None
+
+    elif msg_type == "document":
+        media = msg.get("media", {})
+        doc_url = get_media_url(media)
+        filename = media.get("filename", "document")
+        if doc_url:
+            return f"[Document received: {filename}]", doc_url
+        else:
+            return "[Document received, but no download url found]", None
+
     else:
         return f"[Unrecognized message type: {msg_type}]", None
 
