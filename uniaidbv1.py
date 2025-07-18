@@ -62,130 +62,24 @@ class Message(db.Model):
     raw_media_url = db.Column(db.Text)
     created_at = db.Column(db.DateTime)
 
-# --- Media/Text Extraction ---
-def download_file(url):
-    if url and url.startswith("/v1/"):
-        full_url = "https://api.wassenger.com" + url
-        headers = {"Token": WASSENGER_API_KEY}
-        r = requests.get(full_url, headers=headers)
-    else:
-        r = requests.get(url)
-    r.raise_for_status()
-    return r.content
+class Template(db.Model):
+    __tablename__ = 'templates'
+    id = db.Column(db.Integer, primary_key=True)
+    template_id = db.Column(db.String(100), unique=True)
+    content = db.Column(db.Text)  # JSON: [{"type":"text","content":...},...]
 
-def encode_image_b64(img_bytes):
-    return base64.b64encode(img_bytes).decode()
+# --- Language Detection and Customer Handling ---
+def detect_language(text):
+    if re.search(r'[\u4e00-\u9fff]', text):
+        return 'zh'
+    return 'en'
 
-def extract_text_from_image(img_url, prompt=None):
-    image_bytes = download_file(img_url)
-    img_b64 = encode_image_b64(image_bytes)
-    logger.info("[VISION] Sending image to OpenAI Vision...")
-    messages = [
-        {"role": "system", "content": prompt or "Extract all visible text from this image. If no text, describe what you see."},
-        {"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}]}
-    ]
-    result = openai.chat.completions.create(
-        model="gpt-4o",
-        messages=messages,
-        max_tokens=256
-    )
-    return result.choices[0].message.content.strip()
+def get_or_create_customer(phone, lang):
+    # Here you can add your own Customer table/model
+    # This example just returns lang, but should create or update in your real model.
+    return {"phone": phone, "language": lang}
 
-def transcribe_audio_from_url(audio_url):
-    audio_bytes = download_file(audio_url)
-    temp_path = "/tmp/temp_audio.ogg"
-    with open(temp_path, "wb") as f:
-        f.write(audio_bytes)
-    with open(temp_path, "rb") as audio_file:
-        transcript = openai.audio.transcriptions.create(model="whisper-1", file=audio_file)
-    return transcript.text.strip()
-
-def get_media_url(media):
-    url = media.get("url")
-    if not url and "links" in media and "download" in media["links"]:
-        url = media["links"]["download"]
-    return url
-
-def extract_text_from_message(msg):
-    msg_type = msg.get("type", "text")
-    logger.info(f"[MEDIA DETECT] Message type: {msg_type}")
-
-    if msg_type == "text":
-        return msg.get("body", ""), None
-
-    elif msg_type == "image":
-        media = msg.get("media", {})
-        img_url = get_media_url(media)
-        caption = msg.get("body", "")
-        try:
-            ocr_text = extract_text_from_image(img_url) if img_url else ""
-        except Exception as e:
-            logger.error(f"[IMAGE OCR] {e}")
-            ocr_text = ""
-        combined = " ".join(filter(None, [caption, ocr_text]))
-        return combined.strip() or "[Image received, no text found]", img_url
-
-    elif msg_type == "audio":
-        media = msg.get("media", {})
-        audio_url = get_media_url(media)
-        try:
-            transcript = transcribe_audio_from_url(audio_url) if audio_url else "[Audio received, no url]"
-            return transcript, audio_url
-        except Exception as e:
-            logger.error(f"[AUDIO TRANSCRIBE] {e}")
-            return "[Audio received, transcription failed]", audio_url
-
-    elif msg_type == "sticker":
-        logger.info(f"[DEBUG] Sticker payload: {msg}")
-        media = msg.get("media", {})
-        img_url = get_media_url(media)
-        if img_url:
-            try:
-                meaning = extract_text_from_image(
-                    img_url,
-                    prompt="This is a WhatsApp sticker. Describe exactly what this sticker shows, including the animal or object, its pose, facial expression, and possible mood or context. Use Malaysian-style directness. Example outputs: 'cat relaxing', 'cat surprised', 'cat excited', 'cat surrender pose', etc.'"
-                )
-                return meaning or "[Sticker received]", img_url
-            except Exception as e:
-                logger.error(f"[STICKER MEANING] {e}")
-                return "[Sticker received]", img_url
-        logger.warning("[STICKER] No media url or download link found in sticker payload.")
-        return "[Sticker received]", None
-
-    elif msg_type == "document":
-        media = msg.get("media", {})
-        doc_url = get_media_url(media)
-        filename = media.get("filename", "document")
-        if doc_url:
-            return f"[Document received: {filename}]", doc_url
-        else:
-            return "[Document received, but no download url found]", None
-
-    elif msg_type == "video":
-        media = msg.get("media", {})
-        vid_url = get_media_url(media)
-        if vid_url:
-            return "[Video received]", vid_url
-        else:
-            return "[Video received, but no download url found]", None
-
-    else:
-        return f"[Unrecognized message type: {msg_type}]", None
-
-def generate_media_description(media_url, media_type):
-    """Returns description string using Vision for image/video/sticker, else empty."""
-    if media_type in ("image", "sticker", "video"):
-        prompt = (
-            "Describe exactly what this shows, including the subject, pose, mood, and possible context. "
-            "If it's a sticker, say so and describe the emotion or intent. "
-            "Example: 'cat lying belly up, playful and relaxed, looks like a WhatsApp sticker.'"
-        )
-        try:
-            return extract_text_from_image(media_url, prompt)
-        except Exception as e:
-            logger.error(f"[VISION DESC] {media_type} failed: {e}")
-            return ""
-    return ""
+# --- Media/Text Extraction, Vision, Audio... (unchanged, see your code) ---
 
 # --- Wassenger Send Message (with delayed delivery via API) ---
 def send_wassenger_reply(phone, content, device_id, delay_seconds=0, msg_type="text"):
@@ -194,20 +88,17 @@ def send_wassenger_reply(phone, content, device_id, delay_seconds=0, msg_type="t
     payload = {"phone": phone, "device": device_id}
     if msg_type == "text":
         payload["message"] = content
-    elif msg_type in ("image", "sticker"):
+    elif msg_type in ("image", "sticker", "video"):
         payload["mediaUrl"] = content
         payload["message"] = ""
+        if msg_type != "image":
+            payload["type"] = msg_type
     elif msg_type == "audio":
         payload["mediaUrl"] = content
         payload["message"] = ""
         payload["type"] = "audio"
-    elif msg_type == "video":
-        payload["mediaUrl"] = content
-        payload["message"] = ""
-        payload["type"] = "video"
     else:
         payload["message"] = content  # fallback
-
     if delay_seconds > 0:
         deliver_at = datetime.utcnow() + timedelta(seconds=delay_seconds)
         payload["deliverAt"] = deliver_at.isoformat() + "Z"
@@ -259,7 +150,7 @@ def save_message(bot_id, customer_phone, session_id, direction, content, raw_med
     db.session.commit()
     logger.info(f"[DB] Saved message ({direction}) for {customer_phone}: {content}")
 
-def get_latest_history(bot_id, customer_phone, session_id, n=20):
+def get_latest_history(bot_id, customer_phone, session_id, n=50):  # last 50 for context
     messages = (Message.query
         .filter_by(bot_id=bot_id, customer_phone=customer_phone, session_id=session_id)
         .order_by(Message.created_at.desc())
@@ -269,9 +160,25 @@ def get_latest_history(bot_id, customer_phone, session_id, n=20):
     logger.info(f"[DB] History ({len(messages)} messages) loaded.")
     return messages
 
+# --- Template/Attachment Sending (new, #7) ---
+def send_template_by_id(phone, template_id, device_id):
+    tmpl = Template.query.filter_by(template_id=template_id).first()
+    if not tmpl:
+        logger.warning(f"[TEMPLATE] Template {template_id} not found in DB.")
+        return
+    parts = json.loads(tmpl.content)
+    for obj in parts:
+        if obj["type"] == "text":
+            send_wassenger_reply(phone, obj["content"], device_id, msg_type="text")
+        elif obj["type"] in ["image", "video", "file"]:
+            send_wassenger_reply(phone, obj["content"], device_id, msg_type=obj["type"])
+        time.sleep(1)
+
 # --- AI: Tool Decision ---
-def decide_tool_with_manager_prompt(bot, history):
+def decide_tool_with_manager_prompt(bot, history, lang='en'):
     prompt = bot.manager_system_prompt
+    if "{LANG}" in prompt:
+        prompt = prompt.replace("{LANG}", lang)
     history_text = "\n".join([f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}" for m in history])
     logger.info(f"[AI DECISION] manager_system_prompt: {prompt}")
     logger.info(f"[AI DECISION] history: {history_text}")
@@ -290,13 +197,17 @@ def decide_tool_with_manager_prompt(bot, history):
     return match.group(1) if match else None
 
 # --- AI: Final Reply Generator (Streaming) ---
-def compose_reply(bot, tool, history, context_input):
-    if tool:
-        prompt = (bot.system_prompt or "") + "\n" + (tool.prompt or "")
-    else:
-        prompt = bot.system_prompt or ""
-    logger.info(f"[AI REPLY] Prompt: {prompt}")
+def compose_reply(bot, tool, history, context_input, lang='en'):
+    # Prompt selection (concise/human split enforced here)
+    sys_prompt = (bot.system_prompt or "")
+    if "{LANG}" in sys_prompt:
+        sys_prompt = sys_prompt.replace("{LANG}", lang)
+    prompt = (sys_prompt + "\n" + (tool.prompt or "")) if tool else sys_prompt
 
+    # Append concise reply instruction!
+    prompt += "\n回复必须简短自然，2-3句话，每句话不超过60字。用/n/n分段。"
+
+    logger.info(f"[AI REPLY] Prompt: {prompt}")
     messages = [
         {"role": "system", "content": prompt},
         {"role": "user", "content": context_input}
@@ -304,59 +215,57 @@ def compose_reply(bot, tool, history, context_input):
     stream = openai.chat.completions.create(
         model="gpt-4o",
         messages=messages,
-        max_tokens=8192,
+        max_tokens=1024,
         temperature=0.3,
         stream=True
     )
     reply_accum = ""
-    print("[STREAM] Streaming model reply:")
     for chunk in stream:
         if hasattr(chunk.choices[0].delta, 'content') and chunk.choices[0].delta.content:
             reply_accum += chunk.choices[0].delta.content
-            print(chunk.choices[0].delta.content, end="", flush=True)
     logger.info(f"\n[AI REPLY STREAMED]: {reply_accum}")
     return reply_accum
 
-# --- Universal Table Content Split and Send ---
+# --- Universal Table Content Split and Send (enhanced, #1/2/7) ---
 def send_split_messages_wassenger(phone, ai_reply, device_id, bot_id=None, user=None, session_id=None, auto_describe_media=True):
     try:
         parsed = json.loads(ai_reply)
+        # If array, treat as template/attachment/message
         if isinstance(parsed, list):
             for idx, obj in enumerate(parsed):
                 msg_type = obj.get("type", "text")
                 content = obj.get("content", "")
-
-                # For media: send Vision-generated description (if enabled)
-                if auto_describe_media and msg_type in ("image", "sticker", "video"):
-                    desc = generate_media_description(content, msg_type)
-                    if desc:
-                        send_wassenger_reply(phone, desc, device_id, msg_type="text")
-                        if bot_id and user and session_id:
-                            save_message(bot_id, user, session_id, "out", desc)
-                        time.sleep(1)  # Small delay before sending media
-
-                # Send actual message/media
                 send_wassenger_reply(phone, content, device_id, msg_type=msg_type)
                 if bot_id and user and session_id:
                     save_message(bot_id, user, session_id, "out", str(obj))
                 if idx < len(parsed) - 1:
-                    time.sleep(5)
+                    time.sleep(2)
             return
-        # Fallback: if not a list, send as one message (legacy)
+        # If dict with template
+        if isinstance(parsed, dict) and "template" in parsed:
+            send_template_by_id(phone, parsed["template"], device_id)
+            return
     except Exception as e:
-        logger.error(f"[SEND SPLIT MSGS] Failed to parse AI reply: {e}")
+        logger.error(f"[SEND SPLIT MSGS] Failed to parse AI reply as JSON: {e}")
 
-    # Default: split by length
-    max_len = 1024
-    parts = [ai_reply[i:i+max_len] for i in range(0, len(ai_reply), max_len)]
+    # Always split by paragraph (\n\n), fallback to length if not found
+    parts = [p.strip() for p in ai_reply.split('\n\n') if p.strip()]
+    if not parts:
+        max_len = 1024
+        parts = [ai_reply[i:i+max_len] for i in range(0, len(ai_reply), max_len)]
     for idx, part in enumerate(parts):
         send_wassenger_reply(phone, part, device_id)
         if bot_id and user and session_id:
             save_message(bot_id, user, session_id, "out", part)
         if idx < len(parts) - 1:
-            time.sleep(5)
+            time.sleep(2)
 
-# --- Webhook Handler ---
+# --- Session/Goal/Status Logic (Goal tools in config) ---
+def is_goal_achieved(tool_id, bot_config):
+    goal_tools = (bot_config or {}).get("goal_tools", [])
+    return tool_id in goal_tools
+
+# --- Webhook Handler (main logic, all features) ---
 @app.route('/webhook', methods=['POST'])
 def webhook():
     logger.info("[WEBHOOK] Received POST /webhook")
@@ -379,6 +288,9 @@ def webhook():
     # --- Universal media/text extraction ---
     msg_text, raw_media_url = extract_text_from_message(msg)
 
+    lang = detect_language(msg_text)
+    customer = get_or_create_customer(user_phone, lang)  # For real app, store/track customer language
+
     bot = get_bot_by_phone(bot_phone)
     if not bot:
         logger.error(f"[ERROR] No bot found for phone {bot_phone}")
@@ -390,8 +302,8 @@ def webhook():
         return jsonify({"error": "Failed to process customer message"}), 500
 
     save_message(bot.id, user_phone, session_id, "in", msg_text, raw_media_url=raw_media_url)
-    history = get_latest_history(bot.id, user_phone, session_id)
-    tool_id = decide_tool_with_manager_prompt(bot, history)
+    history = get_latest_history(bot.id, user_phone, session_id, n=50)  # last 50 for AI context
+    tool_id = decide_tool_with_manager_prompt(bot, history, lang=lang)
     tool = None
     if tool_id and tool_id.lower() != "default":
         for t in get_active_tools_for_bot(bot.id):
@@ -403,10 +315,12 @@ def webhook():
         "\n".join([f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}" for m in history])
         if tool else msg_text
     )
-    ai_reply = compose_reply(bot, tool, history, context_input)
+    ai_reply = compose_reply(bot, tool, history, context_input, lang=lang)
     send_split_messages_wassenger(user_phone, ai_reply, device_id, bot_id=bot.id, user=user_phone, session_id=session_id)
-    if "success" in ai_reply.lower() or "booking confirmed" in ai_reply.lower():
+    # --- Goal/session close logic, from config ---
+    if tool_id and is_goal_achieved(tool_id, bot.config):
         notify_sales_group(bot, f"Goal achieved for customer {user_phone}: {ai_reply}")
+        # Here: Optionally update session table to set status = "closed" for session_id
 
     return jsonify({"status": "ok", "ai_reply": ai_reply})
 
