@@ -73,7 +73,7 @@ def extract_text_from_image(img_url):
     image_bytes = download_file(img_url)
     img_b64 = encode_image_b64(image_bytes)
     logger.info("[VISION] Sending image to OpenAI Vision...")
-    result = openai.chat.completions.create(
+    result = client.chat.completions.create(
         model="gpt-4o",
         messages=[
             {"role": "system", "content": "Extract all visible text from this image. If no text, describe what you see."},
@@ -190,7 +190,7 @@ def decide_tool_with_manager_prompt(bot, history):
     history_text = "\n".join([f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}" for m in history])
     logger.info(f"[AI DECISION] manager_system_prompt: {prompt}")
     logger.info(f"[AI DECISION] history: {history_text}")
-    response = openai.chat.completions.create(
+    response = client.chat.completions.create(
         model="gpt-4o",
         messages=[
             {"role": "system", "content": prompt},
@@ -216,8 +216,8 @@ def compose_reply(bot, tool, history, context_input):
         {"role": "system", "content": prompt},
         {"role": "user", "content": context_input}
     ]
-    stream = openai.chat.completions.create(
-        model=os.getenv("LAUDE_MODEL", "gpt-4o"),
+    stream = client.chat.completions.create(
+        model="gpt-4o",
         messages=messages,
         max_tokens=8192,
         temperature=0.3,
