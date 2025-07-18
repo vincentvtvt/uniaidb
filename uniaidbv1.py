@@ -5,152 +5,229 @@ from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import and_
 from datetime import datetime
 import requests
-from anthropic import Anthropic, AsyncAnthropic
+import openai
+import base64
 
-# --- Setup Logging ---
+# --- Configuration ---
+openai.api_key = os.getenv("OPENAI_API_KEY")
+WASSENGER_API_KEY = os.getenv("WASSENGER_API_KEY", "your-wassenger-api-key")
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("UniAI")
 
-# --- Flask + DB ---
 app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv("DATABASE_URL")
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
-# --- Claude config ---
-CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY")
-CLAUDE_MODEL = os.getenv("LAUDE_MODEL", "claude-3-7-sonnet-20250219")  # typo as in your variable, fix as needed
+# --- SQLAlchemy Models ---
+class Bot(db.Model):
+    __tablename__ = 'bots'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(50))
+    phone_number = db.Column(db.String(30))
+    config = db.Column(db.JSON)
+    created_at = db.Column(db.DateTime)
+    system_prompt = db.Column(db.Text)
+    manager_system_prompt = db.Column(db.Text)
 
-# --- Models ---
+class Tool(db.Model):
+    __tablename__ = 'tools'
+    id = db.Column(db.Integer, primary_key=True)
+    tool_id = db.Column(db.String(50))
+    name = db.Column(db.String(100))
+    description = db.Column(db.Text)
+    prompt = db.Column(db.Text)
+    action_type = db.Column(db.String(30))
+    active = db.Column(db.Boolean)
+    created_at = db.Column(db.DateTime)
+
+class BotTool(db.Model):
+    __tablename__ = 'bot_tools'
+    id = db.Column(db.Integer, primary_key=True)
+    bot_id = db.Column(db.Integer)
+    tool_id = db.Column(db.String(50))
+    active = db.Column(db.Boolean)
+
 class Message(db.Model):
     __tablename__ = 'messages'
     id = db.Column(db.Integer, primary_key=True)
-    session_id = db.Column(db.Integer)
-    sender_type = db.Column(db.String(20))
-    sender_id = db.Column(db.Integer)
-    message = db.Column(db.Text)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    meta = db.Column(db.JSON)
-    payload = db.Column(db.JSON)
+    bot_id = db.Column(db.Integer)
+    customer_phone = db.Column(db.String(50))
+    session_id = db.Column(db.String(50))
+    direction = db.Column(db.String(10)) # 'in' or 'out'
+    content = db.Column(db.Text)
+    created_at = db.Column(db.DateTime)
 
-# Add your other tables/models as needed for tool, bot, etc.
+# --- Universal Media/Text Extractor ---
+def download_file(url):
+    r = requests.get(url)
+    r.raise_for_status()
+    return r.content
 
-# --- Utility ---
-def log_message(session_id, sender_type, sender_id, message, meta=None, payload=None):
+def encode_image_b64(img_bytes):
+    return base64.b64encode(img_bytes).decode()
+
+def extract_text_from_image(img_url):
+    image_bytes = download_file(img_url)
+    img_b64 = encode_image_b64(image_bytes)
+    logger.info("[VISION] Sending image to OpenAI Vision...")
+    result = openai.ChatCompletion.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": "Extract all visible text from this image. If no text, describe what you see."},
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
+            ]}
+        ],
+        max_tokens=256
+    )
+    vision_result = result["choices"][0]["message"]["content"].strip()
+    logger.info(f"[VISION RESULT] {vision_result}")
+    return vision_result
+
+def transcribe_audio_from_url(audio_url):
+    audio_bytes = download_file(audio_url)
+    temp_path = "/tmp/temp_audio.ogg"
+    with open(temp_path, "wb") as f:
+        f.write(audio_bytes)
+    with open(temp_path, "rb") as audio_file:
+        transcript = openai.Audio.transcribe("whisper-1", audio_file)
+    transcript_text = transcript["text"].strip()
+    logger.info(f"[WHISPER] Transcription: {transcript_text}")
+    return transcript_text
+
+def extract_text_from_message(msg):
+    msg_type = msg.get("type", "text")
+    logger.info(f"[MEDIA DETECT] Message type: {msg_type}")
+    if msg_type == "text":
+        return msg.get("body", "")
+    elif msg_type == "image":
+        img_url = msg.get("media", {}).get("url")
+        caption = msg.get("body", "")
+        try:
+            ocr_text = extract_text_from_image(img_url) if img_url else ""
+        except Exception as e:
+            logger.error(f"[IMAGE OCR] {e}")
+            ocr_text = ""
+        combined = " ".join(filter(None, [caption, ocr_text]))
+        return combined.strip() or "[Image received, no text found]"
+    elif msg_type == "audio":
+        audio_url = msg.get("media", {}).get("url")
+        try:
+            return transcribe_audio_from_url(audio_url) if audio_url else "[Audio received, no url]"
+        except Exception as e:
+            logger.error(f"[AUDIO TRANSCRIBE] {e}")
+            return "[Audio received, transcription failed]"
+    elif msg_type == "sticker":
+        return "[Sticker received]"
+    else:
+        return f"[Unrecognized message type: {msg_type}]"
+
+# --- Wassenger Send Message (Stub) ---
+def send_wassenger_reply(phone, text, device_id):
+    logger.info(f"[WASSENGER] To: {phone} | Device: {device_id} | Text: {text}")
+    url = "https://api.wassenger.com/v1/messages"
+    headers = {
+        "Content-Type": "application/json",
+        "Token": WASSENGER_API_KEY
+    }
+    payload = {
+        "phone": phone,
+        "message": text,
+        "device": device_id
+    }
+    try:
+        resp = requests.post(url, json=payload, headers=headers)
+        logger.info(f"Wassenger response: {resp.text}")
+    except Exception as e:
+        logger.error(f"Wassenger send failed: {e}")
+
+# --- DB Logic (minimal) ---
+def get_bot_by_phone(phone_number):
+    bot = Bot.query.filter_by(phone_number=phone_number).first()
+    logger.info(f"[DB] Bot lookup by phone: {phone_number} => {bot}")
+    return bot
+
+def get_active_tools_for_bot(bot_id):
+    tools = (
+        db.session.query(Tool)
+        .join(BotTool, and_(
+            Tool.tool_id == BotTool.tool_id,
+            BotTool.bot_id == bot_id,
+            Tool.active == True,
+            BotTool.active == True
+        ))
+        .all()
+    )
+    logger.info(f"[DB] Tools for bot_id={bot_id}: {[t.tool_id for t in tools]}")
+    return tools
+
+def find_default_tool(tools):
+    for tool in tools:
+        if tool.tool_id == "defaultvpt":
+            return tool
+    return None
+
+def save_message(bot_id, customer_phone, session_id, direction, content):
     msg = Message(
+        bot_id=bot_id,
+        customer_phone=customer_phone,
         session_id=session_id,
-        sender_type=sender_type,
-        sender_id=sender_id,
-        message=message,
-        created_at=datetime.utcnow(),
-        meta=meta or {},
-        payload=payload or {}
+        direction=direction,
+        content=content,
+        created_at=datetime.now()
     )
     db.session.add(msg)
     db.session.commit()
-    logger.info(f"[LOG] Message saved: session_id={session_id}, sender_type={sender_type}, sender_id={sender_id}, message='{message}'")
-    return msg.id
+    logger.info(f"[DB] Saved message ({direction}) for {customer_phone}: {content}")
 
-def send_wassenger_reply(phone, text, device_id):
-    logger.info(f"[WASSENGER] To: {phone} | Device: {device_id} | Text: {text}")
-    # Example only; fill in your actual logic.
-    # url = "https://api.wassenger.com/v1/messages"
-    # headers = {"Token": os.getenv("WASSENGER_API_KEY")}
-    # payload = {"phone": phone, "message": text, "device": device_id}
-    # resp = requests.post(url, json=payload, headers=headers)
-    # logger.info(f"Wassenger response: {resp.text}")
-
-# --- Claude Streaming Reply ---
-def get_claude_stream(system_prompt, user_message, history):
-    import openai
-    openai.api_key = CLAUDE_API_KEY
-    # Compose message history for Claude
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    # add history
-    for h in history:
-        messages.append({"role": h["role"], "content": h["content"]})
-    # add current message
-    messages.append({"role": "user", "content": user_message})
-    # NOTE: For Anthropic, you should use anthropic.Message.create for streaming, below is sample logic.
-    from anthropic import Anthropic, AsyncAnthropic
-    client = Anthropic(api_key=CLAUDE_API_KEY)
-    stream = client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=8192,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_message}],
-        temperature=0.3,
-        stream=True
-    )
-    full_reply = ""
-    for event in stream:
-        if event.type == "content_block_delta":
-            content = event.delta.text
-            print(content, end="", flush=True)  # streaming log
-            full_reply += content
-    print()  # new line after stream
-    return full_reply
-
-# --- Webhook ---
+# --- Webhook Handler ---
 @app.route('/webhook', methods=['POST'])
 def webhook():
     logger.info("[WEBHOOK] Received POST /webhook")
     data = request.json
     logger.info(f"[WEBHOOK] Incoming data: {data}")
 
-    # Parse Wassenger webhook
     try:
         msg = data["data"]
         bot_phone = msg["toNumber"]
         user_phone = msg["fromNumber"]
         device_id = data["device"]["id"]
-        msg_text = msg["body"]
-        # Session logic here, for now use user_phone as session_id
-        session_id = int(''.join(filter(str.isdigit, user_phone)))  # naive example, use your session table in prod
-        user_id = session_id
-        bot_id = 1
+        session_id = user_phone  # or define another session policy
     except Exception as e:
         logger.error(f"[WEBHOOK] Invalid incoming data: {e}")
         return jsonify({"error": "Invalid request format"}), 400
 
-    # 1. Log incoming message
-    log_message(session_id=session_id, sender_type="user", sender_id=user_id, message=msg_text, meta=None, payload=data)
+    # --- Extract message as text (universal handler) ---
+    msg_text = extract_text_from_message(msg)
 
-    # 2. Retrieve message history for session (limit as needed)
-    messages = (
-        Message.query.filter_by(session_id=session_id)
-        .order_by(Message.created_at.asc())
-        .limit(20).all()
-    )
-    claude_history = [
-        {
-            "role": "user" if m.sender_type == "user" else "assistant",
-            "content": m.message
-        }
-        for m in messages
-    ]
+    # Save IN message
+    bot = get_bot_by_phone(bot_phone)
+    if not bot:
+        logger.error(f"[ERROR] No bot found for phone {bot_phone}")
+        return jsonify({"error": "Bot not found"}), 404
+    save_message(bot.id, user_phone, session_id, "in", msg_text)
 
-    # 3. Prepare prompts (stub, pull from DB as needed)
-    system_prompt = "You are a helpful WhatsApp bot."  # replace with your bot table system_prompt
-    tools_prompt = ""  # logic for tool prompt selection here
+    # --- Tool logic / prompt selection ---
+    tools = get_active_tools_for_bot(bot.id)
+    default_tool = find_default_tool(tools)
+    if default_tool:
+        final_prompt = (bot.system_prompt or "") + "\n" + (default_tool.prompt or "")
+        logger.info(f"[PROMPT] Using system_prompt + defaultvpt: {final_prompt}")
+    else:
+        final_prompt = bot.system_prompt or ""
+        logger.warning("[PROMPT] No defaultvpt tool found, using system_prompt only")
+    logger.info(f"[PROMPT] Final prompt: {final_prompt}")
 
-    # 4. Claude streaming reply
-    try:
-        bot_reply = get_claude_stream(system_prompt, msg_text, claude_history)
-    except Exception as ex:
-        logger.error(f"[CLAUDE] Error: {ex}")
-        bot_reply = "Sorry, I can't process your request right now."
+    # --- Send reply via Wassenger ---
+    send_wassenger_reply(user_phone, final_prompt, device_id)
 
-    # 5. Log bot reply
-    log_message(session_id=session_id, sender_type="bot", sender_id=bot_id, message=bot_reply, meta=None, payload=None)
+    # Save OUT message
+    save_message(bot.id, user_phone, session_id, "out", final_prompt)
 
-    # 6. Send reply via Wassenger
-    send_wassenger_reply(user_phone, bot_reply, device_id)
+    return jsonify({"status": "ok", "used_prompt": final_prompt})
 
-    return jsonify({"status": "ok"})
-
-# --- Run ---
+# --- Flask run (dev only) ---
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
