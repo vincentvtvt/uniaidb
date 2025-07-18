@@ -127,13 +127,25 @@ def send_wassenger_reply(phone, text, device_id, delay_seconds=0):
     url = "https://api.wassenger.com/v1/messages"
     headers = {"Content-Type": "application/json", "Token": WASSENGER_API_KEY}
     payload = {"phone": phone, "message": text, "device": device_id}
-
-    # Add delayed delivery using Wassenger API if delay_seconds > 0
     if delay_seconds > 0:
         deliver_at = datetime.utcnow() + timedelta(seconds=delay_seconds)
         payload["deliverAt"] = deliver_at.isoformat() + "Z"
         logger.info(f"[WASSENGER] Delayed send at: {payload['deliverAt']}")
+    try:
+        resp = requests.post(url, json=payload, headers=headers)
+        logger.info(f"Wassenger response: {resp.text}")
+    except Exception as e:
+        logger.error(f"Wassenger send failed: {e}")
 
+def send_wassenger_media(phone, media_url, device_id, delay_seconds=0):
+    logger.info(f"[WASSENGER] To: {phone} | Device: {device_id} | Image: {media_url}")
+    url = "https://api.wassenger.com/v1/messages"
+    headers = {"Content-Type": "application/json", "Token": WASSENGER_API_KEY}
+    payload = {"phone": phone, "media": media_url, "device": device_id}
+    if delay_seconds > 0:
+        deliver_at = datetime.utcnow() + timedelta(seconds=delay_seconds)
+        payload["deliverAt"] = deliver_at.isoformat() + "Z"
+        logger.info(f"[WASSENGER] Delayed media send at: {payload['deliverAt']}")
     try:
         resp = requests.post(url, json=payload, headers=headers)
         logger.info(f"Wassenger response: {resp.text}")
@@ -214,7 +226,7 @@ def decide_tool_with_manager_prompt(bot, history):
 
 # --- AI: Final Reply Generator (Streaming) ---
 def compose_reply(bot, tool, history, context_input):
-    if tool:
+    if tool and tool.tool_id.lower() != "default":
         prompt = (bot.system_prompt or "") + "\n" + (tool.prompt or "")
     else:
         prompt = bot.system_prompt or ""
@@ -240,11 +252,23 @@ def compose_reply(bot, tool, history, context_input):
     logger.info(f"\n[AI REPLY STREAMED]: {reply_accum}")
     return reply_accum
 
-# --- Split and Send Multi-line (JSON or by line, with delayed scheduling) ---
+# --- Split and Send Multi-line (support for text & image templates, with delayed scheduling) ---
 def send_split_messages_wassenger(phone, ai_reply, device_id, bot_id=None, user=None, session_id=None):
     try:
         parsed = json.loads(ai_reply)
-        if "message" in parsed and isinstance(parsed["message"], list):
+        if isinstance(parsed, list):
+            # e.g. [{"type": "text", "content": "hi"}, {"type": "image", "content": "imgurl"}]
+            for idx, msg in enumerate(parsed):
+                if msg.get("type") == "text":
+                    send_wassenger_reply(phone, msg.get("content"), device_id, delay_seconds=5*idx)
+                    if bot_id and user and session_id:
+                        save_message(bot_id, user, session_id, "out", msg.get("content"))
+                elif msg.get("type") == "image":
+                    send_wassenger_media(phone, msg.get("content"), device_id, delay_seconds=5*idx)
+                    if bot_id and user and session_id:
+                        save_message(bot_id, user, session_id, "out", f"[image sent] {msg.get('content')}")
+            return
+        elif "message" in parsed and isinstance(parsed["message"], list):
             for idx, msg in enumerate(parsed["message"]):
                 send_wassenger_reply(phone, msg, device_id, delay_seconds=5*idx)
                 if bot_id and user and session_id:
@@ -274,9 +298,9 @@ def webhook():
 
     try:
         msg = data["data"]
-        # Incoming: bot_phone is "toNumber" (our bot), Outgoing: (future) would be fromNumber
-        bot_phone = msg.get("toNumber") or msg.get("fromNumber")
-        user_phone = msg.get("fromNumber") or msg.get("toNumber")
+        # Always treat toNumber as bot (our) number, fromNumber as user
+        bot_phone = msg.get("toNumber")
+        user_phone = msg.get("fromNumber")
         device_id = data["device"]["id"]
         session_id = user_phone
     except Exception as e:
