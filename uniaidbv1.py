@@ -7,11 +7,11 @@ from datetime import datetime
 import requests
 import openai
 import base64
+import re
 
-# --- Configuration ---
+# --- Config ---
 openai.api_key = os.getenv("OPENAI_API_KEY")
-WASSENGER_API_KEY = os.getenv("WASSENGER_API_KEY", "your-wassenger-api-key")
-
+WASSENGER_API_KEY = os.getenv("WASSENGER_API_KEY")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("UniAI")
 
@@ -20,7 +20,7 @@ app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv("DATABASE_URL")
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
-# --- SQLAlchemy Models (same as before, with raw_media_url field for Message) ---
+# --- SQLAlchemy Models ---
 class Bot(db.Model):
     __tablename__ = 'bots'
     id = db.Column(db.Integer, primary_key=True)
@@ -57,10 +57,10 @@ class Message(db.Model):
     session_id = db.Column(db.String(50))
     direction = db.Column(db.String(10))  # 'in' or 'out'
     content = db.Column(db.Text)
-    raw_media_url = db.Column(db.Text)   # Only for non-text
+    raw_media_url = db.Column(db.Text)
     created_at = db.Column(db.DateTime)
 
-# --- Universal Media/Text Extractor ---
+# --- Media/Text Extraction ---
 def download_file(url):
     r = requests.get(url)
     r.raise_for_status()
@@ -73,19 +73,15 @@ def extract_text_from_image(img_url):
     image_bytes = download_file(img_url)
     img_b64 = encode_image_b64(image_bytes)
     logger.info("[VISION] Sending image to OpenAI Vision...")
-    result = openai.ChatCompletion.create(
+    result = openai.chat.completions.create(
         model="gpt-4o",
         messages=[
             {"role": "system", "content": "Extract all visible text from this image. If no text, describe what you see."},
-            {"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
-            ]}
+            {"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}]}
         ],
         max_tokens=256
     )
-    vision_result = result["choices"][0]["message"]["content"].strip()
-    logger.info(f"[VISION RESULT] {vision_result}")
-    return vision_result
+    return result.choices[0].message.content.strip()
 
 def transcribe_audio_from_url(audio_url):
     audio_bytes = download_file(audio_url)
@@ -93,10 +89,8 @@ def transcribe_audio_from_url(audio_url):
     with open(temp_path, "wb") as f:
         f.write(audio_bytes)
     with open(temp_path, "rb") as audio_file:
-        transcript = openai.Audio.transcribe("whisper-1", audio_file)
-    transcript_text = transcript["text"].strip()
-    logger.info(f"[WHISPER] Transcription: {transcript_text}")
-    return transcript_text
+        transcript = openai.audio.transcriptions.create(model="whisper-1", file=audio_file)
+    return transcript.text.strip()
 
 def extract_text_from_message(msg):
     msg_type = msg.get("type", "text")
@@ -126,19 +120,12 @@ def extract_text_from_message(msg):
     else:
         return f"[Unrecognized message type: {msg_type}]", None
 
-# --- Wassenger Send Message (real) ---
+# --- Wassenger Send Message ---
 def send_wassenger_reply(phone, text, device_id):
     logger.info(f"[WASSENGER] To: {phone} | Device: {device_id} | Text: {text}")
     url = "https://api.wassenger.com/v1/messages"
-    headers = {
-        "Content-Type": "application/json",
-        "Token": WASSENGER_API_KEY
-    }
-    payload = {
-        "phone": phone,
-        "message": text,
-        "device": device_id
-    }
+    headers = {"Content-Type": "application/json", "Token": WASSENGER_API_KEY}
+    payload = {"phone": phone, "message": text, "device": device_id}
     try:
         resp = requests.post(url, json=payload, headers=headers)
         logger.info(f"Wassenger response: {resp.text}")
@@ -154,7 +141,7 @@ def notify_sales_group(bot, message, error=False):
     else:
         logger.warning("[NOTIFY] Notification group or device_id missing in bot.config")
 
-# --- DB Logic (minimal) ---
+# --- DB Utility ---
 def get_bot_by_phone(phone_number):
     bot = Bot.query.filter_by(phone_number=phone_number).first()
     logger.info(f"[DB] Bot lookup by phone: {phone_number} => {bot}")
@@ -168,8 +155,7 @@ def get_active_tools_for_bot(bot_id):
             BotTool.bot_id == bot_id,
             Tool.active == True,
             BotTool.active == True
-        ))
-        .all()
+        )).all()
     )
     logger.info(f"[DB] Tools for bot_id={bot_id}: {[t.tool_id for t in tools]}")
     return tools
@@ -198,16 +184,13 @@ def get_latest_history(bot_id, customer_phone, session_id, n=20):
     logger.info(f"[DB] History ({len(messages)} messages) loaded.")
     return messages
 
-# --- Claude/AI Tool Decision (Step 1) ---
+# --- AI: Tool Decision ---
 def decide_tool_with_manager_prompt(bot, history):
     prompt = bot.manager_system_prompt
-    history_text = "\n".join(
-        [f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}" for m in history]
-    )
+    history_text = "\n".join([f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}" for m in history])
     logger.info(f"[AI DECISION] manager_system_prompt: {prompt}")
-    logger.info(f"[AI DECISION] history for decision: {history_text}")
-    # Call Claude/GPT here to select tool_id
-    response = openai.ChatCompletion.create(
+    logger.info(f"[AI DECISION] history: {history_text}")
+    response = openai.chat.completions.create(
         model="gpt-4o",
         messages=[
             {"role": "system", "content": prompt},
@@ -216,34 +199,38 @@ def decide_tool_with_manager_prompt(bot, history):
         max_tokens=32,
         temperature=0
     )
-    tool_decision = response["choices"][0]["message"]["content"]
+    tool_decision = response.choices[0].message.content
     logger.info(f"[AI DECISION] Tool chosen: {tool_decision}")
-    # Extract tool_id from response, fallback to None if parsing fails
-    import re
     match = re.search(r'"TOOLS":\s*"([^"]+)"', tool_decision)
     return match.group(1) if match else None
 
-# --- Claude/AI Final Reply Generator (Step 2/3) ---
+# --- AI: Final Reply Generator (Streaming) ---
 def compose_reply(bot, tool, history, context_input):
     if tool:
         prompt = (bot.system_prompt or "") + "\n" + (tool.prompt or "")
     else:
         prompt = bot.system_prompt or ""
-    logger.info(f"[AI REPLY] Prompt to model: {prompt}")
+    logger.info(f"[AI REPLY] Prompt: {prompt}")
+
     messages = [
         {"role": "system", "content": prompt},
         {"role": "user", "content": context_input}
     ]
-    # Stream reply (simulate, you can do OpenAI stream if needed)
-    response = openai.ChatCompletion.create(
-        model="gpt-4o",  # replace with claude-3-7-sonnet-20250219 as needed
+    stream = openai.chat.completions.create(
+        model=os.getenv("LAUDE_MODEL", "gpt-4o"),
         messages=messages,
-        max_tokens=512,
-        temperature=0.3
+        max_tokens=8192,
+        temperature=0.3,
+        stream=True
     )
-    ai_reply = response["choices"][0]["message"]["content"].strip()
-    logger.info(f"[AI REPLY] {ai_reply}")
-    return ai_reply
+    reply_chunks, reply_accum = [], ""
+    print("[STREAM] Streaming model reply:")
+    for chunk in stream:
+        if hasattr(chunk.choices[0].delta, 'content') and chunk.choices[0].delta.content:
+            reply_accum += chunk.choices[0].delta.content
+            print(chunk.choices[0].delta.content, end="", flush=True)
+    logger.info(f"\n[AI REPLY STREAMED]: {reply_accum}")
+    return reply_accum
 
 # --- Webhook Handler ---
 @app.route('/webhook', methods=['POST'])
@@ -257,15 +244,14 @@ def webhook():
         bot_phone = msg["toNumber"]
         user_phone = msg["fromNumber"]
         device_id = data["device"]["id"]
-        session_id = user_phone  # or your session policy
+        session_id = user_phone
     except Exception as e:
         logger.error(f"[WEBHOOK] Invalid incoming data: {e}")
         return jsonify({"error": "Invalid request format"}), 400
 
-    # --- Extract message as text (universal handler) ---
+    # --- Universal media/text extraction ---
     msg_text, raw_media_url = extract_text_from_message(msg)
 
-    # Save IN message only if text is available, otherwise notify group
     bot = get_bot_by_phone(bot_phone)
     if not bot:
         logger.error(f"[ERROR] No bot found for phone {bot_phone}")
@@ -276,39 +262,39 @@ def webhook():
         notify_sales_group(bot, f"Failed to process customer message: {raw_media_url}", error=True)
         return jsonify({"error": "Failed to process customer message"}), 500
 
+    # Only save in-message if text
     save_message(bot.id, user_phone, session_id, "in", msg_text, raw_media_url=raw_media_url)
 
-    # Get latest history
+    # Load recent history
     history = get_latest_history(bot.id, user_phone, session_id)
 
-    # Step 1: Decide tool using manager_system_prompt
+    # Step 1: Tool decision (via manager_system_prompt)
     tool_id = decide_tool_with_manager_prompt(bot, history)
     tool = None
-    if tool_id and tool_id != "Default":
-        tools = get_active_tools_for_bot(bot.id)
-        for t in tools:
+    if tool_id and tool_id.lower() != "default":
+        for t in get_active_tools_for_bot(bot.id):
             if t.tool_id == tool_id:
                 tool = t
                 break
     logger.info(f"[LOGIC] Tool selected: {tool_id}, tool obj: {tool}")
 
-    # Step 2: Use tool prompt/context (if any), else just history as input
-    if tool:
-        context_input = "\n".join([f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}" for m in history])
-    else:
-        context_input = msg_text
+    # Step 2: Tool prompt/context, else just message text
+    context_input = (
+        "\n".join([f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}" for m in history])
+        if tool else msg_text
+    )
 
-    # Step 3: Compose AI reply (Claude/GPT)
+    # Step 3: Compose AI reply (streamed)
     ai_reply = compose_reply(bot, tool, history, context_input)
 
-    # Step 4: Send AI reply (split as needed)
-    max_len = 512  # or per your requirement
+    # Step 4: Send split reply via Wassenger
+    max_len = 1024
     reply_chunks = [ai_reply[i:i+max_len] for i in range(0, len(ai_reply), max_len)]
     for chunk in reply_chunks:
         send_wassenger_reply(user_phone, chunk, device_id)
         save_message(bot.id, user_phone, session_id, "out", chunk)
 
-    # Step 5: If goal achieved (define your goal logic), notify group
+    # Step 5: Notify group if goal (customize logic here)
     if "success" in ai_reply.lower() or "booking confirmed" in ai_reply.lower():
         notify_sales_group(bot, f"Goal achieved for customer {user_phone}: {ai_reply}")
 
