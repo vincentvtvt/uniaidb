@@ -3,15 +3,16 @@ import logging
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import and_
-from datetime import datetime
+from datetime import datetime, timedelta
 import requests
 import openai
 import base64
 import re
+import json
 
-# --- Config ---
 openai.api_key = os.getenv("OPENAI_API_KEY")
 WASSENGER_API_KEY = os.getenv("WASSENGER_API_KEY")
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("UniAI")
 
@@ -20,7 +21,7 @@ app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv("DATABASE_URL")
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
-# --- SQLAlchemy Models ---
+# --- Models ---
 class Bot(db.Model):
     __tablename__ = 'bots'
     id = db.Column(db.Integer, primary_key=True)
@@ -120,12 +121,19 @@ def extract_text_from_message(msg):
     else:
         return f"[Unrecognized message type: {msg_type}]", None
 
-# --- Wassenger Send Message ---
-def send_wassenger_reply(phone, text, device_id):
+# --- Wassenger Send Message (with delayed delivery via API) ---
+def send_wassenger_reply(phone, text, device_id, delay_seconds=0):
     logger.info(f"[WASSENGER] To: {phone} | Device: {device_id} | Text: {text}")
     url = "https://api.wassenger.com/v1/messages"
     headers = {"Content-Type": "application/json", "Token": WASSENGER_API_KEY}
     payload = {"phone": phone, "message": text, "device": device_id}
+
+    # Add delayed delivery using Wassenger API if delay_seconds > 0
+    if delay_seconds > 0:
+        deliver_at = datetime.utcnow() + timedelta(seconds=delay_seconds)
+        payload["deliverAt"] = deliver_at.isoformat() + "Z"
+        logger.info(f"[WASSENGER] Delayed send at: {payload['deliverAt']}")
+
     try:
         resp = requests.post(url, json=payload, headers=headers)
         logger.info(f"Wassenger response: {resp.text}")
@@ -232,35 +240,30 @@ def compose_reply(bot, tool, history, context_input):
     logger.info(f"\n[AI REPLY STREAMED]: {reply_accum}")
     return reply_accum
 
-# --- Split and Send Multi-line (JSON) ---
+# --- Split and Send Multi-line (JSON or by line, with delayed scheduling) ---
 def send_split_messages_wassenger(phone, ai_reply, device_id, bot_id=None, user=None, session_id=None):
-    # If reply is a JSON with a "message" array, split and send line by line
     try:
-        import json
         parsed = json.loads(ai_reply)
         if "message" in parsed and isinstance(parsed["message"], list):
-            for msg in parsed["message"]:
-                send_wassenger_reply(phone, msg, device_id)
+            for idx, msg in enumerate(parsed["message"]):
+                send_wassenger_reply(phone, msg, device_id, delay_seconds=5*idx)
                 if bot_id and user and session_id:
                     save_message(bot_id, user, session_id, "out", msg)
             return
     except Exception:
-        pass  # Not JSON or not in correct format, fallback to split
+        pass  # Not JSON or not in correct format
 
-    # Otherwise, split reply by \n\n or chunk if too long
+    # Otherwise, split by line or chunk if too long
     max_len = 1024
+    parts = []
     if "\n" in ai_reply and len(ai_reply) < max_len:
         parts = [p.strip() for p in ai_reply.split("\n") if p.strip()]
-        for part in parts:
-            send_wassenger_reply(phone, part, device_id)
-            if bot_id and user and session_id:
-                save_message(bot_id, user, session_id, "out", part)
     else:
-        reply_chunks = [ai_reply[i:i+max_len] for i in range(0, len(ai_reply), max_len)]
-        for chunk in reply_chunks:
-            send_wassenger_reply(phone, chunk, device_id)
-            if bot_id and user and session_id:
-                save_message(bot_id, user, session_id, "out", chunk)
+        parts = [ai_reply[i:i+max_len] for i in range(0, len(ai_reply), max_len)]
+    for idx, part in enumerate(parts):
+        send_wassenger_reply(phone, part, device_id, delay_seconds=5*idx)
+        if bot_id and user and session_id:
+            save_message(bot_id, user, session_id, "out", part)
 
 # --- Webhook Handler ---
 @app.route('/webhook', methods=['POST'])
@@ -271,8 +274,9 @@ def webhook():
 
     try:
         msg = data["data"]
-        bot_phone = msg["toNumber"]
-        user_phone = msg["fromNumber"]
+        # Incoming: bot_phone is "toNumber" (our bot), Outgoing: (future) would be fromNumber
+        bot_phone = msg.get("toNumber") or msg.get("fromNumber")
+        user_phone = msg.get("fromNumber") or msg.get("toNumber")
         device_id = data["device"]["id"]
         session_id = user_phone
     except Exception as e:
@@ -292,7 +296,7 @@ def webhook():
         notify_sales_group(bot, f"Failed to process customer message: {raw_media_url}", error=True)
         return jsonify({"error": "Failed to process customer message"}), 500
 
-    # Only save in-message if text (after extraction/OCR/transcribe)
+    # Only save if text (after extraction/OCR/transcribe)
     save_message(bot.id, user_phone, session_id, "in", msg_text, raw_media_url=raw_media_url)
 
     # Load recent history
@@ -317,7 +321,7 @@ def webhook():
     # Step 3: Compose AI reply (streamed)
     ai_reply = compose_reply(bot, tool, history, context_input)
 
-    # Step 4: Send split reply via Wassenger
+    # Step 4: Send split reply via Wassenger, 5s delay for each part
     send_split_messages_wassenger(user_phone, ai_reply, device_id, bot_id=bot.id, user=user_phone, session_id=session_id)
 
     # Step 5: Notify group if goal (customize logic here)
