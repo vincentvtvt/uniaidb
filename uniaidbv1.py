@@ -122,11 +122,20 @@ def extract_text_from_message(msg):
         return f"[Unrecognized message type: {msg_type}]", None
 
 # --- Wassenger Send Message (with delayed delivery via API) ---
-def send_wassenger_reply(phone, text, device_id, delay_seconds=0):
-    logger.info(f"[WASSENGER] To: {phone} | Device: {device_id} | Text: {text}")
+def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text"):
+    logger.info(f"[WASSENGER] To: {phone} | Device: {device_id} | Text: {text} | Type: {msg_type}")
     url = "https://api.wassenger.com/v1/messages"
     headers = {"Content-Type": "application/json", "Token": WASSENGER_API_KEY}
-    payload = {"phone": phone, "message": text, "device": device_id}
+    payload = {"phone": phone, "device": device_id}
+
+    # Set the type and content
+    if msg_type == "text":
+        payload["message"] = text
+    elif msg_type == "image":
+        payload["mediaUrl"] = text
+        payload["message"] = ""
+    else:
+        payload["message"] = text  # fallback
 
     # Add delayed delivery using Wassenger API if delay_seconds > 0
     if delay_seconds > 0:
@@ -244,7 +253,16 @@ def compose_reply(bot, tool, history, context_input):
 def send_split_messages_wassenger(phone, ai_reply, device_id, bot_id=None, user=None, session_id=None):
     try:
         parsed = json.loads(ai_reply)
-        if "message" in parsed and isinstance(parsed["message"], list):
+        if isinstance(parsed, list):
+            # Array of message objects [{"type":...,"content":...}]
+            for idx, obj in enumerate(parsed):
+                msg_type = obj.get("type", "text")
+                content = obj.get("content", "")
+                send_wassenger_reply(phone, content, device_id, delay_seconds=5*idx, msg_type=msg_type)
+                if bot_id and user and session_id:
+                    save_message(bot_id, user, session_id, "out", content)
+            return
+        elif "message" in parsed and isinstance(parsed["message"], list):
             for idx, msg in enumerate(parsed["message"]):
                 send_wassenger_reply(phone, msg, device_id, delay_seconds=5*idx)
                 if bot_id and user and session_id:
@@ -274,9 +292,13 @@ def webhook():
 
     try:
         msg = data["data"]
-        # Incoming: bot_phone is "toNumber" (our bot), Outgoing: (future) would be fromNumber
-        bot_phone = msg.get("toNumber") or msg.get("fromNumber")
-        user_phone = msg.get("fromNumber") or msg.get("toNumber")
+        # Only process incoming messages (no bot-to-bot echo).
+        if msg.get("flow") == "outbound":
+            return jsonify({"status": "ignored"}), 200
+
+        # For all incoming, bot_phone = toNumber
+        bot_phone = msg.get("toNumber")
+        user_phone = msg.get("fromNumber")
         device_id = data["device"]["id"]
         session_id = user_phone
     except Exception as e:
