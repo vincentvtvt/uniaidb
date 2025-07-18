@@ -9,6 +9,7 @@ import openai
 import base64
 import re
 import json
+import time
 
 openai.api_key = os.getenv("OPENAI_API_KEY")
 WASSENGER_API_KEY = os.getenv("WASSENGER_API_KEY")
@@ -70,16 +71,17 @@ def download_file(url):
 def encode_image_b64(img_bytes):
     return base64.b64encode(img_bytes).decode()
 
-def extract_text_from_image(img_url):
+def extract_text_from_image(img_url, prompt=None):
     image_bytes = download_file(img_url)
     img_b64 = encode_image_b64(image_bytes)
     logger.info("[VISION] Sending image to OpenAI Vision...")
+    messages = [
+        {"role": "system", "content": prompt or "Extract all visible text from this image. If no text, describe what you see."},
+        {"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}]}
+    ]
     result = openai.chat.completions.create(
         model="gpt-4o",
-        messages=[
-            {"role": "system", "content": "Extract all visible text from this image. If no text, describe what you see."},
-            {"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}]}
-        ],
+        messages=messages,
         max_tokens=256
     )
     return result.choices[0].message.content.strip()
@@ -117,6 +119,17 @@ def extract_text_from_message(msg):
             logger.error(f"[AUDIO TRANSCRIBE] {e}")
             return "[Audio received, transcription failed]", audio_url
     elif msg_type == "sticker":
+        img_url = msg.get("media", {}).get("url")
+        if img_url:
+            try:
+                meaning = extract_text_from_image(
+                    img_url,
+                    prompt="This is a WhatsApp sticker. Describe the main emotion or meaning it conveys in 1-2 words, e.g. 'thank you', 'happy', 'love', 'celebration', 'laugh', etc. If text is visible, mention it."
+                )
+                return meaning or "[Sticker received]", img_url
+            except Exception as e:
+                logger.error(f"[STICKER MEANING] {e}")
+                return "[Sticker received]", img_url
         return "[Sticker received]", None
     else:
         return f"[Unrecognized message type: {msg_type}]", None
@@ -258,30 +271,35 @@ def send_split_messages_wassenger(phone, ai_reply, device_id, bot_id=None, user=
             for idx, obj in enumerate(parsed):
                 msg_type = obj.get("type", "text")
                 content = obj.get("content", "")
-                send_wassenger_reply(phone, content, device_id, delay_seconds=5*idx, msg_type=msg_type)
+                send_wassenger_reply(phone, content, device_id, msg_type=msg_type)
                 if bot_id and user and session_id:
                     save_message(bot_id, user, session_id, "out", content)
+                if idx < len(parsed) - 1:
+                    time.sleep(5)
             return
         elif "message" in parsed and isinstance(parsed["message"], list):
             for idx, msg in enumerate(parsed["message"]):
-                send_wassenger_reply(phone, msg, device_id, delay_seconds=5*idx)
+                send_wassenger_reply(phone, msg, device_id)
                 if bot_id and user and session_id:
                     save_message(bot_id, user, session_id, "out", msg)
+                if idx < len(parsed["message"]) - 1:
+                    time.sleep(5)
             return
     except Exception:
         pass  # Not JSON or not in correct format
 
     # Otherwise, split by line or chunk if too long
     max_len = 1024
-    parts = []
     if "\n" in ai_reply and len(ai_reply) < max_len:
         parts = [p.strip() for p in ai_reply.split("\n") if p.strip()]
     else:
         parts = [ai_reply[i:i+max_len] for i in range(0, len(ai_reply), max_len)]
     for idx, part in enumerate(parts):
-        send_wassenger_reply(phone, part, device_id, delay_seconds=5*idx)
+        send_wassenger_reply(phone, part, device_id)
         if bot_id and user and session_id:
             save_message(bot_id, user, session_id, "out", part)
+        if idx < len(parts) - 1:
+            time.sleep(5)
 
 # --- Webhook Handler ---
 @app.route('/webhook', methods=['POST'])
