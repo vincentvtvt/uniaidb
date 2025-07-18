@@ -223,7 +223,7 @@ def compose_reply(bot, tool, history, context_input):
         temperature=0.3,
         stream=True
     )
-    reply_chunks, reply_accum = [], ""
+    reply_accum = ""
     print("[STREAM] Streaming model reply:")
     for chunk in stream:
         if hasattr(chunk.choices[0].delta, 'content') and chunk.choices[0].delta.content:
@@ -231,6 +231,36 @@ def compose_reply(bot, tool, history, context_input):
             print(chunk.choices[0].delta.content, end="", flush=True)
     logger.info(f"\n[AI REPLY STREAMED]: {reply_accum}")
     return reply_accum
+
+# --- Split and Send Multi-line (JSON) ---
+def send_split_messages_wassenger(phone, ai_reply, device_id, bot_id=None, user=None, session_id=None):
+    # If reply is a JSON with a "message" array, split and send line by line
+    try:
+        import json
+        parsed = json.loads(ai_reply)
+        if "message" in parsed and isinstance(parsed["message"], list):
+            for msg in parsed["message"]:
+                send_wassenger_reply(phone, msg, device_id)
+                if bot_id and user and session_id:
+                    save_message(bot_id, user, session_id, "out", msg)
+            return
+    except Exception:
+        pass  # Not JSON or not in correct format, fallback to split
+
+    # Otherwise, split reply by \n\n or chunk if too long
+    max_len = 1024
+    if "\n" in ai_reply and len(ai_reply) < max_len:
+        parts = [p.strip() for p in ai_reply.split("\n") if p.strip()]
+        for part in parts:
+            send_wassenger_reply(phone, part, device_id)
+            if bot_id and user and session_id:
+                save_message(bot_id, user, session_id, "out", part)
+    else:
+        reply_chunks = [ai_reply[i:i+max_len] for i in range(0, len(ai_reply), max_len)]
+        for chunk in reply_chunks:
+            send_wassenger_reply(phone, chunk, device_id)
+            if bot_id and user and session_id:
+                save_message(bot_id, user, session_id, "out", chunk)
 
 # --- Webhook Handler ---
 @app.route('/webhook', methods=['POST'])
@@ -262,7 +292,7 @@ def webhook():
         notify_sales_group(bot, f"Failed to process customer message: {raw_media_url}", error=True)
         return jsonify({"error": "Failed to process customer message"}), 500
 
-    # Only save in-message if text
+    # Only save in-message if text (after extraction/OCR/transcribe)
     save_message(bot.id, user_phone, session_id, "in", msg_text, raw_media_url=raw_media_url)
 
     # Load recent history
@@ -288,11 +318,7 @@ def webhook():
     ai_reply = compose_reply(bot, tool, history, context_input)
 
     # Step 4: Send split reply via Wassenger
-    max_len = 1024
-    reply_chunks = [ai_reply[i:i+max_len] for i in range(0, len(ai_reply), max_len)]
-    for chunk in reply_chunks:
-        send_wassenger_reply(user_phone, chunk, device_id)
-        save_message(bot.id, user_phone, session_id, "out", chunk)
+    send_split_messages_wassenger(user_phone, ai_reply, device_id, bot_id=bot.id, user=user_phone, session_id=session_id)
 
     # Step 5: Notify group if goal (customize logic here)
     if "success" in ai_reply.lower() or "booking confirmed" in ai_reply.lower():
