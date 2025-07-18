@@ -62,15 +62,7 @@ class Message(db.Model):
     raw_media_url = db.Column(db.Text)
     created_at = db.Column(db.DateTime)
 
-# --- Media URL extraction ---
-def get_media_url(media):
-    """Get public URL or download endpoint for any media."""
-    url = media.get("url")
-    if not url and "links" in media and "download" in media["links"]:
-        url = media["links"]["download"]
-    return url
-
-# --- Download file from URL (with API token if Wassenger endpoint) ---
+# --- Media/Text Extraction ---
 def download_file(url):
     if url and url.startswith("/v1/"):
         full_url = "https://api.wassenger.com" + url
@@ -107,6 +99,12 @@ def transcribe_audio_from_url(audio_url):
     with open(temp_path, "rb") as audio_file:
         transcript = openai.audio.transcriptions.create(model="whisper-1", file=audio_file)
     return transcript.text.strip()
+
+def get_media_url(media):
+    url = media.get("url")
+    if not url and "links" in media and "download" in media["links"]:
+        url = media["links"]["download"]
+    return url
 
 def extract_text_from_message(msg):
     msg_type = msg.get("type", "text")
@@ -145,7 +143,7 @@ def extract_text_from_message(msg):
             try:
                 meaning = extract_text_from_image(
                     img_url,
-                    prompt="This is a WhatsApp sticker. Describe the main emotion or meaning it conveys in 1-2 words, e.g. 'thank you', 'happy', 'love', 'celebration', 'laugh', etc. If text is visible, mention it."
+                    prompt="This is a WhatsApp sticker. Describe exactly what this sticker shows, including the animal or object, its pose, facial expression, and possible mood or context. Use Malaysian-style directness. Example outputs: 'cat relaxing', 'cat surprised', 'cat excited', 'cat surrender pose', etc.'"
                 )
                 return meaning or "[Sticker received]", img_url
             except Exception as e:
@@ -163,31 +161,56 @@ def extract_text_from_message(msg):
         else:
             return "[Document received, but no download url found]", None
 
+    elif msg_type == "video":
+        media = msg.get("media", {})
+        vid_url = get_media_url(media)
+        if vid_url:
+            return "[Video received]", vid_url
+        else:
+            return "[Video received, but no download url found]", None
+
     else:
         return f"[Unrecognized message type: {msg_type}]", None
 
+def generate_media_description(media_url, media_type):
+    """Returns description string using Vision for image/video/sticker, else empty."""
+    if media_type in ("image", "sticker", "video"):
+        prompt = (
+            "Describe exactly what this shows, including the subject, pose, mood, and possible context. "
+            "If it's a sticker, say so and describe the emotion or intent. "
+            "Example: 'cat lying belly up, playful and relaxed, looks like a WhatsApp sticker.'"
+        )
+        try:
+            return extract_text_from_image(media_url, prompt)
+        except Exception as e:
+            logger.error(f"[VISION DESC] {media_type} failed: {e}")
+            return ""
+    return ""
+
 # --- Wassenger Send Message (with delayed delivery via API) ---
-def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text"):
-    logger.info(f"[WASSENGER] To: {phone} | Device: {device_id} | Text: {text} | Type: {msg_type}")
+def send_wassenger_reply(phone, content, device_id, delay_seconds=0, msg_type="text"):
     url = "https://api.wassenger.com/v1/messages"
     headers = {"Content-Type": "application/json", "Token": WASSENGER_API_KEY}
     payload = {"phone": phone, "device": device_id}
-
-    # Set the type and content
     if msg_type == "text":
-        payload["message"] = text
-    elif msg_type == "image":
-        payload["mediaUrl"] = text
+        payload["message"] = content
+    elif msg_type in ("image", "sticker"):
+        payload["mediaUrl"] = content
         payload["message"] = ""
+    elif msg_type == "audio":
+        payload["mediaUrl"] = content
+        payload["message"] = ""
+        payload["type"] = "audio"
+    elif msg_type == "video":
+        payload["mediaUrl"] = content
+        payload["message"] = ""
+        payload["type"] = "video"
     else:
-        payload["message"] = text  # fallback
+        payload["message"] = content  # fallback
 
-    # Add delayed delivery using Wassenger API if delay_seconds > 0
     if delay_seconds > 0:
         deliver_at = datetime.utcnow() + timedelta(seconds=delay_seconds)
         payload["deliverAt"] = deliver_at.isoformat() + "Z"
-        logger.info(f"[WASSENGER] Delayed send at: {payload['deliverAt']}")
-
     try:
         resp = requests.post(url, json=payload, headers=headers)
         logger.info(f"Wassenger response: {resp.text}")
@@ -294,38 +317,38 @@ def compose_reply(bot, tool, history, context_input):
     logger.info(f"\n[AI REPLY STREAMED]: {reply_accum}")
     return reply_accum
 
-# --- Split and Send Multi-line (JSON or by line, with delayed scheduling) ---
-def send_split_messages_wassenger(phone, ai_reply, device_id, bot_id=None, user=None, session_id=None):
+# --- Universal Table Content Split and Send ---
+def send_split_messages_wassenger(phone, ai_reply, device_id, bot_id=None, user=None, session_id=None, auto_describe_media=True):
     try:
         parsed = json.loads(ai_reply)
         if isinstance(parsed, list):
-            # Array of message objects [{"type":...,"content":...}]
             for idx, obj in enumerate(parsed):
                 msg_type = obj.get("type", "text")
                 content = obj.get("content", "")
+
+                # For media: send Vision-generated description (if enabled)
+                if auto_describe_media and msg_type in ("image", "sticker", "video"):
+                    desc = generate_media_description(content, msg_type)
+                    if desc:
+                        send_wassenger_reply(phone, desc, device_id, msg_type="text")
+                        if bot_id and user and session_id:
+                            save_message(bot_id, user, session_id, "out", desc)
+                        time.sleep(1)  # Small delay before sending media
+
+                # Send actual message/media
                 send_wassenger_reply(phone, content, device_id, msg_type=msg_type)
                 if bot_id and user and session_id:
-                    save_message(bot_id, user, session_id, "out", content)
+                    save_message(bot_id, user, session_id, "out", str(obj))
                 if idx < len(parsed) - 1:
                     time.sleep(5)
             return
-        elif "message" in parsed and isinstance(parsed["message"], list):
-            for idx, msg in enumerate(parsed["message"]):
-                send_wassenger_reply(phone, msg, device_id)
-                if bot_id and user and session_id:
-                    save_message(bot_id, user, session_id, "out", msg)
-                if idx < len(parsed["message"]) - 1:
-                    time.sleep(5)
-            return
-    except Exception:
-        pass  # Not JSON or not in correct format
+        # Fallback: if not a list, send as one message (legacy)
+    except Exception as e:
+        logger.error(f"[SEND SPLIT MSGS] Failed to parse AI reply: {e}")
 
-    # Otherwise, split by line or chunk if too long
+    # Default: split by length
     max_len = 1024
-    if "\n" in ai_reply and len(ai_reply) < max_len:
-        parts = [p.strip() for p in ai_reply.split("\n") if p.strip()]
-    else:
-        parts = [ai_reply[i:i+max_len] for i in range(0, len(ai_reply), max_len)]
+    parts = [ai_reply[i:i+max_len] for i in range(0, len(ai_reply), max_len)]
     for idx, part in enumerate(parts):
         send_wassenger_reply(phone, part, device_id)
         if bot_id and user and session_id:
@@ -342,11 +365,9 @@ def webhook():
 
     try:
         msg = data["data"]
-        # Only process incoming messages (no bot-to-bot echo).
         if msg.get("flow") == "outbound":
             return jsonify({"status": "ignored"}), 200
 
-        # For all incoming, bot_phone = toNumber
         bot_phone = msg.get("toNumber")
         user_phone = msg.get("fromNumber")
         device_id = data["device"]["id"]
@@ -368,13 +389,8 @@ def webhook():
         notify_sales_group(bot, f"Failed to process customer message: {raw_media_url}", error=True)
         return jsonify({"error": "Failed to process customer message"}), 500
 
-    # Only save if text (after extraction/OCR/transcribe)
     save_message(bot.id, user_phone, session_id, "in", msg_text, raw_media_url=raw_media_url)
-
-    # Load recent history
     history = get_latest_history(bot.id, user_phone, session_id)
-
-    # Step 1: Tool decision (via manager_system_prompt)
     tool_id = decide_tool_with_manager_prompt(bot, history)
     tool = None
     if tool_id and tool_id.lower() != "default":
@@ -383,20 +399,12 @@ def webhook():
                 tool = t
                 break
     logger.info(f"[LOGIC] Tool selected: {tool_id}, tool obj: {tool}")
-
-    # Step 2: Tool prompt/context, else just message text
     context_input = (
         "\n".join([f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}" for m in history])
         if tool else msg_text
     )
-
-    # Step 3: Compose AI reply (streamed)
     ai_reply = compose_reply(bot, tool, history, context_input)
-
-    # Step 4: Send split reply via Wassenger, 5s delay for each part
     send_split_messages_wassenger(user_phone, ai_reply, device_id, bot_id=bot.id, user=user_phone, session_id=session_id)
-
-    # Step 5: Notify group if goal (customize logic here)
     if "success" in ai_reply.lower() or "booking confirmed" in ai_reply.lower():
         notify_sales_group(bot, f"Goal achieved for customer {user_phone}: {ai_reply}")
 
