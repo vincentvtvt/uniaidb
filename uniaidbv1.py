@@ -121,27 +121,21 @@ def extract_text_from_message(msg):
     else:
         return f"[Unrecognized message type: {msg_type}]", None
 
-# --- Wassenger Send Message (with delayed delivery via API, support for images and templates) ---
-def send_wassenger_reply(phone, payload, device_id, delay_seconds=0, msg_type="text"):
+# --- Wassenger Send Message (with delayed delivery via API) ---
+def send_wassenger_reply(phone, text, device_id, delay_seconds=0):
+    logger.info(f"[WASSENGER] To: {phone} | Device: {device_id} | Text: {text}")
     url = "https://api.wassenger.com/v1/messages"
     headers = {"Content-Type": "application/json", "Token": WASSENGER_API_KEY}
+    payload = {"phone": phone, "message": text, "device": device_id}
 
-    data = {"device": device_id, "phone": phone}
-    deliver_at = None
+    # Add delayed delivery using Wassenger API if delay_seconds > 0
     if delay_seconds > 0:
         deliver_at = datetime.utcnow() + timedelta(seconds=delay_seconds)
-        data["deliverAt"] = deliver_at.isoformat() + "Z"
+        payload["deliverAt"] = deliver_at.isoformat() + "Z"
+        logger.info(f"[WASSENGER] Delayed send at: {payload['deliverAt']}")
 
-    if msg_type == "image" and isinstance(payload, dict):
-        data["media"] = {"url": payload["url"]}
-        if payload.get("caption"):
-            data["message"] = payload["caption"]
-    else:
-        data["message"] = payload
-
-    logger.info(f"[WASSENGER] To: {phone} | Type: {msg_type} | Device: {device_id} | Data: {data}")
     try:
-        resp = requests.post(url, json=data, headers=headers)
+        resp = requests.post(url, json=payload, headers=headers)
         logger.info(f"Wassenger response: {resp.text}")
     except Exception as e:
         logger.error(f"Wassenger send failed: {e}")
@@ -246,33 +240,20 @@ def compose_reply(bot, tool, history, context_input):
     logger.info(f"\n[AI REPLY STREAMED]: {reply_accum}")
     return reply_accum
 
-# --- Split and Send Multi-part (template-aware, delayed, correct order) ---
+# --- Split and Send Multi-line (JSON or by line, with delayed scheduling) ---
 def send_split_messages_wassenger(phone, ai_reply, device_id, bot_id=None, user=None, session_id=None):
     try:
-        arr = json.loads(ai_reply)
-        # If AI reply is a list (template): [{"type": "text", ...}, {"type": "image", ...}]
-        if isinstance(arr, list):
-            for idx, item in enumerate(arr):
-                if item["type"] == "text":
-                    send_wassenger_reply(phone, item["content"], device_id, delay_seconds=5*idx, msg_type="text")
-                    if bot_id and user and session_id:
-                        save_message(bot_id, user, session_id, "out", item["content"])
-                elif item["type"] == "image":
-                    send_wassenger_reply(phone, {"url": item["content"]}, device_id, delay_seconds=5*idx, msg_type="image")
-                    if bot_id and user and session_id:
-                        save_message(bot_id, user, session_id, "out", f"[image] {item['content']}")
-            return
-        # If AI reply is dict {"message": [...]}, follow the array
-        elif isinstance(arr, dict) and "message" in arr and isinstance(arr["message"], list):
-            for idx, msg in enumerate(arr["message"]):
-                send_wassenger_reply(phone, msg, device_id, delay_seconds=5*idx, msg_type="text")
+        parsed = json.loads(ai_reply)
+        if "message" in parsed and isinstance(parsed["message"], list):
+            for idx, msg in enumerate(parsed["message"]):
+                send_wassenger_reply(phone, msg, device_id, delay_seconds=5*idx)
                 if bot_id and user and session_id:
                     save_message(bot_id, user, session_id, "out", msg)
             return
     except Exception:
         pass  # Not JSON or not in correct format
 
-    # Otherwise, split by line or chunk if too long (fallback)
+    # Otherwise, split by line or chunk if too long
     max_len = 1024
     parts = []
     if "\n" in ai_reply and len(ai_reply) < max_len:
@@ -280,7 +261,7 @@ def send_split_messages_wassenger(phone, ai_reply, device_id, bot_id=None, user=
     else:
         parts = [ai_reply[i:i+max_len] for i in range(0, len(ai_reply), max_len)]
     for idx, part in enumerate(parts):
-        send_wassenger_reply(phone, part, device_id, delay_seconds=5*idx, msg_type="text")
+        send_wassenger_reply(phone, part, device_id, delay_seconds=5*idx)
         if bot_id and user and session_id:
             save_message(bot_id, user, session_id, "out", part)
 
@@ -293,20 +274,16 @@ def webhook():
 
     try:
         msg = data["data"]
-        event_type = data.get("event", "")
-        # Always use toNumber as bot's own number for inbound, fromNumber for outbound (for bot lookup)
-        if event_type.startswith("message:in"):
-            bot_phone = msg.get("toNumber")
-            user_phone = msg.get("fromNumber")
-        else:  # message:out, update, etc.
-            bot_phone = msg.get("fromNumber")
-            user_phone = msg.get("toNumber")
+        # Incoming: bot_phone is "toNumber" (our bot), Outgoing: (future) would be fromNumber
+        bot_phone = msg.get("toNumber") or msg.get("fromNumber")
+        user_phone = msg.get("fromNumber") or msg.get("toNumber")
         device_id = data["device"]["id"]
         session_id = user_phone
     except Exception as e:
         logger.error(f"[WEBHOOK] Invalid incoming data: {e}")
         return jsonify({"error": "Invalid request format"}), 400
 
+    # --- Universal media/text extraction ---
     msg_text, raw_media_url = extract_text_from_message(msg)
 
     bot = get_bot_by_phone(bot_phone)
@@ -319,10 +296,13 @@ def webhook():
         notify_sales_group(bot, f"Failed to process customer message: {raw_media_url}", error=True)
         return jsonify({"error": "Failed to process customer message"}), 500
 
+    # Only save if text (after extraction/OCR/transcribe)
     save_message(bot.id, user_phone, session_id, "in", msg_text, raw_media_url=raw_media_url)
 
+    # Load recent history
     history = get_latest_history(bot.id, user_phone, session_id)
 
+    # Step 1: Tool decision (via manager_system_prompt)
     tool_id = decide_tool_with_manager_prompt(bot, history)
     tool = None
     if tool_id and tool_id.lower() != "default":
@@ -332,14 +312,19 @@ def webhook():
                 break
     logger.info(f"[LOGIC] Tool selected: {tool_id}, tool obj: {tool}")
 
+    # Step 2: Tool prompt/context, else just message text
     context_input = (
         "\n".join([f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}" for m in history])
         if tool else msg_text
     )
 
+    # Step 3: Compose AI reply (streamed)
     ai_reply = compose_reply(bot, tool, history, context_input)
+
+    # Step 4: Send split reply via Wassenger, 5s delay for each part
     send_split_messages_wassenger(user_phone, ai_reply, device_id, bot_id=bot.id, user=user_phone, session_id=session_id)
 
+    # Step 5: Notify group if goal (customize logic here)
     if "success" in ai_reply.lower() or "booking confirmed" in ai_reply.lower():
         notify_sales_group(bot, f"Goal achieved for customer {user_phone}: {ai_reply}")
 
