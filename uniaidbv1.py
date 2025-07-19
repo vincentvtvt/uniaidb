@@ -176,7 +176,7 @@ def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text
         deliver_at = datetime.utcnow() + timedelta(seconds=delay_seconds)
         payload["deliverAt"] = deliver_at.isoformat() + "Z"
         logger.info(f"[WASSENGER] Delayed send at: {payload['deliverAt']}")
-    allowed_keys = {"phone", "device", "mediaUrl", "message", "deliverAt"}
+    allowed_keys = {"phone", "device", "mediaUrl", "type", "deliverAt"}
     payload = {k: v for k, v in payload.items() if v is not None and k in allowed_keys}
     logger.debug(f"[WASSENGER PAYLOAD]: {payload}")
     try:
