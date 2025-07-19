@@ -184,17 +184,32 @@ def extract_text_from_message(msg):
             return "[Audio received, transcription failed]", audio_url
     elif msg_type == "sticker":
         media = msg.get("media", {})
-        img_url = media.get("url")  # usually None
-        # Use Wassenger download link if URL missing
+        img_url = media.get("url")
         if not img_url and "links" in media and "download" in media["links"]:
             img_url = "https://api.wassenger.com" + media["links"]["download"]
         logger.info(f"[STICKER DEBUG] img_url for Vision: {img_url}")
         if img_url:
+            image_bytes = download_wassenger_media(img_url)
+            # If .webp, convert to .png for Vision
+            if media.get("extension", "").lower() == "webp":
+                from PIL import Image
+                from io import BytesIO
+                im = Image.open(BytesIO(image_bytes)).convert("RGBA")
+                buf = BytesIO()
+                im.save(buf, format="PNG")
+                image_bytes = buf.getvalue()
             try:
-                meaning = extract_text_from_image(
-                    img_url,
-                    prompt="This is a WhatsApp sticker. Describe the main emotion or meaning it conveys in 1-2 words, e.g. 'thank you', 'happy', 'love', 'celebration', 'laugh', etc. If text is visible, mention it."
+                img_b64 = encode_image_b64(image_bytes)
+                vision_msg = [
+                    {"role": "system", "content": "This is a WhatsApp sticker. Describe the main emotion or meaning it conveys in 1-2 words, e.g. 'thank you', 'happy', 'love', 'celebration', 'laugh', etc. If text is visible, mention it."},
+                    {"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}]}
+                ]
+                result = openai.chat.completions.create(
+                    model="gpt-4o",
+                    messages=vision_msg,
+                    max_tokens=8192
                 )
+                meaning = result.choices[0].message.content.strip()
                 return meaning or "[Sticker received]", img_url
             except Exception as e:
                 logger.error(f"[STICKER MEANING] {e}")
@@ -235,6 +250,21 @@ def upload_media_to_wassenger(img_url_or_bytes):
     except Exception as e:
         logger.error(f"[MEDIA UPLOAD FAIL] Wassenger /files error: {e}")
     return None
+
+def download_wassenger_media(url):
+    """
+    Downloads a media file from Wassenger using API Key authentication.
+    Returns bytes if successful, else None.
+    """
+    headers = {"Token": os.getenv("WASSENGER_API_KEY")}
+    try:
+        r = requests.get(url, headers=headers, timeout=15)
+        r.raise_for_status()
+        return r.content
+    except Exception as e:
+        logger.error(f"[WASSENGER MEDIA DOWNLOAD ERROR] {e}")
+        return None
+
 
 def send_wassenger_reply(phone, text, device_id, delay_seconds=5, msg_type="text", caption=None):
     url = "https://api.wassenger.com/v1/messages"
