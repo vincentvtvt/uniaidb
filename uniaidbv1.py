@@ -5,11 +5,9 @@ import json
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import and_
 import requests
 import openai
 import base64
-import re
 
 # --- Logger setup ---
 logging.basicConfig(
@@ -156,8 +154,10 @@ def get_template_content(template_id):
         return []
     return template.content if isinstance(template.content, list) else json.loads(template.content)
 
-# --- Wassenger Send (Image/Template FIX) ---
 def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text", caption=None):
+    if not text:
+        logger.warning("[WASSENGER] Skipping send: no text/content for message.")
+        return
     logger.info(f"[WASSENGER] To: {phone} | Device: {device_id} | Text: {text} | Type: {msg_type}")
     url = "https://api.wassenger.com/v1/messages"
     headers = {"Content-Type": "application/json", "Token": WASSENGER_API_KEY}
@@ -169,21 +169,19 @@ def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text
         payload["message"] = text
     elif msg_type == "image":
         payload["mediaUrl"] = text
-        payload["type"] = "image"     # <-- THIS IS REQUIRED FOR IMAGES!
-        payload.pop("message", None)
-
-    if delay_seconds > 0:
-        deliver_at = datetime.utcnow() + timedelta(seconds=delay_seconds)
-        payload["deliverAt"] = deliver_at.isoformat() + "Z"
-        logger.info(f"[WASSENGER] Delayed send at: {payload['deliverAt']}")
-    allowed_keys = {"phone", "device", "mediaUrl", "type", "deliverAt"}
+        payload["type"] = "image"
+        if caption:
+            payload["caption"] = caption
+    allowed_keys = {"phone", "device", "mediaUrl", "type", "caption", "message", "deliverAt"}
     payload = {k: v for k, v in payload.items() if v is not None and k in allowed_keys}
     logger.debug(f"[WASSENGER PAYLOAD]: {payload}")
     try:
         resp = requests.post(url, json=payload, headers=headers)
         logger.info(f"Wassenger response: {resp.text}")
     except Exception as e:
-        logger.error(f"Wassenger send failed: {e}")
+        logger.error(f"WASSENGER send failed: {e}")
+    if delay_seconds > 0:
+        time.sleep(delay_seconds)
 
 def notify_sales_group(bot, message, error=False):
     group_id = (bot.config or {}).get("notification_group")
@@ -214,12 +212,8 @@ def get_bot_by_phone(phone_number):
 def get_active_tools_for_bot(bot_id):
     tools = (
         db.session.query(Tool)
-        .join(BotTool, and_(
-            Tool.tool_id == BotTool.tool_id,
-            BotTool.bot_id == bot_id,
-            Tool.active == True,
-            BotTool.active == True
-        )).all()
+        .join(BotTool, (Tool.tool_id == BotTool.tool_id) & (BotTool.bot_id == bot_id) & (Tool.active == True) & (BotTool.active == True))
+        .all()
     )
     logger.info(f"[DB] Tools for bot_id={bot_id}: {[t.tool_id for t in tools]}")
     return tools
@@ -264,6 +258,7 @@ def decide_tool_with_manager_prompt(bot, history):
     )
     tool_decision = response.choices[0].message.content
     logger.info(f"[AI DECISION] Tool chosen: {tool_decision}")
+    import re
     match = re.search(r'"TOOLS":\s*"([^"]+)"', tool_decision)
     return match.group(1) if match else None
 
@@ -310,13 +305,12 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
                     save_message(bot_id, user, session_id, "out", part["content"])
                 time.sleep(1)
             elif part.get("type") == "image":
-                # If part.get("caption") is empty, omit message field!
                 send_wassenger_reply(
                     customer_phone,
                     part["content"],
                     device_id,
                     msg_type="image",
-                    caption=part.get("caption") if part.get("caption") else None
+                    caption=part.get("caption") or None
                 )
                 if bot_id and user and session_id:
                     save_message(bot_id, user, session_id, "out", f"[IMAGE]{part['content']}")
@@ -331,11 +325,12 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
     elif isinstance(parsed, str):
         msg_lines = [parsed]
     for idx, part in enumerate(msg_lines[:3]):
-        send_wassenger_reply(customer_phone, part, device_id)
-        if bot_id and user and session_id:
-            save_message(bot_id, user, session_id, "out", part)
-        if idx < len(msg_lines[:3]) - 1:
-            time.sleep(5)
+        if part:
+            send_wassenger_reply(customer_phone, part, device_id)
+            if bot_id and user and session_id:
+                save_message(bot_id, user, session_id, "out", part)
+            if idx < len(msg_lines[:3]) - 1:
+                time.sleep(2)
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
