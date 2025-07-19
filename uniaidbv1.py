@@ -1,326 +1,352 @@
-import os, re, json, time, logging, requests
-from datetime import datetime, timedelta
+import os
+import logging
 from flask import Flask, request, jsonify
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, JSON, ForeignKey, Boolean
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, scoped_session
-import anthropic, openai  # Use OpenAI for vision/audio, Claude for text
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import and_
+from datetime import datetime, timedelta
+import requests
+import openai
+import base64
+import re
+import json
+import time
 
-# ========== ENV & LOGGING ==========
-DATABASE_URL = os.getenv("DATABASE_URL")
-CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY")
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-3-7-sonnet-20250219")
+openai.api_key = os.getenv("OPENAI_API_KEY")
 WASSENGER_API_KEY = os.getenv("WASSENGER_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("UniAI")
 
-# ========== FLASK & DB SETUP ==========
 app = Flask(__name__)
-Base = declarative_base()
-engine = create_engine(DATABASE_URL)
-Base.metadata.create_all(engine)
-db_session = scoped_session(sessionmaker(bind=engine))
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv("DATABASE_URL")
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
 
-# ========== ORM MODELS ==========
-class Bot(Base):
+# --- Models ---
+class Bot(db.Model):
     __tablename__ = 'bots'
-    id = Column(Integer, primary_key=True)
-    name = Column(String(50))
-    phone_number = Column(String(30), unique=True)
-    config = Column(JSON)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(50))
+    phone_number = db.Column(db.String(30))
+    config = db.Column(db.JSON)
+    created_at = db.Column(db.DateTime)
+    system_prompt = db.Column(db.Text)
+    manager_system_prompt = db.Column(db.Text)
 
-class Customer(Base):
-    __tablename__ = 'customers'
-    id = Column(Integer, primary_key=True)
-    phone_number = Column(String(30), unique=True)
-    name = Column(String(50))
-    language = Column(String(10))
-    meta = Column(JSON)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-class Session(Base):
-    __tablename__ = 'sessions'
-    id = Column(Integer, primary_key=True)
-    customer_id = Column(Integer, ForeignKey('customers.id'))
-    bot_id = Column(Integer, ForeignKey('bots.id'))
-    started_at = Column(DateTime, default=datetime.utcnow)
-    ended_at = Column(DateTime)
-    status = Column(String(20), default='open')
-    goal = Column(String(50))
-    context = Column(JSON)
-
-class Message(Base):
-    __tablename__ = 'messages'
-    id = Column(Integer, primary_key=True)
-    session_id = Column(Integer, ForeignKey('sessions.id'))
-    sender_type = Column(String(20))  # user/ai
-    message = Column(Text)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    meta = Column(JSON)
-    payload = Column(JSON)
-
-class Tool(Base):
+class Tool(db.Model):
     __tablename__ = 'tools'
-    id = Column(Integer, primary_key=True)
-    tool_id = Column(String(30), unique=True)
-    name = Column(String(50))
-    description = Column(Text)
-    prompt = Column(Text)  # Can be JSON or plain text
-    active = Column(Boolean, default=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    id = db.Column(db.Integer, primary_key=True)
+    tool_id = db.Column(db.String(50))
+    name = db.Column(db.String(100))
+    description = db.Column(db.Text)
+    prompt = db.Column(db.Text)
+    action_type = db.Column(db.String(30))
+    active = db.Column(db.Boolean)
+    created_at = db.Column(db.DateTime)
 
-# ========== UTILS ==========
-def get_active_bot(phone_number):
-    pn = phone_number.lstrip('+')
-    bot = db_session.query(Bot).filter(Bot.phone_number.like(f"%{pn}")).first()
+class BotTool(db.Model):
+    __tablename__ = 'bot_tools'
+    id = db.Column(db.Integer, primary_key=True)
+    bot_id = db.Column(db.Integer)
+    tool_id = db.Column(db.String(50))
+    active = db.Column(db.Boolean)
+
+class Message(db.Model):
+    __tablename__ = 'messages'
+    id = db.Column(db.Integer, primary_key=True)
+    bot_id = db.Column(db.Integer)
+    customer_phone = db.Column(db.String(50))
+    session_id = db.Column(db.String(50))
+    direction = db.Column(db.String(10))  # 'in' or 'out'
+    content = db.Column(db.Text)
+    raw_media_url = db.Column(db.Text)
+    created_at = db.Column(db.DateTime)
+
+# --- Media/Text Extraction ---
+def download_file(url):
+    r = requests.get(url)
+    r.raise_for_status()
+    return r.content
+
+def encode_image_b64(img_bytes):
+    return base64.b64encode(img_bytes).decode()
+
+def extract_text_from_image(img_url, prompt=None):
+    image_bytes = download_file(img_url)
+    img_b64 = encode_image_b64(image_bytes)
+    logger.info("[VISION] Sending image to OpenAI Vision...")
+    messages = [
+        {"role": "system", "content": prompt or "Extract all visible text from this image. If no text, describe what you see."},
+        {"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}]}
+    ]
+    result = openai.chat.completions.create(
+        model="gpt-4o",
+        messages=messages,
+        max_tokens=256
+    )
+    return result.choices[0].message.content.strip()
+
+def transcribe_audio_from_url(audio_url):
+    audio_bytes = download_file(audio_url)
+    temp_path = "/tmp/temp_audio.ogg"
+    with open(temp_path, "wb") as f:
+        f.write(audio_bytes)
+    with open(temp_path, "rb") as audio_file:
+        transcript = openai.audio.transcriptions.create(model="whisper-1", file=audio_file)
+    return transcript.text.strip()
+
+def extract_text_from_message(msg):
+    msg_type = msg.get("type", "text")
+    logger.info(f"[MEDIA DETECT] Message type: {msg_type}")
+    if msg_type == "text":
+        return msg.get("body", ""), None
+    elif msg_type == "image":
+        img_url = msg.get("media", {}).get("url")
+        caption = msg.get("body", "")
+        try:
+            ocr_text = extract_text_from_image(img_url) if img_url else ""
+        except Exception as e:
+            logger.error(f"[IMAGE OCR] {e}")
+            ocr_text = ""
+        combined = " ".join(filter(None, [caption, ocr_text]))
+        return combined.strip() or "[Image received, no text found]", img_url
+    elif msg_type == "audio":
+        audio_url = msg.get("media", {}).get("url")
+        try:
+            transcript = transcribe_audio_from_url(audio_url) if audio_url else "[Audio received, no url]"
+            return transcript, audio_url
+        except Exception as e:
+            logger.error(f"[AUDIO TRANSCRIBE] {e}")
+            return "[Audio received, transcription failed]", audio_url
+    elif msg_type == "sticker":
+        img_url = msg.get("media", {}).get("url")
+        if img_url:
+            try:
+                meaning = extract_text_from_image(
+                    img_url,
+                    prompt="This is a WhatsApp sticker. Describe the main emotion or meaning it conveys in 1-2 words, e.g. 'thank you', 'happy', 'love', 'celebration', 'laugh', etc. If text is visible, mention it."
+                )
+                return meaning or "[Sticker received]", img_url
+            except Exception as e:
+                logger.error(f"[STICKER MEANING] {e}")
+                return "[Sticker received]", img_url
+        return "[Sticker received]", None
+    else:
+        return f"[Unrecognized message type: {msg_type}]", None
+
+# --- Wassenger Send Message (plain text, always flatten output) ---
+def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text"):
+    logger.info(f"[WASSENGER] To: {phone} | Device: {device_id} | Text: {text} | Type: {msg_type}")
+    url = "https://api.wassenger.com/v1/messages"
+    headers = {"Content-Type": "application/json", "Token": WASSENGER_API_KEY}
+    payload = {"phone": phone, "device": device_id}
+    if msg_type == "text":
+        payload["message"] = text
+    elif msg_type == "image":
+        payload["mediaUrl"] = text
+        payload["message"] = ""
+    else:
+        payload["message"] = text  # fallback
+    if delay_seconds > 0:
+        deliver_at = datetime.utcnow() + timedelta(seconds=delay_seconds)
+        payload["deliverAt"] = deliver_at.isoformat() + "Z"
+        logger.info(f"[WASSENGER] Delayed send at: {payload['deliverAt']}")
+    try:
+        resp = requests.post(url, json=payload, headers=headers)
+        logger.info(f"Wassenger response: {resp.text}")
+    except Exception as e:
+        logger.error(f"Wassenger send failed: {e}")
+
+def notify_sales_group(bot, message, error=False):
+    group_id = (bot.config or {}).get("notification_group")
+    device_id = (bot.config or {}).get("device_id")
+    if group_id and device_id:
+        note = f"[ALERT] {message}" if error else message
+        send_wassenger_reply(group_id, note, device_id)
+    else:
+        logger.warning("[NOTIFY] Notification group or device_id missing in bot.config")
+
+# --- DB Utility ---
+def get_bot_by_phone(phone_number):
+    bot = Bot.query.filter_by(phone_number=phone_number).first()
     logger.info(f"[DB] Bot lookup by phone: {phone_number} => {bot}")
     return bot
 
-def get_customer_by_phone(phone_number):
-    customer = db_session.query(Customer).filter(Customer.phone_number == phone_number).first()
-    return customer
+def get_active_tools_for_bot(bot_id):
+    tools = (
+        db.session.query(Tool)
+        .join(BotTool, and_(
+            Tool.tool_id == BotTool.tool_id,
+            BotTool.bot_id == bot_id,
+            Tool.active == True,
+            BotTool.active == True
+        )).all()
+    )
+    logger.info(f"[DB] Tools for bot_id={bot_id}: {[t.tool_id for t in tools]}")
+    return tools
 
-def get_or_create_customer(phone_number, name=None, language=None):
-    customer = get_customer_by_phone(phone_number)
-    if not customer:
-        customer = Customer(phone_number=phone_number, name=name or phone_number, language=language)
-        db_session.add(customer)
-        db_session.commit()
-    return customer
+def save_message(bot_id, customer_phone, session_id, direction, content, raw_media_url=None):
+    msg = Message(
+        bot_id=bot_id,
+        customer_phone=customer_phone,
+        session_id=session_id,
+        direction=direction,
+        content=content,
+        raw_media_url=raw_media_url,
+        created_at=datetime.now()
+    )
+    db.session.add(msg)
+    db.session.commit()
+    logger.info(f"[DB] Saved message ({direction}) for {customer_phone}: {content}")
 
-def get_latest_session(customer_id, bot_id):
-    return db_session.query(Session).filter(Session.customer_id == customer_id, Session.bot_id == bot_id, Session.status == 'open').order_by(Session.started_at.desc()).first()
+def get_latest_history(bot_id, customer_phone, session_id, n=20):
+    messages = (Message.query
+        .filter_by(bot_id=bot_id, customer_phone=customer_phone, session_id=session_id)
+        .order_by(Message.created_at.desc())
+        .limit(n)
+        .all())
+    messages = messages[::-1]
+    logger.info(f"[DB] History ({len(messages)} messages) loaded.")
+    return messages
 
-def start_new_session(customer_id, bot_id, goal=None):
-    session = Session(customer_id=customer_id, bot_id=bot_id, goal=goal, status='open', started_at=datetime.now())
-    db_session.add(session)
-    db_session.commit()
-    return session
+# --- AI: Tool Decision ---
+def decide_tool_with_manager_prompt(bot, history):
+    prompt = bot.manager_system_prompt
+    history_text = "\n".join([f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}" for m in history])
+    logger.info(f"[AI DECISION] manager_system_prompt: {prompt}")
+    logger.info(f"[AI DECISION] history: {history_text}")
+    response = openai.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": history_text}
+        ],
+        max_tokens=32,
+        temperature=0
+    )
+    tool_decision = response.choices[0].message.content
+    logger.info(f"[AI DECISION] Tool chosen: {tool_decision}")
+    match = re.search(r'"TOOLS":\s*"([^"]+)"', tool_decision)
+    return match.group(1) if match else None
 
-def save_message(session_id, sender_type, message, meta=None, payload=None):
-    msg = Message(session_id=session_id, sender_type=sender_type, message=message, meta=meta or {}, payload=payload or {})
-    db_session.add(msg)
-    db_session.commit()
-    logger.info(f"[DB] Saved message ({sender_type}) for session {session_id}: {message}")
+# --- AI: Final Reply Generator (Streaming) ---
+def compose_reply(bot, tool, history, context_input):
+    if tool:
+        prompt = (bot.system_prompt or "") + "\n" + (tool.prompt or "")
+    else:
+        prompt = bot.system_prompt or ""
+    logger.info(f"[AI REPLY] Prompt: {prompt}")
 
-def load_history(customer_id, bot_id, limit=50):
-    sessions = db_session.query(Session).filter(Session.customer_id == customer_id, Session.bot_id == bot_id).order_by(Session.started_at.desc()).all()
-    if not sessions: return []
-    session_ids = [s.id for s in sessions]
-    msgs = db_session.query(Message).filter(Message.session_id.in_(session_ids)).order_by(Message.created_at.desc()).limit(limit).all()
-    return list(reversed([{"sender": m.sender_type, "text": m.message, "meta": m.meta, "created_at": m.created_at.isoformat()} for m in msgs]))
+    messages = [
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": context_input}
+    ]
+    stream = openai.chat.completions.create(
+        model="gpt-4o",
+        messages=messages,
+        max_tokens=1024,
+        temperature=0.3,
+        stream=True
+    )
+    reply_accum = ""
+    print("[STREAM] Streaming model reply:")
+    for chunk in stream:
+        if hasattr(chunk.choices[0].delta, 'content') and chunk.choices[0].delta.content:
+            reply_accum += chunk.choices[0].delta.content
+            print(chunk.choices[0].delta.content, end="", flush=True)
+    logger.info(f"\n[AI REPLY STREAMED]: {reply_accum}")
+    return reply_accum
 
-def close_session(session):
-    session.status = 'closed'
-    session.ended_at = datetime.now()
-    db_session.commit()
-    logger.info(f"[SESSION] Closed session {session.id}")
-
-def get_tools_for_bot(bot_id):
-    return db_session.query(Tool).filter(Tool.active==True).all()
-
-def get_tool_by_id(tool_id):
-    return db_session.query(Tool).filter(Tool.tool_id == tool_id).first()
-
-def send_wassenger_reply(phone, text, device_id):
-    url = "https://api.wassenger.com/v1/messages"
-    headers = {"Content-Type": "application/json", "Token": WASSENGER_API_KEY}
-    payload = {"phone": phone if phone.startswith("+") else f"+{phone}", "message": text, "device": device_id}
-    r = requests.post(url, json=payload, headers=headers)
-    logger.info(f"[WASSENGER] Sent: {text} to {phone}, status: {r.status_code}")
-
-def send_wassenger_template(phone, template_json, device_id):
-    url = "https://api.wassenger.com/v1/messages"
-    headers = {"Content-Type": "application/json", "Token": WASSENGER_API_KEY}
-    # e.g. template_json = [{"type": "text", "content": "..."}, {"type": "image", ...}]
-    payload = {"phone": phone if phone.startswith("+") else f"+{phone}", "messages": template_json, "device": device_id}
-    r = requests.post(url, json=payload, headers=headers)
-    logger.info(f"[WASSENGER] Sent template: {template_json} to {phone}, status: {r.status_code}")
-
-def split_and_send_reply(phone, reply, device_id, bot_id=None, user=None, session_id=None):
-    # Convert JSON-like reply to plain text
-    parts = []
-    if isinstance(reply, str):
-        try:
-            reply = json.loads(reply)
-        except Exception:
-            pass
-    if isinstance(reply, dict) and "message" in reply:
-        message_list = reply["message"]
-        if isinstance(message_list, list):
-            flat = "\n\n".join([str(m).strip() for m in message_list if m.strip()])
+# --- Split and Send Multi-line (Flatten all JSON into text, max 3 WhatsApp messages) ---
+def send_split_messages_wassenger(phone, ai_reply, device_id, bot_id=None, user=None, session_id=None):
+    # Always flatten/parse, never send JSON to user!
+    try:
+        parsed = json.loads(ai_reply)
+        if isinstance(parsed, dict) and "message" in parsed:
+            flat = "\n\n".join([str(m).strip() for m in parsed["message"] if str(m).strip()])
+            parts = [p.strip() for p in flat.split('\n\n') if p.strip()]
+        elif isinstance(parsed, list):
+            flat = "\n\n".join([str(m).strip() for m in parsed if str(m).strip()])
             parts = [p.strip() for p in flat.split('\n\n') if p.strip()]
         else:
-            parts = [str(message_list)]
-    elif isinstance(reply, list):
-        parts = [str(m).strip() for m in reply if str(m).strip()]
-    else:
-        reply_str = reply if isinstance(reply, str) else str(reply)
+            reply_str = ai_reply if isinstance(ai_reply, str) else str(ai_reply)
+            parts = [p.strip() for p in reply_str.split('\n\n') if p.strip()]
+    except Exception:
+        reply_str = ai_reply if isinstance(ai_reply, str) else str(ai_reply)
         parts = [p.strip() for p in reply_str.split('\n\n') if p.strip()]
     for idx, part in enumerate(parts[:3]):
         send_wassenger_reply(phone, part, device_id)
         if bot_id and user and session_id:
-            save_message(session_id, "ai", part)
+            save_message(bot_id, user, session_id, "out", part)
         if idx < len(parts[:3]) - 1:
-            time.sleep(1)
+            time.sleep(5)
 
-def download_and_interpret_media(media_url, file_type="image"):
-    headers = {"Token": WASSENGER_API_KEY}
-    r = requests.get(media_url, headers=headers)
-    file_bytes = r.content
-    if file_type == "image":
-        openai.api_key = OPENAI_API_KEY
-        response = openai.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "You are a sticker/meme interpreter, summarize what this image expresses."},
-                {"role": "user", "content": [{"type": "image_url", "image_url": {"url": media_url}}]}
-            ],
-            max_tokens=512,
-        )
-        ai_reply = response.choices[0].message.content.strip()
-        return ai_reply
-    # Audio/other can use whisper
-    return "[Media file received]"
-
-def ai_language_detect(history):
-    # Use Claude/OpenAI to infer language from context, prefer last user msg
-    latest_user_msg = None
-    for h in reversed(history):
-        if h["sender"] == "user":
-            latest_user_msg = h["text"]
-            break
-    if not latest_user_msg:
-        return "en"
-    # Use OpenAI for quick detection
-    openai.api_key = OPENAI_API_KEY
-    completion = openai.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[{"role": "system", "content": "What is the language of the following message? Only answer as ISO code (en, zh, ms, etc)."}, {"role": "user", "content": latest_user_msg}],
-        max_tokens=1,
-    )
-    lang = completion.choices[0].message.content.strip().lower()
-    if lang not in ["en", "zh", "ms"]:
-        lang = "en"
-    return lang
-
-def call_claude(system_prompt, history, user_message, language=None):
-    client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
-    # Compose context
-    history_str = ""
-    for msg in history[-50:]:
-        if msg['sender'] == 'user':
-            history_str += f"User: {msg['text']}\n"
-        else:
-            history_str += f"Bot: {msg['text']}\n"
-    final_prompt = f"{system_prompt}\nCurrent conversation (last 50 messages):\n{history_str}\nUser message: {user_message}"
-    if language:
-        final_prompt += f"\nCustomer language: {language}\n"
-    message = client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=1024,
-        temperature=0.2,
-        system=system_prompt,
-        messages=[{"role": "user", "content": final_prompt}]
-    )
-    return message.content[0].text if message and message.content else ""
-
-# ========== FLASK WEBHOOK ==========
+# --- Webhook Handler ---
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    data = request.get_json(force=True)
-    msg = data.get('data', {})
-    logger.info(f"[INCOMING] WhatsApp message: {json.dumps(msg)[:500]}")
-    event_type = data.get('event')
+    logger.info("[WEBHOOK] Received POST /webhook")
+    data = request.json
+    logger.info(f"[WEBHOOK] Incoming data: {data}")
 
-    # Ignore groups/system
-    if event_type != 'message:in:new' or msg.get('meta', {}).get('isGroup'):
-        return jsonify({'status': 'ignored'})
-
-    bot_phone = (msg.get('toNumber') or msg.get('to', '')).replace('+', '').replace('@c.us', '')
-    bot = get_active_bot(bot_phone)
-    if not bot or not bot.config or not bot.config.get("device_id"):
-        return jsonify({"error": "No bot/device"})
-    device_id = bot.config["device_id"]
-
-    from_number = (msg.get('fromNumber') or msg.get('from', '')).replace('@c.us', '').replace('+','')
-    user_name = msg.get("chat", {}).get("contact", {}).get("name", from_number)
-    customer = get_or_create_customer(from_number, user_name)
-    session = get_latest_session(customer.id, bot.id)
-    if not session:
-        session = start_new_session(customer.id, bot.id)
-    user_message = msg.get("body", "") or ""
-    media_msg = ""
-    # If it's media, download and run vision/whisper
-    if msg.get("type") in ["image", "sticker", "video", "audio", "document"]:
-        links = msg.get("media", {}).get("links", {})
-        download_url = None
-        if "download" in links:
-            download_url = "https://api.wassenger.com" + links["download"]
-        elif "resource" in links:
-            download_url = "https://api.wassenger.com" + links["resource"]
-        if download_url:
-            try:
-                media_msg = download_and_interpret_media(download_url, file_type=msg.get("type", "image"))
-                user_message = f"[{msg.get('type').capitalize()}] {media_msg}"
-            except Exception as e:
-                logger.error(f"[AI INTERPRETER] Error: {e}")
-                user_message = f"[{msg.get('type').capitalize()} received, but could not interpret]"
-    save_message(session.id, "user", user_message, meta={"raw": msg})
-
-    # Load last 50 history (plain, AI will decide context)
-    history = load_history(customer.id, bot.id, 50)
-    language = ai_language_detect(history)
-
-    # Manager AI: choose tool/goal, pass tools list/goals, system prompt from DB/config
-    manager_system_prompt = bot.config.get("manager_system_prompt", "You are the manager.")
-    tools = get_tools_for_bot(bot.id)
-    tools_table = "\n".join([f"{t.tool_id}|{t.description}" for t in tools])
-    goal_tools = "\n".join([t.tool_id for t in tools if "88" in t.tool_id])
-    manager_prompt_final = f"{manager_system_prompt}\n<TOOLS>\n{tools_table}\n</TOOLS>\n<GoalTools>\n{goal_tools}\n</GoalTools>\n"
-    ai_decision = call_claude(manager_prompt_final, history, user_message, language=language)
-    logger.info(f"[AI DECISION] manager_system_prompt: {manager_prompt_final[:300]}...")
-    logger.info(f"[AI DECISION] Tool chosen: {ai_decision}")
-
-    # Parse tool output: {"TOOLS": "something"}
     try:
-        tool_result = json.loads(ai_decision)
-        tool_id = tool_result.get("TOOLS", "Default")
-    except Exception:
-        tool_id = "Default"
+        msg = data["data"]
+        if msg.get("flow") == "outbound":
+            return jsonify({"status": "ignored"}), 200
 
-    # Tool action: if template/media/attachments, use tool.prompt as JSON; else normal
-    tool = get_tool_by_id(tool_id)
-    if tool and tool.prompt:
-        try:
-            prompt_obj = json.loads(tool.prompt)
-            # E.g. {"template": "bf_product", "message": [...], "mediaUrl": "..."}
-            if "template" in prompt_obj or "mediaUrl" in prompt_obj:
-                send_wassenger_template(customer.phone_number, prompt_obj, device_id)
-                save_message(session.id, "ai", json.dumps(prompt_obj))
-            else:
-                split_and_send_reply(customer.phone_number, prompt_obj.get("message", ""), device_id, bot.id, customer.id, session.id)
-        except Exception:
-            # Not JSON: just split and send as text
-            split_and_send_reply(customer.phone_number, tool.prompt, device_id, bot.id, customer.id, session.id)
-    else:
-        # AI direct reply: call Claude as normal chat AI
-        system_prompt = bot.config.get("system_prompt", "You are Richelle, answer in max 3 concise sentences, split by paragraph, never use JSON.")
-        ai_reply = call_claude(system_prompt, history, user_message, language=language)
-        split_and_send_reply(customer.phone_number, ai_reply, device_id, bot.id, customer.id, session.id)
+        bot_phone = msg.get("toNumber")
+        user_phone = msg.get("fromNumber")
+        device_id = data["device"]["id"]
+        session_id = user_phone
+    except Exception as e:
+        logger.error(f"[WEBHOOK] Invalid incoming data: {e}")
+        return jsonify({"error": "Invalid request format"}), 400
 
-    # If the tool is a goal/close (contains "88"), auto-close session
-    if "88" in tool_id:
-        close_session(session)
+    # --- Universal media/text extraction ---
+    msg_text, raw_media_url = extract_text_from_message(msg)
 
-    return jsonify({"status": "ok"})
+    bot = get_bot_by_phone(bot_phone)
+    if not bot:
+        logger.error(f"[ERROR] No bot found for phone {bot_phone}")
+        return jsonify({"error": "Bot not found"}), 404
 
-@app.route('/health', methods=['GET'])
-def health():
-    return "OK", 200
+    if not msg_text or msg_text.startswith("[Unrecognized") or msg_text.startswith("[Audio received, transcription failed]"):
+        logger.error("[ERROR] Failed to extract text from message.")
+        notify_sales_group(bot, f"Failed to process customer message: {raw_media_url}", error=True)
+        return jsonify({"error": "Failed to process customer message"}), 500
 
-if __name__ == '__main__':
-    port = int(os.getenv("PORT", 5000))
-    app.run(host='0.0.0.0', port=port, debug=True)
+    # Only save if text (after extraction/OCR/transcribe)
+    save_message(bot.id, user_phone, session_id, "in", msg_text, raw_media_url=raw_media_url)
+
+    # Load recent history
+    history = get_latest_history(bot.id, user_phone, session_id)
+
+    # Step 1: Tool decision (via manager_system_prompt)
+    tool_id = decide_tool_with_manager_prompt(bot, history)
+    tool = None
+    if tool_id and tool_id.lower() != "default":
+        for t in get_active_tools_for_bot(bot.id):
+            if t.tool_id == tool_id:
+                tool = t
+                break
+    logger.info(f"[LOGIC] Tool selected: {tool_id}, tool obj: {tool}")
+
+    # Step 2: Tool prompt/context, else just message text
+    context_input = (
+        "\n".join([f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}" for m in history])
+        if tool else msg_text
+    )
+
+    # Step 3: Compose AI reply (streamed)
+    ai_reply = compose_reply(bot, tool, history, context_input)
+
+    # Step 4: Send split reply via Wassenger, 5s delay for each part
+    send_split_messages_wassenger(user_phone, ai_reply, device_id, bot_id=bot.id, user=user_phone, session_id=session_id)
+
+    # Step 5: Notify group if goal (customize logic here, e.g. tool_id has "88")
+    if tool_id and "88" in tool_id:
+        notify_sales_group(bot, f"Goal achieved for customer {user_phone}: {ai_reply}")
+
+    return jsonify({"status": "ok", "ai_reply": ai_reply})
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
