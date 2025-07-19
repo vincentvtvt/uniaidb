@@ -153,6 +153,32 @@ def get_template_content(template_id):
         return []
     return template.content if isinstance(template.content, list) else json.loads(template.content)
 
+def upload_media_to_wassenger(img_url_or_bytes):
+    """
+    Uploads image to Wassenger via URL or bytes, returns file_id.
+    Accepts either a direct image URL or raw bytes.
+    """
+    url = "https://api.wassenger.com/v1/files"
+    headers = {"Content-Type": "application/json", "Token": WASSENGER_API_KEY}
+    # If string, treat as URL; else assume bytes and upload as base64
+    if isinstance(img_url_or_bytes, str):
+        payload = {"url": img_url_or_bytes}
+    else:
+        # For local bytes, convert to base64 and use payload {'data': ...}
+        import base64
+        payload = {"data": base64.b64encode(img_url_or_bytes).decode()}
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=15)
+        resp.raise_for_status()
+        files = resp.json()
+        if files and isinstance(files, list) and files[0].get('id'):
+            return files[0]['id']
+        else:
+            logger.error(f"[MEDIA UPLOAD FAIL] Wassenger /files bad response: {resp.text}")
+    except Exception as e:
+        logger.error(f"[MEDIA UPLOAD FAIL] Wassenger /files error: {e}")
+    return None
+
 def send_wassenger_reply(phone, text, device_id, delay_seconds=5, msg_type="text", caption=None):
     url = "https://api.wassenger.com/v1/messages"
     headers = {"Content-Type": "application/json", "Token": WASSENGER_API_KEY}
@@ -163,29 +189,29 @@ def send_wassenger_reply(phone, text, device_id, delay_seconds=5, msg_type="text
     if msg_type == "text":
         payload["message"] = text
         payload["schedule"] = {"delay": delay_seconds}
-        allowed_keys = {"phone", "device", "message", "schedule"}
     elif msg_type == "image":
-        payload["mediaUrl"] = text
-        payload["type"] = "image"
+        # text is either an image URL or image bytes (URL for most templates)
+        file_id = upload_media_to_wassenger(text)
+        if not file_id:
+            logger.error("[SEND IMAGE] Failed to upload image to Wassenger")
+            return
+        payload["media"] = {"file": file_id}
         if caption:
-            payload["caption"] = caption
-        # deliverAt (ISO8601 string)
-        dt = datetime.utcnow() + timedelta(seconds=delay_seconds)
-        payload["deliverAt"] = dt.strftime('%Y-%m-%dT%H:%M:%S.000Z')
-        allowed_keys = {"phone", "device", "mediaUrl", "type", "caption", "deliverAt"}
+            payload["message"] = caption
+        # Note: 'schedule' (delay) is not supported for media messages; image will be sent ASAP
     else:
         logger.error(f"Unsupported msg_type: {msg_type}")
         return
 
-    # Filter only allowed keys and non-empty
-    payload = {k: v for k, v in payload.items() if v is not None and k in allowed_keys}
-
+    # Remove keys with empty values
+    payload = {k: v for k, v in payload.items() if v is not None}
     logger.debug(f"[WASSENGER PAYLOAD]: {payload}")
     try:
-        resp = requests.post(url, json=payload, headers=headers)
+        resp = requests.post(url, json=payload, headers=headers, timeout=20)
         logger.info(f"Wassenger response: {resp.text}")
     except Exception as e:
         logger.error(f"WASSENGER send failed: {e}")
+
 
 
 def notify_sales_group(bot, message, error=False):
