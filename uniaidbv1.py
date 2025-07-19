@@ -10,11 +10,24 @@ import requests
 import openai
 import base64
 
+
 # --- Universal JSON Prompt Builder ---
+def build_json_prompt(base_prompt, example_json, tag=None):
+    tag_name = tag if tag else "ExampleOutput"
+    json_instruction = (
+        "\n\n<OutputFormat>\n"
+        "Always respond ONLY with a strict, valid JSON object. "
+        "Use double quotes for all keys and string values. "
+        "Do not include any explanation, markdown, or code block formatting—just pure JSON.\n"
+        f"Wrap your response inside <{tag_name}> tags as shown below.\n"
+        "</OutputFormat>\n"
+        f"<{tag_name}>\n"
+        f"{example_json.strip()}\n"
+        f"</{tag_name}>"
+    )
+    return base_prompt.strip() + json_instruction
+
 def build_json_prompt_with_reasoning(base_prompt, example_json, tag=None):
-    """
-    Same as build_json_prompt but asks for reasoning before the strict JSON.
-    """
     tag_name = tag if tag else "ExampleOutput"
     reasoning_instruction = (
         "\n\n<Reasoning>\n"
@@ -36,6 +49,9 @@ def build_json_prompt_with_reasoning(base_prompt, example_json, tag=None):
         f"</{tag_name}>"
     )
     return base_prompt.strip() + json_instruction
+
+
+
 
 # Example usage (manager decision):
 # manager_prompt = build_json_prompt(bot.manager_system_prompt, '{\n  "TOOLS": "Default"\n}', tag="ExampleOutput")
@@ -167,7 +183,12 @@ def extract_text_from_message(msg):
             logger.error(f"[AUDIO TRANSCRIBE] {e}")
             return "[Audio received, transcription failed]", audio_url
     elif msg_type == "sticker":
-        img_url = msg.get("media", {}).get("url")
+        media = msg.get("media", {})
+        img_url = media.get("url")  # usually None
+        # Use Wassenger download link if URL missing
+        if not img_url and "links" in media and "download" in media["links"]:
+            img_url = "https://api.wassenger.com" + media["links"]["download"]
+        logger.info(f"[STICKER DEBUG] img_url for Vision: {img_url}")
         if img_url:
             try:
                 meaning = extract_text_from_image(
@@ -179,6 +200,7 @@ def extract_text_from_message(msg):
                 logger.error(f"[STICKER MEANING] {e}")
                 return "[Sticker received]", img_url
         return "[Sticker received]", None
+
     else:
         return f"[Unrecognized message type: {msg_type}]", None
 
