@@ -11,24 +11,24 @@ import openai
 import base64
 
 # --- Universal JSON Prompt Builder ---
-def build_json_prompt(base_prompt, example_json, tag=None):
+def build_json_prompt_with_reasoning(base_prompt, example_json, tag=None):
     """
-    Universal function to attach strict JSON output instruction with an example block.
-
-    Args:
-        base_prompt (str): Your core system or tool prompt.
-        example_json (str): The example JSON block to show the model.
-        tag (str): The example tag name, e.g., 'ExampleOutput' (default), or anything else you want.
-
-    Returns:
-        str: Full prompt with attached JSON instruction and example.
+    Same as build_json_prompt but asks for reasoning before the strict JSON.
     """
     tag_name = tag if tag else "ExampleOutput"
+    reasoning_instruction = (
+        "\n\n<Reasoning>\n"
+        "Before answering, briefly explain your reasoning for the tool selection in 1-2 sentences."
+        " After your reasoning, output ONLY the strict JSON inside <{tag}> tags as shown below."
+        " Do not add code block formatting or any other explanation after the JSON.\n"
+        "</Reasoning>"
+    ).replace("{tag}", tag_name)
     json_instruction = (
+        reasoning_instruction +
         "\n\n<OutputFormat>\n"
         "Always respond ONLY with a strict, valid JSON object. "
         "Use double quotes for all keys and string values. "
-        "Do not include any explanation, markdown, or code block formatting—just pure JSON.\n"
+        "No markdown, no code block formatting.\n"
         f"Wrap your response inside <{tag_name}> tags as shown below.\n"
         "</OutputFormat>\n"
         f"<{tag_name}>\n"
@@ -311,8 +311,8 @@ def get_latest_history(bot_id, customer_phone, session_id, n=20):
 def decide_tool_with_manager_prompt(bot, history):
     # Build history text as before
     history_text = "\n".join([f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}" for m in history])
-    # Use the universal prompt builder for strict JSON
-    manager_prompt = build_json_prompt(
+    # Use the new prompt builder with reasoning
+    manager_prompt = build_json_prompt_with_reasoning(
         bot.manager_system_prompt or "",
         '{\n  "TOOLS": "Default"\n}',
         tag="ExampleOutput"
@@ -329,14 +329,22 @@ def decide_tool_with_manager_prompt(bot, history):
         temperature=0
     )
     tool_decision = response.choices[0].message.content
-    logger.info(f"[AI DECISION] Tool chosen: {tool_decision}")
-    import re
+
+    # Extract reasoning (for logging/printout)
+    reasoning_match = re.search(r'<Reasoning>(.*?)</Reasoning>', tool_decision, re.DOTALL)
+    if reasoning_match:
+        reasoning = reasoning_match.group(1).strip()
+        logger.info(f"[AI TOOL DECISION REASONING]: {reasoning}")
+        print("\n[AI TOOL DECISION REASONING]:", reasoning)
+    else:
+        logger.info("[AI TOOL DECISION REASONING]: None found")
+
     # Extract the JSON block inside <ExampleOutput>
-    import re
     match = re.search(r'<ExampleOutput>(.*?)</ExampleOutput>', tool_decision, re.DOTALL)
     json_block = match.group(1).strip() if match else tool_decision
     match_json = re.search(r'"TOOLS":\s*"([^"]+)"', json_block)
     return match_json.group(1) if match_json else None
+
 
 def compose_reply(bot, tool, history, context_input):
     # Compose reply using strict JSON format prompt
