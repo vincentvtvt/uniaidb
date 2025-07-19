@@ -201,27 +201,27 @@ def extract_text_from_message(msg):
             try:
                 img_b64 = encode_image_b64(image_bytes)
                 img_b64 = encode_image_b64(image_bytes)
-        vision_msg = [
-            {
-                "role": "system",
-                "content": (
-                    "This is a WhatsApp sticker. "
-                    "Briefly describe what is shown in the sticker, focusing on the main character, action, and emotion. "
-                    "If there is text in the sticker, include it in your answer. "
-                    "Reply in a short, natural phrase (e.g., 'a cat happily sitting', 'dog saying thank you', 'happy face with celebration text'). "
-                    "Do not explain or add code formatting, just the phrase."
-                ),
-            },
-            {
-                "role": "user",
-                "content": [
+                vision_msg = [
                     {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{img_b64}"}
+                        "role": "system",
+                        "content": (
+                            "This is a WhatsApp sticker. "
+                            "Briefly describe what is shown in the sticker, focusing on the main character, action, and emotion. "
+                            "If there is text in the sticker, include it in your answer. "
+                            "Reply in a short, natural phrase (e.g., 'a cat happily sitting', 'dog saying thank you', 'happy face with celebration text'). "
+                            "Do not explain or add code formatting, just the phrase."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/png;base64,{img_b64}"}
+                            }
+                        ],
                     }
-                ],
-            }
-        ]
+                ]
 
                 result = openai.chat.completions.create(
                     model="gpt-4o",
