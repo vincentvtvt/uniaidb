@@ -208,7 +208,7 @@ def extract_text_from_message(msg):
                             "This is a WhatsApp sticker. "
                             "Briefly describe what is shown in the sticker, focusing on the main character, action, and emotion. "
                             "If there is text in the sticker, include it in your answer. "
-                            "Reply in a short, natural phrase (e.g., 'a cat happily sitting', 'dog saying thank you', 'happy face with celebration text'). "
+                            "Reply in a short, natural phrase (e.g., 'user sent a sticker of a cat happily sitting', 'user sent a sticker of dog saying thank you', 'user sent a sticker of happy face with celebration text'). "
                             "Do not explain or add code formatting, just the phrase."
                         ),
                     },
