@@ -555,10 +555,10 @@ def webhook():
                 break
     logger.info(f"[LOGIC] Tool selected: {tool_id}, tool obj: {tool}")
 
-    context_input = (
-        "\n".join([f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}" for m in history])
-        if tool else msg_text
-    )
+    context_input = "\n".join([
+        f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}"
+        for m in history
+    ])
 
     ai_reply = compose_reply(bot, tool, history, context_input)
 
