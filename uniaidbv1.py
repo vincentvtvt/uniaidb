@@ -265,6 +265,30 @@ def is_goal_achieved(tool_id, bot_config):
     goal_tools = (bot_config or {}).get("goal_tools", [])
     return tool_id in goal_tools
 
+def extract_text_from_message(msg):
+    """
+    Extracts main text content from WhatsApp/Wassenger message.
+    Returns: (text, raw_media_url)
+    """
+    text = ""
+    raw_media_url = None
+
+    # If the message contains plain text
+    if "body" in msg and msg["body"]:
+        text = msg["body"]
+    # If the message is a file (document/image/audio/video)
+    elif msg.get("type") in ("image", "video", "audio", "document", "file"):
+        # Optionally use caption if present
+        text = msg.get("caption", "")
+        raw_media_url = msg.get("mediaUrl") or msg.get("fileUrl")
+        if not text:
+            text = f"[{msg.get('type').capitalize()} received]"
+    # Fallback
+    else:
+        text = "[Unrecognized message type]"
+    return text, raw_media_url
+
+
 # --- Webhook Handler (main logic, all features) ---
 @app.route('/webhook', methods=['POST'])
 def webhook():
