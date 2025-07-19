@@ -154,10 +154,6 @@ def get_template_content(template_id):
     return template.content if isinstance(template.content, list) else json.loads(template.content)
 
 def send_wassenger_reply(phone, text, device_id, delay_seconds=5, msg_type="text", caption=None):
-    if not text:
-        logger.warning("[WASSENGER] Skipping send: no text/content for message.")
-        return
-    logger.info(f"[WASSENGER] To: {phone} | Device: {device_id} | Text: {text} | Type: {msg_type}")
     url = "https://api.wassenger.com/v1/messages"
     headers = {"Content-Type": "application/json", "Token": WASSENGER_API_KEY}
     payload = {
@@ -167,22 +163,30 @@ def send_wassenger_reply(phone, text, device_id, delay_seconds=5, msg_type="text
     if msg_type == "text":
         payload["message"] = text
         payload["schedule"] = {"delay": delay_seconds}
+        allowed_keys = {"phone", "device", "message", "schedule"}
     elif msg_type == "image":
         payload["mediaUrl"] = text
         payload["type"] = "image"
         if caption:
             payload["caption"] = caption
-        # Images do not use "schedule", use deliverAt if you want
-        deliver_time = int((datetime.now() + timedelta(seconds=delay_seconds)).timestamp() * 1000)
-        payload["deliverAt"] = deliver_time
-    allowed_keys = {"phone", "device", "mediaUrl", "type", "caption", "message", "deliverAt", "schedule"}
+        # deliverAt (ISO8601 string)
+        dt = datetime.utcnow() + timedelta(seconds=delay_seconds)
+        payload["deliverAt"] = dt.strftime('%Y-%m-%dT%H:%M:%S.000Z')
+        allowed_keys = {"phone", "device", "mediaUrl", "type", "caption", "deliverAt"}
+    else:
+        logger.error(f"Unsupported msg_type: {msg_type}")
+        return
+
+    # Filter only allowed keys and non-empty
     payload = {k: v for k, v in payload.items() if v is not None and k in allowed_keys}
+
     logger.debug(f"[WASSENGER PAYLOAD]: {payload}")
     try:
         resp = requests.post(url, json=payload, headers=headers)
         logger.info(f"Wassenger response: {resp.text}")
     except Exception as e:
         logger.error(f"WASSENGER send failed: {e}")
+
 
 def notify_sales_group(bot, message, error=False):
     group_id = (bot.config or {}).get("notification_group")
