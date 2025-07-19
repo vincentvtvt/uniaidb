@@ -1,16 +1,17 @@
 import os
 import logging
+import time
+import json
+from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import and_
-from datetime import datetime, timedelta
 import requests
 import openai
 import base64
 import re
-import json
-import time
 
+# --- Setup ---
 openai.api_key = os.getenv("OPENAI_API_KEY")
 WASSENGER_API_KEY = os.getenv("WASSENGER_API_KEY")
 
@@ -74,7 +75,7 @@ class Template(db.Model):
     created_at = db.Column(db.DateTime)
     updated_at = db.Column(db.DateTime)
 
-# --- Media/Text Extraction ---
+# --- Helpers ---
 def download_file(url):
     r = requests.get(url)
     r.raise_for_status()
@@ -146,29 +147,29 @@ def extract_text_from_message(msg):
     else:
         return f"[Unrecognized message type: {msg_type}]", None
 
-# --- Template Fetch ---
 def get_template_content(template_id):
     template = db.session.query(Template).filter_by(template_id=template_id, active=True).first()
     if not template or not template.content:
         return []
     return template.content if isinstance(template.content, list) else json.loads(template.content)
 
-def send_whatsapp_image(to, image_url, device_id):
-    send_wassenger_reply(to, image_url, device_id, msg_type="image")
-
-# --- Wassenger Send Message (plain text, always flatten output) ---
-def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text"):
+# --- Wassenger Send (with correct image support) ---
+def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text", caption=None):
     logger.info(f"[WASSENGER] To: {phone} | Device: {device_id} | Text: {text} | Type: {msg_type}")
     url = "https://api.wassenger.com/v1/messages"
     headers = {"Content-Type": "application/json", "Token": WASSENGER_API_KEY}
-    payload = {"phone": phone, "device": device_id}
+    payload = {
+        "phone": phone,
+        "device": device_id
+    }
     if msg_type == "text":
         payload["message"] = text
     elif msg_type == "image":
-        payload["mediaUrl"] = text
-        payload["message"] = ""
-    else:
-        payload["message"] = text  # fallback
+        payload["mediaUrl"] = text  # image url
+        payload["type"] = "image"
+        if caption:
+            payload["message"] = caption
+    # Delayed send (optional)
     if delay_seconds > 0:
         deliver_at = datetime.utcnow() + timedelta(seconds=delay_seconds)
         payload["deliverAt"] = deliver_at.isoformat() + "Z"
@@ -299,23 +300,27 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
                     save_message(bot_id, user, session_id, "out", part["content"])
                 time.sleep(1)
             elif part.get("type") == "image":
-                send_whatsapp_image(customer_phone, part["content"], device_id)
+                send_wassenger_reply(
+                    customer_phone,
+                    part["content"],          # image URL
+                    device_id,
+                    msg_type="image",
+                    caption=part.get("caption")
+                )
                 if bot_id and user and session_id:
                     save_message(bot_id, user, session_id, "out", f"[IMAGE]{part['content']}")
                 time.sleep(1)
-            # You can extend with "video", "audio" here.
+            # Extend with "video", "audio" here if needed
 
     # 2. AI free text
     msg_lines = []
     if "message" in parsed:
-        # message could be list or string
         if isinstance(parsed["message"], list):
             msg_lines = parsed["message"]
         elif isinstance(parsed["message"], str):
             msg_lines = [parsed["message"]]
     elif isinstance(parsed, str):
         msg_lines = [parsed]
-    # fallback if raw
     for idx, part in enumerate(msg_lines[:3]):
         send_wassenger_reply(customer_phone, part, device_id)
         if bot_id and user and session_id:
@@ -343,7 +348,6 @@ def webhook():
         logger.error(f"[WEBHOOK] Invalid incoming data: {e}")
         return jsonify({"error": "Invalid request format"}), 400
 
-    # --- Universal media/text extraction ---
     msg_text, raw_media_url = extract_text_from_message(msg)
 
     bot = get_bot_by_phone(bot_phone)
@@ -356,13 +360,10 @@ def webhook():
         notify_sales_group(bot, f"Failed to process customer message: {raw_media_url}", error=True)
         return jsonify({"error": "Failed to process customer message"}), 500
 
-    # Only save if text (after extraction/OCR/transcribe)
     save_message(bot.id, user_phone, session_id, "in", msg_text, raw_media_url=raw_media_url)
 
-    # Load recent history
     history = get_latest_history(bot.id, user_phone, session_id)
 
-    # Step 1: Tool decision (via manager_system_prompt)
     tool_id = decide_tool_with_manager_prompt(bot, history)
     tool = None
     if tool_id and tool_id.lower() != "default":
@@ -372,19 +373,15 @@ def webhook():
                 break
     logger.info(f"[LOGIC] Tool selected: {tool_id}, tool obj: {tool}")
 
-    # Step 2: Tool prompt/context, else just message text
     context_input = (
         "\n".join([f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}" for m in history])
         if tool else msg_text
     )
 
-    # Step 3: Compose AI reply (streamed)
     ai_reply = compose_reply(bot, tool, history, context_input)
 
-    # Step 4: Send template + split free text via Wassenger, 5s delay per text
     process_ai_reply_and_send(user_phone, ai_reply, device_id, bot_id=bot.id, user=user_phone, session_id=session_id)
 
-    # Step 5: Notify group if goal (customize logic here, e.g. tool_id has "88")
     if tool_id and "88" in tool_id:
         notify_sales_group(bot, f"Goal achieved for customer {user_phone}: {ai_reply}")
 
