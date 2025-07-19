@@ -13,12 +13,11 @@ import re
 
 # --- Logger setup ---
 logging.basicConfig(
-    level=logging.DEBUG,  # ensure full debug output!
+    level=logging.DEBUG,
     format='%(asctime)s %(levelname)s:%(name)s:%(message)s'
 )
 logger = logging.getLogger("UniAI")
 
-# --- Setup ---
 openai.api_key = os.getenv("OPENAI_API_KEY")
 WASSENGER_API_KEY = os.getenv("WASSENGER_API_KEY")
 
@@ -157,7 +156,7 @@ def get_template_content(template_id):
         return []
     return template.content if isinstance(template.content, list) else json.loads(template.content)
 
-# --- Wassenger Send (with correct image support) ---
+# --- Wassenger Send (FIXED for image) ---
 def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text", caption=None):
     logger.info(f"[WASSENGER] To: {phone} | Device: {device_id} | Text: {text} | Type: {msg_type}")
     url = "https://api.wassenger.com/v1/messages"
@@ -169,7 +168,7 @@ def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text
     if msg_type == "text":
         payload["message"] = text
     elif msg_type == "image":
-        payload["mediaUrl"] = text  # image url
+        payload["mediaUrl"] = text
         payload["type"] = "image"
         if caption:
             payload["message"] = caption
@@ -177,6 +176,9 @@ def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text
         deliver_at = datetime.utcnow() + timedelta(seconds=delay_seconds)
         payload["deliverAt"] = deliver_at.isoformat() + "Z"
         logger.info(f"[WASSENGER] Delayed send at: {payload['deliverAt']}")
+    allowed_keys = {"phone", "device", "mediaUrl", "type", "message", "deliverAt"}
+    payload = {k: v for k, v in payload.items() if v is not None and k in allowed_keys}
+    logger.debug(f"[WASSENGER PAYLOAD]: {payload}")
     try:
         resp = requests.post(url, json=payload, headers=headers)
         logger.info(f"Wassenger response: {resp.text}")
@@ -192,9 +194,7 @@ def notify_sales_group(bot, message, error=False):
     else:
         logger.warning("[NOTIFY] Notification group or device_id missing in bot.config")
 
-# --- DB Utility ---
 def get_bot_by_phone(phone_number):
-    # Try various forms: with/without '+', with/without @c.us, just digits
     num_variants = [
         phone_number,
         phone_number.lstrip('+'),
@@ -248,7 +248,6 @@ def get_latest_history(bot_id, customer_phone, session_id, n=20):
     logger.info(f"[DB] History ({len(messages)} messages) loaded.")
     return messages
 
-# --- AI: Tool Decision ---
 def decide_tool_with_manager_prompt(bot, history):
     prompt = bot.manager_system_prompt
     history_text = "\n".join([f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}" for m in history])
@@ -268,14 +267,12 @@ def decide_tool_with_manager_prompt(bot, history):
     match = re.search(r'"TOOLS":\s*"([^"]+)"', tool_decision)
     return match.group(1) if match else None
 
-# --- AI: Final Reply Generator (Streaming) ---
 def compose_reply(bot, tool, history, context_input):
     if tool:
         prompt = (bot.system_prompt or "") + "\n" + (tool.prompt or "")
     else:
         prompt = bot.system_prompt or ""
     logger.info(f"[AI REPLY] Prompt: {prompt}")
-
     messages = [
         {"role": "system", "content": prompt},
         {"role": "user", "content": context_input}
@@ -296,7 +293,6 @@ def compose_reply(bot, tool, history, context_input):
     logger.info(f"\n[AI REPLY STREAMED]: {reply_accum}")
     return reply_accum
 
-# --- Template and Free-text Processing and Sending ---
 def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, user=None, session_id=None):
     try:
         parsed = ai_reply if isinstance(ai_reply, dict) else json.loads(ai_reply)
@@ -316,7 +312,7 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
             elif part.get("type") == "image":
                 send_wassenger_reply(
                     customer_phone,
-                    part["content"],          # image URL
+                    part["content"],
                     device_id,
                     msg_type="image",
                     caption=part.get("caption")
@@ -340,7 +336,6 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
         if idx < len(msg_lines[:3]) - 1:
             time.sleep(5)
 
-# --- Webhook Handler ---
 @app.route('/webhook', methods=['POST'])
 def webhook():
     logger.info("[WEBHOOK] Received POST /webhook")
