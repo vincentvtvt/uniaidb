@@ -92,25 +92,72 @@ def get_or_create_customer(phone, lang):
     # This example just returns lang, but should create or update in your real model.
     return {"phone": phone, "language": lang}
 
-# --- Media/Text Extraction ---
+# --- AI Vision for Images ---
+def openai_vision_image_caption(image_url):
+    try:
+        resp = requests.get(image_url)
+        resp.raise_for_status()
+        image_bytes = resp.content
+        encoded = base64.b64encode(image_bytes).decode()
+        vision_content = [
+            {"type": "image_url", "image_url": "data:image/jpeg;base64," + encoded}
+        ]
+        response = openai.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "Describe this image in 1-2 short sentences. If there's any readable text, OCR it too. Use the user's language if context indicates."},
+                {"role": "user", "content": vision_content}
+            ],
+            max_tokens=256,
+            temperature=0.2
+        )
+        desc = response.choices[0].message.content
+        return desc if desc else "[Image received, but no description could be generated]"
+    except Exception as e:
+        logger.error(f"[Vision] Failed to process image: {e}")
+        return "[Image received, failed to analyze]"
+
+# --- AI Whisper for Audio ---
+def openai_whisper_transcribe(audio_url):
+    try:
+        resp = requests.get(audio_url)
+        resp.raise_for_status()
+        audio_bytes = resp.content
+        # openai-python v1.0.0 and later
+        response = openai.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_bytes,
+            response_format="text"
+        )
+        return response if response else "[Audio received, but could not transcribe]"
+    except Exception as e:
+        logger.error(f"[Whisper] Failed to transcribe audio: {e}")
+        return "[Audio received, failed to transcribe]"
+
+# --- Media/Text Extraction, now 100% AI-driven ---
 def extract_text_from_message(msg):
     """
-    Extracts main text content from WhatsApp/Wassenger message.
-    Returns: (text, raw_media_url)
+    Always returns text for OpenAI, even if only via Vision/Whisper.
     """
     text = ""
     raw_media_url = None
+
     # If the message contains plain text
     if "body" in msg and msg["body"]:
         text = msg["body"]
-    # If the message is a file (document/image/audio/video)
-    elif msg.get("type") in ("image", "video", "audio", "document", "file"):
-        # Optionally use caption if present
-        text = msg.get("caption", "")
+    elif msg.get("type") == "image":
         raw_media_url = msg.get("mediaUrl") or msg.get("fileUrl")
-        if not text:
-            text = f"[{msg.get('type').capitalize()} received]"
-    # Fallback
+        text = openai_vision_image_caption(raw_media_url)
+    elif msg.get("type") == "video":
+        # For now, just pass URL and let AI handle; optionally add video OCR/caption logic
+        raw_media_url = msg.get("mediaUrl") or msg.get("fileUrl")
+        text = "[Video received, please describe or reply with questions.]"
+    elif msg.get("type") == "audio":
+        raw_media_url = msg.get("mediaUrl") or msg.get("fileUrl")
+        text = openai_whisper_transcribe(raw_media_url)
+    elif msg.get("type") in ("document", "file"):
+        raw_media_url = msg.get("mediaUrl") or msg.get("fileUrl")
+        text = "[Document or file received. Please describe the document or send as text for better assistance.]"
     else:
         text = "[Unrecognized message type]"
     return text, raw_media_url
@@ -261,7 +308,6 @@ def compose_reply(bot, tool, history, context_input, lang='en'):
 def send_split_messages_wassenger(phone, ai_reply, device_id, bot_id=None, user=None, session_id=None, auto_describe_media=True):
     try:
         parsed = json.loads(ai_reply)
-        # If array, treat as template/attachment/message
         if isinstance(parsed, list):
             for idx, obj in enumerate(parsed):
                 msg_type = obj.get("type", "text")
@@ -272,7 +318,6 @@ def send_split_messages_wassenger(phone, ai_reply, device_id, bot_id=None, user=
                 if idx < len(parsed) - 1:
                     time.sleep(2)
             return
-        # If dict with template
         if isinstance(parsed, dict) and "template" in parsed:
             send_template_by_id(phone, parsed["template"], device_id)
             return
@@ -327,7 +372,7 @@ def webhook():
         logger.error(f"[ERROR] No bot found for phone {bot_phone}")
         return jsonify({"error": "Bot not found"}), 404
 
-    if not msg_text or msg_text.startswith("[Unrecognized") or msg_text.startswith("[Audio received, transcription failed]"):
+    if not msg_text or msg_text.startswith("[Unrecognized"):
         logger.error("[ERROR] Failed to extract text from message.")
         notify_sales_group(bot, f"Failed to process customer message: {raw_media_url}", error=True)
         return jsonify({"error": "Failed to process customer message"}), 500
@@ -351,7 +396,7 @@ def webhook():
     # --- Goal/session close logic, from config ---
     if tool_id and is_goal_achieved(tool_id, bot.config):
         notify_sales_group(bot, f"Goal achieved for customer {user_phone}: {ai_reply}")
-        # Here: Optionally update session table to set status = "closed" for session_id
+        # Optionally update session table to set status = "closed" for session_id
 
     return jsonify({"status": "ok", "ai_reply": ai_reply})
 
