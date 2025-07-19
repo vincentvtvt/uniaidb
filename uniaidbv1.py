@@ -89,75 +89,55 @@ def detect_language(text):
 
 def get_or_create_customer(phone, lang):
     # Here you can add your own Customer table/model
-    # This example just returns lang, but should create or update in your real model.
     return {"phone": phone, "language": lang}
 
-# --- AI Vision for Images ---
-def openai_vision_image_caption(image_url):
+# --- Universal AI Interpreter for Any Media ---
+def ai_interpret_file(file_url, file_type, lang='en'):
     try:
-        resp = requests.get(image_url)
+        resp = requests.get(file_url)
         resp.raise_for_status()
-        image_bytes = resp.content
-        encoded = base64.b64encode(image_bytes).decode()
-        vision_content = [
-            {"type": "image_url", "image_url": "data:image/jpeg;base64," + encoded}
-        ]
-        response = openai.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "Describe this image in 1-2 short sentences. If there's any readable text, OCR it too. Use the user's language if context indicates."},
-                {"role": "user", "content": vision_content}
-            ],
-            max_tokens=256,
-            temperature=0.2
-        )
-        desc = response.choices[0].message.content
-        return desc if desc else "[Image received, but no description could be generated]"
+        file_bytes = resp.content
+        if file_type in ("image", "sticker", "video"):
+            encoded = base64.b64encode(file_bytes).decode()
+            msg = f"You are an interpreter. The user sent a {file_type}. If it's a sticker, describe the sticker in 1 short sentence (e.g. 'User sent sticker of a cat laughing'). For image/video, describe the visual or OCR any text. Reply in the user's language ({lang})."
+            vision_content = [
+                {"type": "image_url", "image_url": "data:image/jpeg;base64," + encoded}
+            ]
+            response = openai.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": msg},
+                    {"role": "user", "content": vision_content}
+                ],
+                max_tokens=256,
+                temperature=0.2
+            )
+            desc = response.choices[0].message.content
+            return desc if desc else f"[{file_type.capitalize()} received, no description]"
+        elif file_type == "audio":
+            response = openai.audio.transcriptions.create(
+                model="whisper-1",
+                file=file_bytes,
+                response_format="text"
+            )
+            return response if response else "[Audio received, but could not transcribe]"
+        elif file_type in ("document", "file"):
+            return "[File/document received. Please upload as image/text for better understanding.]"
+        else:
+            return "[Unrecognized file type]"
     except Exception as e:
-        logger.error(f"[Vision] Failed to process image: {e}")
-        return "[Image received, failed to analyze]"
+        logger.error(f"[AI INTERPRETER] Error: {e}")
+        return f"[{file_type.capitalize()} received, but could not interpret]"
 
-# --- AI Whisper for Audio ---
-def openai_whisper_transcribe(audio_url):
-    try:
-        resp = requests.get(audio_url)
-        resp.raise_for_status()
-        audio_bytes = resp.content
-        # openai-python v1.0.0 and later
-        response = openai.audio.transcriptions.create(
-            model="whisper-1",
-            file=audio_bytes,
-            response_format="text"
-        )
-        return response if response else "[Audio received, but could not transcribe]"
-    except Exception as e:
-        logger.error(f"[Whisper] Failed to transcribe audio: {e}")
-        return "[Audio received, failed to transcribe]"
-
-# --- Media/Text Extraction, now 100% AI-driven ---
-def extract_text_from_message(msg):
-    """
-    Always returns text for OpenAI, even if only via Vision/Whisper.
-    """
+# --- Media/Text Extraction, 100% AI-driven ---
+def extract_text_from_message(msg, lang='en'):
     text = ""
     raw_media_url = None
-
-    # If the message contains plain text
     if "body" in msg and msg["body"]:
         text = msg["body"]
-    elif msg.get("type") == "image":
+    elif msg.get("type") in ("image", "sticker", "video", "audio", "document", "file"):
         raw_media_url = msg.get("mediaUrl") or msg.get("fileUrl")
-        text = openai_vision_image_caption(raw_media_url)
-    elif msg.get("type") == "video":
-        # For now, just pass URL and let AI handle; optionally add video OCR/caption logic
-        raw_media_url = msg.get("mediaUrl") or msg.get("fileUrl")
-        text = "[Video received, please describe or reply with questions.]"
-    elif msg.get("type") == "audio":
-        raw_media_url = msg.get("mediaUrl") or msg.get("fileUrl")
-        text = openai_whisper_transcribe(raw_media_url)
-    elif msg.get("type") in ("document", "file"):
-        raw_media_url = msg.get("mediaUrl") or msg.get("fileUrl")
-        text = "[Document or file received. Please describe the document or send as text for better assistance.]"
+        text = ai_interpret_file(raw_media_url, msg["type"], lang=lang)
     else:
         text = "[Unrecognized message type]"
     return text, raw_media_url
@@ -180,7 +160,7 @@ def send_wassenger_reply(phone, content, device_id, delay_seconds=0, msg_type="t
         payload["message"] = ""
         payload["type"] = "audio"
     else:
-        payload["message"] = content  # fallback
+        payload["message"] = content
     if delay_seconds > 0:
         deliver_at = datetime.utcnow() + timedelta(seconds=delay_seconds)
         payload["deliverAt"] = deliver_at.isoformat() + "Z"
@@ -232,7 +212,7 @@ def save_message(bot_id, customer_phone, session_id, direction, content, raw_med
     db.session.commit()
     logger.info(f"[DB] Saved message ({direction}) for {customer_phone}: {content}")
 
-def get_latest_history(bot_id, customer_phone, session_id, n=50):  # last 50 for context
+def get_latest_history(bot_id, customer_phone, session_id, n=50):
     messages = (Message.query
         .filter_by(bot_id=bot_id, customer_phone=customer_phone, session_id=session_id)
         .order_by(Message.created_at.desc())
@@ -242,7 +222,7 @@ def get_latest_history(bot_id, customer_phone, session_id, n=50):  # last 50 for
     logger.info(f"[DB] History ({len(messages)} messages) loaded.")
     return messages
 
-# --- Template/Attachment Sending ---
+# --- Template/Attachment Sending (if you use template tools) ---
 def send_template_by_id(phone, template_id, device_id):
     tmpl = Template.query.filter_by(template_id=template_id).first()
     if not tmpl:
@@ -256,7 +236,7 @@ def send_template_by_id(phone, template_id, device_id):
             send_wassenger_reply(phone, obj["content"], device_id, msg_type=obj["type"])
         time.sleep(1)
 
-# --- AI: Tool Decision ---
+# --- AI: Tool Decision (manager prompt) ---
 def decide_tool_with_manager_prompt(bot, history, lang='en'):
     prompt = bot.manager_system_prompt
     if "{LANG}" in prompt:
@@ -324,7 +304,6 @@ def send_split_messages_wassenger(phone, ai_reply, device_id, bot_id=None, user=
     except Exception as e:
         logger.error(f"[SEND SPLIT MSGS] Failed to parse AI reply as JSON: {e}")
 
-    # Always split by paragraph (\n\n), fallback to length if not found
     parts = [p.strip() for p in ai_reply.split('\n\n') if p.strip()]
     if not parts:
         max_len = 1024
@@ -361,11 +340,10 @@ def webhook():
         logger.error(f"[WEBHOOK] Invalid incoming data: {e}")
         return jsonify({"error": "Invalid request format"}), 400
 
-    # --- Universal media/text extraction ---
-    msg_text, raw_media_url = extract_text_from_message(msg)
-
-    lang = detect_language(msg_text)
-    customer = get_or_create_customer(user_phone, lang)  # For real app, store/track customer language
+    lang = detect_language(msg.get("body", ""))  # fallback if text
+    msg_text, raw_media_url = extract_text_from_message(msg, lang=lang)
+    lang = detect_language(msg_text) or lang
+    customer = get_or_create_customer(user_phone, lang)
 
     bot = get_bot_by_phone(bot_phone)
     if not bot:
@@ -378,7 +356,7 @@ def webhook():
         return jsonify({"error": "Failed to process customer message"}), 500
 
     save_message(bot.id, user_phone, session_id, "in", msg_text, raw_media_url=raw_media_url)
-    history = get_latest_history(bot.id, user_phone, session_id, n=50)  # last 50 for AI context
+    history = get_latest_history(bot.id, user_phone, session_id, n=50)
     tool_id = decide_tool_with_manager_prompt(bot, history, lang=lang)
     tool = None
     if tool_id and tool_id.lower() != "default":
@@ -393,10 +371,8 @@ def webhook():
     )
     ai_reply = compose_reply(bot, tool, history, context_input, lang=lang)
     send_split_messages_wassenger(user_phone, ai_reply, device_id, bot_id=bot.id, user=user_phone, session_id=session_id)
-    # --- Goal/session close logic, from config ---
     if tool_id and is_goal_achieved(tool_id, bot.config):
         notify_sales_group(bot, f"Goal achieved for customer {user_phone}: {ai_reply}")
-        # Optionally update session table to set status = "closed" for session_id
 
     return jsonify({"status": "ok", "ai_reply": ai_reply})
 
