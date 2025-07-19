@@ -169,7 +169,6 @@ def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text
         payload["message"] = text
     elif msg_type == "image":
         payload["mediaUrl"] = text
-        payload["type"] = "image"
         payload["message"] = caption or ""  # always set a message field for image!
     if delay_seconds > 0:
         deliver_at = datetime.utcnow() + timedelta(seconds=delay_seconds)
