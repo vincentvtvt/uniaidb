@@ -82,10 +82,8 @@ def format_e164(phone):
     return phone
 
 def get_or_create_customer(phone):
-    # Optionally: create or fetch from customer table
     return {"phone": phone}
 
-# --- Download Media from Wassenger ---
 def get_media_download_url(msg):
     media = msg.get("media") or {}
     if "links" in media and "download" in media["links"]:
@@ -99,7 +97,6 @@ def download_media_with_auth(url):
     resp.raise_for_status()
     return resp.content
 
-# --- AI Interpreter for Any Media ---
 def ai_interpret_file(file_url, file_type):
     try:
         file_bytes = download_media_with_auth(file_url)
@@ -114,7 +111,7 @@ def ai_interpret_file(file_url, file_type):
                 "If unsure, reply in the language most used in conversation."
             )
             vision_content = [
-                {"type": "image_url", "image_url": "data:image/jpeg;base64," + encoded}
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + encoded}}
             ]
             response = openai.chat.completions.create(
                 model="gpt-4o",
@@ -142,7 +139,6 @@ def ai_interpret_file(file_url, file_type):
         logger.error(f"[AI INTERPRETER] Error: {e}")
         return f"[{file_type.capitalize()} received, but could not interpret]"
 
-# --- Media/Text Extraction, 100% AI-driven ---
 def extract_text_from_message(msg):
     text = ""
     raw_media_url = None
@@ -268,53 +264,69 @@ def decide_tool_with_manager_prompt(bot, history):
     match = re.search(r'"TOOLS":\s*"([^"]+)"', tool_decision)
     return match.group(1) if match else None
 
-def compose_reply(bot, tool, history, context_input):
+def compose_reply(bot, tool, history):
+    # Format conversation: "User: ...\nBot: ...\nUser: ..."
+    context_lines = []
+    for m in history:
+        speaker = "User" if m.direction == "in" else "Bot"
+        context_lines.append(f"{speaker}: {m.content}")
+    context_input = "\n".join(context_lines)
+
     sys_prompt = (bot.system_prompt or "")
-    # INSTRUCT: Always reply in the main language of the latest customer message
     sys_prompt += (
-        "\nAlways reply in the same language as the customer's latest message. "
-        "If unsure, reply in the language most used in the conversation history."
-        "\nKeep replies concise, human-like, and split replies using \\n\\n for new message parts."
+        "\nYou are an AI WhatsApp assistant. Here is the conversation history with the customer and the bot."
+        "\nUse all previous messages as context to deeply understand the customer's needs, intent, and pain points."
+        "\nONLY reply to the most recent user message at the end of the conversation."
+        "\nDo NOT reply to every message in history; only respond as if you’re replying to the very latest customer input."
+        "\nYour reply must be concise (max 2–3 sentences), human-like, and in the language used by the customer."
+        "\nSplit long replies with \\n\\n to indicate message boundaries."
     )
     prompt = (sys_prompt + "\n" + (tool.prompt or "")) if tool else sys_prompt
     messages = [
         {"role": "system", "content": prompt},
         {"role": "user", "content": context_input}
     ]
-    stream = openai.chat.completions.create(
+    response = openai.chat.completions.create(
         model="gpt-4o",
         messages=messages,
         max_tokens=1024,
         temperature=0.3,
-        stream=True
     )
-    reply_accum = ""
-    for chunk in stream:
-        if hasattr(chunk.choices[0].delta, 'content') and chunk.choices[0].delta.content:
-            reply_accum += chunk.choices[0].delta.content
-    logger.info(f"\n[AI REPLY STREAMED]: {reply_accum}")
-    return reply_accum
+    ai_reply = response.choices[0].message.content
+    logger.info(f"\n[AI REPLY]: {ai_reply}")
+    return ai_reply
 
 def send_split_messages_wassenger(phone, ai_reply, device_id, bot_id=None, user=None, session_id=None):
-    try:
-        parsed = json.loads(ai_reply)
-        if isinstance(parsed, list):
-            for idx, obj in enumerate(parsed):
-                msg_type = obj.get("type", "text")
-                content = obj.get("content", "")
-                send_wassenger_reply(phone, content, device_id, msg_type=msg_type)
-                if bot_id and user and session_id:
-                    save_message(bot_id, user, session_id, "out", str(obj))
-                if idx < len(parsed) - 1:
-                    time.sleep(2)
-            return
-        if isinstance(parsed, dict) and "template" in parsed:
-            send_template_by_id(phone, parsed["template"], device_id)
-            return
-    except Exception as e:
-        logger.error(f"[SEND SPLIT MSGS] Failed to parse AI reply as JSON: {e}")
+    # Accept both dict/list (if model returns JSON), or string (plain reply)
+    parsed = None
+    if isinstance(ai_reply, str):
+        try:
+            parsed = json.loads(ai_reply)
+        except Exception:
+            parsed = None
+    else:
+        parsed = ai_reply
 
-    parts = [p.strip() for p in ai_reply.split('\n\n') if p.strip()]
+    # Structured/template reply
+    if isinstance(parsed, list):
+        for idx, obj in enumerate(parsed):
+            msg_type = obj.get("type", "text")
+            content = obj.get("content", "")
+            send_wassenger_reply(phone, content, device_id, msg_type=msg_type)
+            if bot_id and user and session_id:
+                save_message(bot_id, user, session_id, "out", str(obj))
+            if idx < len(parsed) - 1:
+                time.sleep(2)
+        return
+    if isinstance(parsed, dict) and "template" in parsed:
+        send_template_by_id(phone, parsed["template"], device_id)
+        if "message" in parsed and isinstance(parsed["message"], list):
+            for part in parsed["message"]:
+                send_wassenger_reply(phone, part, device_id)
+        return
+
+    # Simple string reply (split by paragraphs)
+    parts = [p.strip() for p in (ai_reply if isinstance(ai_reply, str) else str(ai_reply)).split('\n\n') if p.strip()]
     if not parts:
         max_len = 1024
         parts = [ai_reply[i:i+max_len] for i in range(0, len(ai_reply), max_len)]
@@ -371,11 +383,7 @@ def webhook():
                 tool = t
                 break
     logger.info(f"[LOGIC] Tool selected: {tool_id}, tool obj: {tool}")
-    context_input = (
-        "\n".join([f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}" for m in history])
-        if tool else msg_text
-    )
-    ai_reply = compose_reply(bot, tool, history, context_input)
+    ai_reply = compose_reply(bot, tool, history)
     send_split_messages_wassenger(user_phone, ai_reply, device_id, bot_id=bot.id, user=user_phone, session_id=session_id)
     if tool_id and is_goal_achieved(tool_id, bot.config):
         notify_sales_group(bot, f"Goal achieved for customer {user_phone}: {ai_reply}")
