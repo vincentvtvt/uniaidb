@@ -9,7 +9,6 @@ import requests
 import openai
 import base64
 
-# --- Logger setup ---
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s %(levelname)s:%(name)s:%(message)s'
@@ -154,7 +153,7 @@ def get_template_content(template_id):
         return []
     return template.content if isinstance(template.content, list) else json.loads(template.content)
 
-def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text", caption=None):
+def send_wassenger_reply(phone, text, device_id, delay_seconds=5, msg_type="text", caption=None):
     if not text:
         logger.warning("[WASSENGER] Skipping send: no text/content for message.")
         return
@@ -167,12 +166,16 @@ def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text
     }
     if msg_type == "text":
         payload["message"] = text
+        payload["schedule"] = {"delay": delay_seconds}
     elif msg_type == "image":
         payload["mediaUrl"] = text
         payload["type"] = "image"
         if caption:
             payload["caption"] = caption
-    allowed_keys = {"phone", "device", "mediaUrl", "type", "caption", "message", "deliverAt"}
+        # Images do not use "schedule", use deliverAt if you want
+        deliver_time = int((datetime.now() + timedelta(seconds=delay_seconds)).timestamp() * 1000)
+        payload["deliverAt"] = deliver_time
+    allowed_keys = {"phone", "device", "mediaUrl", "type", "caption", "message", "deliverAt", "schedule"}
     payload = {k: v for k, v in payload.items() if v is not None and k in allowed_keys}
     logger.debug(f"[WASSENGER PAYLOAD]: {payload}")
     try:
@@ -180,8 +183,6 @@ def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text
         logger.info(f"Wassenger response: {resp.text}")
     except Exception as e:
         logger.error(f"WASSENGER send failed: {e}")
-    if delay_seconds > 0:
-        time.sleep(delay_seconds)
 
 def notify_sales_group(bot, message, error=False):
     group_id = (bot.config or {}).get("notification_group")
@@ -295,27 +296,31 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
         logger.error("[SEND SPLIT MSGS] Failed to parse AI reply as JSON")
         parsed = {}
 
+    # --- TEMPLATE PROCESSING ---
     if "template" in parsed:
         template_id = parsed["template"]
         template_content = get_template_content(template_id)
-        for part in template_content:
+        for idx, part in enumerate(template_content):
             if part.get("type") == "text":
-                send_wassenger_reply(customer_phone, part["content"], device_id)
+                send_wassenger_reply(customer_phone, part["content"], device_id, delay_seconds=5)
                 if bot_id and user and session_id:
                     save_message(bot_id, user, session_id, "out", part["content"])
-                time.sleep(1)
             elif part.get("type") == "image":
                 send_wassenger_reply(
                     customer_phone,
                     part["content"],
                     device_id,
+                    delay_seconds=5,
                     msg_type="image",
                     caption=part.get("caption") or None
                 )
                 if bot_id and user and session_id:
                     save_message(bot_id, user, session_id, "out", f"[IMAGE]{part['content']}")
-                time.sleep(1)
+            # Always wait for a delay between template parts
+            if idx < len(template_content) - 1:
+                time.sleep(5)
 
+    # --- MESSAGE PARTS ---
     msg_lines = []
     if "message" in parsed:
         if isinstance(parsed["message"], list):
@@ -326,11 +331,11 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
         msg_lines = [parsed]
     for idx, part in enumerate(msg_lines[:3]):
         if part:
-            send_wassenger_reply(customer_phone, part, device_id)
+            send_wassenger_reply(customer_phone, part, device_id, delay_seconds=5)
             if bot_id and user and session_id:
                 save_message(bot_id, user, session_id, "out", part)
             if idx < len(msg_lines[:3]) - 1:
-                time.sleep(2)
+                time.sleep(5)
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
