@@ -11,12 +11,16 @@ import openai
 import base64
 import re
 
+# --- Logger setup ---
+logging.basicConfig(
+    level=logging.DEBUG,  # ensure full debug output!
+    format='%(asctime)s %(levelname)s:%(name)s:%(message)s'
+)
+logger = logging.getLogger("UniAI")
+
 # --- Setup ---
 openai.api_key = os.getenv("OPENAI_API_KEY")
 WASSENGER_API_KEY = os.getenv("WASSENGER_API_KEY")
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("UniAI")
 
 app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv("DATABASE_URL")
@@ -169,7 +173,6 @@ def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text
         payload["type"] = "image"
         if caption:
             payload["message"] = caption
-    # Delayed send (optional)
     if delay_seconds > 0:
         deliver_at = datetime.utcnow() + timedelta(seconds=delay_seconds)
         payload["deliverAt"] = deliver_at.isoformat() + "Z"
@@ -191,9 +194,22 @@ def notify_sales_group(bot, message, error=False):
 
 # --- DB Utility ---
 def get_bot_by_phone(phone_number):
-    bot = Bot.query.filter_by(phone_number=phone_number).first()
-    logger.info(f"[DB] Bot lookup by phone: {phone_number} => {bot}")
-    return bot
+    # Try various forms: with/without '+', with/without @c.us, just digits
+    num_variants = [
+        phone_number,
+        phone_number.lstrip('+'),
+        phone_number.replace('+', '').replace('@c.us', ''),
+        '+' + phone_number.replace('@c.us', '').lstrip('+'),
+        phone_number.replace('@c.us', ''),
+    ]
+    logger.debug(f"[DB] Bot lookup attempt for: {phone_number} (variants: {num_variants})")
+    for variant in num_variants:
+        bot = Bot.query.filter_by(phone_number=variant).first()
+        if bot:
+            logger.debug(f"[DB] Bot found! Input: {phone_number}, Matched: {variant} (DB: {bot.phone_number})")
+            return bot
+    logger.error(f"[DB] Bot NOT FOUND for: {phone_number} (tried: {num_variants})")
+    return None
 
 def get_active_tools_for_bot(bot_id):
     tools = (
@@ -282,14 +298,12 @@ def compose_reply(bot, tool, history, context_input):
 
 # --- Template and Free-text Processing and Sending ---
 def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, user=None, session_id=None):
-    # Always flatten/parse, never send JSON to user!
     try:
         parsed = ai_reply if isinstance(ai_reply, dict) else json.loads(ai_reply)
     except Exception:
         logger.error("[SEND SPLIT MSGS] Failed to parse AI reply as JSON")
         parsed = {}
 
-    # 1. Template
     if "template" in parsed:
         template_id = parsed["template"]
         template_content = get_template_content(template_id)
@@ -310,9 +324,7 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
                 if bot_id and user and session_id:
                     save_message(bot_id, user, session_id, "out", f"[IMAGE]{part['content']}")
                 time.sleep(1)
-            # Extend with "video", "audio" here if needed
 
-    # 2. AI free text
     msg_lines = []
     if "message" in parsed:
         if isinstance(parsed["message"], list):
