@@ -168,12 +168,10 @@ def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text
     if msg_type == "text":
         payload["message"] = text
     elif msg_type == "image":
-        payload["mediaUrl"] = text
-        if caption:
-            payload["message"] = caption
-        # If caption is empty, REMOVE 'message' to avoid validation error
-        else:
-            payload.pop("message", None)
+    payload["mediaUrl"] = text
+    # Wassenger: Do NOT send "message" (caption) with mediaUrl for images.
+    payload.pop("message", None)
+
     if delay_seconds > 0:
         deliver_at = datetime.utcnow() + timedelta(seconds=delay_seconds)
         payload["deliverAt"] = deliver_at.isoformat() + "Z"
