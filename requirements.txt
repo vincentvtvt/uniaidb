@@ -9,3 +9,4 @@ fastapi
 datetime
 tiktoken
 flask_sqlalchemy
+Pillow
