@@ -95,7 +95,7 @@ def extract_text_from_image(img_url, prompt=None):
     result = openai.chat.completions.create(
         model="gpt-4o",
         messages=messages,
-        max_tokens=256
+        max_tokens=8192
     )
     return result.choices[0].message.content.strip()
 
@@ -284,7 +284,7 @@ def decide_tool_with_manager_prompt(bot, history):
             {"role": "system", "content": prompt},
             {"role": "user", "content": history_text}
         ],
-        max_tokens=32,
+        max_tokens=8192,
         temperature=0
     )
     tool_decision = response.choices[0].message.content
@@ -306,7 +306,7 @@ def compose_reply(bot, tool, history, context_input):
     stream = openai.chat.completions.create(
         model="gpt-4o",
         messages=messages,
-        max_tokens=1024,
+        max_tokens=8192,
         temperature=0.3,
         stream=True
     )
