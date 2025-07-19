@@ -68,6 +68,19 @@ class Template(db.Model):
     template_id = db.Column(db.String(100), unique=True)
     content = db.Column(db.Text)  # JSON: [{"type":"text","content":...},...]
 
+# --- Phone Formatter ---
+def format_e164(phone):
+    phone = str(phone).replace(' ', '').replace('-', '').replace('(', '').replace(')', '')
+    if phone.startswith('+'):
+        return phone
+    if phone.startswith('6'):
+        return '+' + phone
+    if phone.startswith('01'):
+        return '+6' + phone
+    if phone.startswith('1'):
+        return '+60' + phone
+    return phone
+
 # --- Language Detection and Customer Handling ---
 def detect_language(text):
     if re.search(r'[\u4e00-\u9fff]', text):
@@ -79,10 +92,32 @@ def get_or_create_customer(phone, lang):
     # This example just returns lang, but should create or update in your real model.
     return {"phone": phone, "language": lang}
 
-# --- Media/Text Extraction, Vision, Audio... (unchanged, see your code) ---
+# --- Media/Text Extraction ---
+def extract_text_from_message(msg):
+    """
+    Extracts main text content from WhatsApp/Wassenger message.
+    Returns: (text, raw_media_url)
+    """
+    text = ""
+    raw_media_url = None
+    # If the message contains plain text
+    if "body" in msg and msg["body"]:
+        text = msg["body"]
+    # If the message is a file (document/image/audio/video)
+    elif msg.get("type") in ("image", "video", "audio", "document", "file"):
+        # Optionally use caption if present
+        text = msg.get("caption", "")
+        raw_media_url = msg.get("mediaUrl") or msg.get("fileUrl")
+        if not text:
+            text = f"[{msg.get('type').capitalize()} received]"
+    # Fallback
+    else:
+        text = "[Unrecognized message type]"
+    return text, raw_media_url
 
 # --- Wassenger Send Message (with delayed delivery via API) ---
 def send_wassenger_reply(phone, content, device_id, delay_seconds=0, msg_type="text"):
+    phone = format_e164(phone)
     url = "https://api.wassenger.com/v1/messages"
     headers = {"Content-Type": "application/json", "Token": WASSENGER_API_KEY}
     payload = {"phone": phone, "device": device_id}
@@ -160,7 +195,7 @@ def get_latest_history(bot_id, customer_phone, session_id, n=50):  # last 50 for
     logger.info(f"[DB] History ({len(messages)} messages) loaded.")
     return messages
 
-# --- Template/Attachment Sending (new, #7) ---
+# --- Template/Attachment Sending ---
 def send_template_by_id(phone, template_id, device_id):
     tmpl = Template.query.filter_by(template_id=template_id).first()
     if not tmpl:
@@ -198,15 +233,11 @@ def decide_tool_with_manager_prompt(bot, history, lang='en'):
 
 # --- AI: Final Reply Generator (Streaming) ---
 def compose_reply(bot, tool, history, context_input, lang='en'):
-    # Prompt selection (concise/human split enforced here)
     sys_prompt = (bot.system_prompt or "")
     if "{LANG}" in sys_prompt:
         sys_prompt = sys_prompt.replace("{LANG}", lang)
     prompt = (sys_prompt + "\n" + (tool.prompt or "")) if tool else sys_prompt
-
-    # Append concise reply instruction!
     prompt += "\n回复必须简短自然，2-3句话，每句话不超过60字。用/n/n分段。"
-
     logger.info(f"[AI REPLY] Prompt: {prompt}")
     messages = [
         {"role": "system", "content": prompt},
@@ -226,7 +257,7 @@ def compose_reply(bot, tool, history, context_input, lang='en'):
     logger.info(f"\n[AI REPLY STREAMED]: {reply_accum}")
     return reply_accum
 
-# --- Universal Table Content Split and Send (enhanced, #1/2/7) ---
+# --- Universal Table Content Split and Send ---
 def send_split_messages_wassenger(phone, ai_reply, device_id, bot_id=None, user=None, session_id=None, auto_describe_media=True):
     try:
         parsed = json.loads(ai_reply)
@@ -264,30 +295,6 @@ def send_split_messages_wassenger(phone, ai_reply, device_id, bot_id=None, user=
 def is_goal_achieved(tool_id, bot_config):
     goal_tools = (bot_config or {}).get("goal_tools", [])
     return tool_id in goal_tools
-
-def extract_text_from_message(msg):
-    """
-    Extracts main text content from WhatsApp/Wassenger message.
-    Returns: (text, raw_media_url)
-    """
-    text = ""
-    raw_media_url = None
-
-    # If the message contains plain text
-    if "body" in msg and msg["body"]:
-        text = msg["body"]
-    # If the message is a file (document/image/audio/video)
-    elif msg.get("type") in ("image", "video", "audio", "document", "file"):
-        # Optionally use caption if present
-        text = msg.get("caption", "")
-        raw_media_url = msg.get("mediaUrl") or msg.get("fileUrl")
-        if not text:
-            text = f"[{msg.get('type').capitalize()} received]"
-    # Fallback
-    else:
-        text = "[Unrecognized message type]"
-    return text, raw_media_url
-
 
 # --- Webhook Handler (main logic, all features) ---
 @app.route('/webhook', methods=['POST'])
