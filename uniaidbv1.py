@@ -85,12 +85,24 @@ def get_or_create_customer(phone):
     # Optionally: create or fetch from customer table
     return {"phone": phone}
 
+# --- Download Media from Wassenger ---
+def get_media_download_url(msg):
+    media = msg.get("media") or {}
+    if "links" in media and "download" in media["links"]:
+        base_url = "https://api.wassenger.com"
+        return base_url + media["links"]["download"]
+    return None
+
+def download_media_with_auth(url):
+    headers = {"Token": WASSENGER_API_KEY}
+    resp = requests.get(url, headers=headers)
+    resp.raise_for_status()
+    return resp.content
+
 # --- AI Interpreter for Any Media ---
 def ai_interpret_file(file_url, file_type):
     try:
-        resp = requests.get(file_url)
-        resp.raise_for_status()
-        file_bytes = resp.content
+        file_bytes = download_media_with_auth(file_url)
         if file_type in ("image", "sticker", "video"):
             encoded = base64.b64encode(file_bytes).decode()
             msg = (
@@ -137,8 +149,11 @@ def extract_text_from_message(msg):
     if "body" in msg and msg["body"]:
         text = msg["body"]
     elif msg.get("type") in ("image", "sticker", "video", "audio", "document", "file"):
-        raw_media_url = msg.get("mediaUrl") or msg.get("fileUrl")
-        text = ai_interpret_file(raw_media_url, msg["type"])
+        raw_media_url = get_media_download_url(msg)
+        if raw_media_url:
+            text = ai_interpret_file(raw_media_url, msg["type"])
+        else:
+            text = f"[{msg.get('type').capitalize()} received, but no downloadable media link]"
     else:
         text = "[Unrecognized message type]"
     return text, raw_media_url
