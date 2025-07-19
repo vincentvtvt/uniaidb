@@ -9,6 +9,40 @@ import requests
 import openai
 import base64
 
+# --- Universal JSON Prompt Builder ---
+def build_json_prompt(base_prompt, example_json, tag=None):
+    """
+    Universal function to attach strict JSON output instruction with an example block.
+
+    Args:
+        base_prompt (str): Your core system or tool prompt.
+        example_json (str): The example JSON block to show the model.
+        tag (str): The example tag name, e.g., 'ExampleOutput' (default), or anything else you want.
+
+    Returns:
+        str: Full prompt with attached JSON instruction and example.
+    """
+    tag_name = tag if tag else "ExampleOutput"
+    json_instruction = (
+        "\n\n<OutputFormat>\n"
+        "Always respond ONLY with a strict, valid JSON object. "
+        "Use double quotes for all keys and string values. "
+        "Do not include any explanation, markdown, or code block formatting—just pure JSON.\n"
+        f"Wrap your response inside <{tag_name}> tags as shown below.\n"
+        "</OutputFormat>\n"
+        f"<{tag_name}>\n"
+        f"{example_json.strip()}\n"
+        f"</{tag_name}>"
+    )
+    return base_prompt.strip() + json_instruction
+
+# Example usage (manager decision):
+# manager_prompt = build_json_prompt(bot.manager_system_prompt, '{\n  "TOOLS": "Default"\n}', tag="ExampleOutput")
+
+# Example usage (reply/tool generation):
+# reply_prompt = build_json_prompt(bot.system_prompt, '{\n  "message": ["hello", "world"]\n}', tag="ExampleOutput")
+
+
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s %(levelname)s:%(name)s:%(message)s'
@@ -274,14 +308,20 @@ def get_latest_history(bot_id, customer_phone, session_id, n=20):
     return messages
 
 def decide_tool_with_manager_prompt(bot, history):
-    prompt = bot.manager_system_prompt
+    # Build history text as before
     history_text = "\n".join([f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}" for m in history])
-    logger.info(f"[AI DECISION] manager_system_prompt: {prompt}")
+    # Use the universal prompt builder for strict JSON
+    manager_prompt = build_json_prompt(
+        bot.manager_system_prompt or "",
+        '{\n  "TOOLS": "Default"\n}',
+        tag="ExampleOutput"
+    )
+    logger.info(f"[AI DECISION] manager_system_prompt: {manager_prompt}")
     logger.info(f"[AI DECISION] history: {history_text}")
     response = openai.chat.completions.create(
         model="gpt-4o",
         messages=[
-            {"role": "system", "content": prompt},
+            {"role": "system", "content": manager_prompt},
             {"role": "user", "content": history_text}
         ],
         max_tokens=8192,
@@ -290,17 +330,37 @@ def decide_tool_with_manager_prompt(bot, history):
     tool_decision = response.choices[0].message.content
     logger.info(f"[AI DECISION] Tool chosen: {tool_decision}")
     import re
-    match = re.search(r'"TOOLS":\s*"([^"]+)"', tool_decision)
-    return match.group(1) if match else None
+    # Extract the JSON block inside <ExampleOutput>
+    import re
+    match = re.search(r'<ExampleOutput>(.*?)</ExampleOutput>', tool_decision, re.DOTALL)
+    json_block = match.group(1).strip() if match else tool_decision
+    match_json = re.search(r'"TOOLS":\s*"([^"]+)"', json_block)
+    return match_json.group(1) if match_json else None
 
 def compose_reply(bot, tool, history, context_input):
+    # Compose reply using strict JSON format prompt
     if tool:
         prompt = (bot.system_prompt or "") + "\n" + (tool.prompt or "")
+        example_json = '''{
+  "template": "bf_UGnkL24bhtCQBIJr7hbT",
+  "message": [
+    "salam cik atas pakej astro fibre 2025",
+    "cik ada astro tv yang aktif bulanan ke?"
+  ]
+}'''
     else:
         prompt = bot.system_prompt or ""
-    logger.info(f"[AI REPLY] Prompt: {prompt}")
+        example_json = '''{
+  "message": [
+    "astro fibre boleh sambung 10-20+ device",
+    "astro go boleh stream 4 device",
+    "nak proceed sila isi borang ye cik"
+  ]
+}'''
+    reply_prompt = build_json_prompt(prompt, example_json, tag="ExampleOutput")
+    logger.info(f"[AI REPLY] Prompt: {reply_prompt}")
     messages = [
-        {"role": "system", "content": prompt},
+        {"role": "system", "content": reply_prompt},
         {"role": "user", "content": context_input}
     ]
     stream = openai.chat.completions.create(
@@ -317,7 +377,9 @@ def compose_reply(bot, tool, history, context_input):
             reply_accum += chunk.choices[0].delta.content
             print(chunk.choices[0].delta.content, end="", flush=True)
     logger.info(f"\n[AI REPLY STREAMED]: {reply_accum}")
-    return reply_accum
+    # Extract JSON inside <ExampleOutput>
+    match = re.search(r'<ExampleOutput>(.*?)</ExampleOutput>', reply_accum, re.DOTALL)
+    return match.group(1).strip() if match else reply_accum
 
 def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, user=None, session_id=None):
     try:
