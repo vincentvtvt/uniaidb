@@ -200,10 +200,29 @@ def extract_text_from_message(msg):
                 image_bytes = buf.getvalue()
             try:
                 img_b64 = encode_image_b64(image_bytes)
-                vision_msg = [
-                    {"role": "system", "content": "This is a WhatsApp sticker. Describe the main emotion or meaning it conveys in 1-2 words, e.g. 'thank you', 'happy', 'love', 'celebration', 'laugh', etc. If text is visible, mention it."},
-                    {"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}]}
-                ]
+                img_b64 = encode_image_b64(image_bytes)
+        vision_msg = [
+            {
+                "role": "system",
+                "content": (
+                    "This is a WhatsApp sticker. "
+                    "Briefly describe what is shown in the sticker, focusing on the main character, action, and emotion. "
+                    "If there is text in the sticker, include it in your answer. "
+                    "Reply in a short, natural phrase (e.g., 'a cat happily sitting', 'dog saying thank you', 'happy face with celebration text'). "
+                    "Do not explain or add code formatting, just the phrase."
+                ),
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{img_b64}"}
+                    }
+                ],
+            }
+        ]
+
                 result = openai.chat.completions.create(
                     model="gpt-4o",
                     messages=vision_msg,
