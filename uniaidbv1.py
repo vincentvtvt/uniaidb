@@ -81,25 +81,26 @@ def format_e164(phone):
         return '+60' + phone
     return phone
 
-# --- Language Detection and Customer Handling ---
-def detect_language(text):
-    if re.search(r'[\u4e00-\u9fff]', text):
-        return 'zh'
-    return 'en'
+def get_or_create_customer(phone):
+    # Optionally: create or fetch from customer table
+    return {"phone": phone}
 
-def get_or_create_customer(phone, lang):
-    # Here you can add your own Customer table/model
-    return {"phone": phone, "language": lang}
-
-# --- Universal AI Interpreter for Any Media ---
-def ai_interpret_file(file_url, file_type, lang='en'):
+# --- AI Interpreter for Any Media ---
+def ai_interpret_file(file_url, file_type):
     try:
         resp = requests.get(file_url)
         resp.raise_for_status()
         file_bytes = resp.content
         if file_type in ("image", "sticker", "video"):
             encoded = base64.b64encode(file_bytes).decode()
-            msg = f"You are an interpreter. The user sent a {file_type}. If it's a sticker, describe the sticker in 1 short sentence (e.g. 'User sent sticker of a cat laughing'). For image/video, describe the visual or OCR any text. Reply in the user's language ({lang})."
+            msg = (
+                "You are an AI WhatsApp interpreter. User sent a "
+                f"{file_type}. If it's a sticker, briefly describe its meaning in one sentence "
+                "(e.g. 'User sent sticker of a cat laughing'). For image/video, describe the visual, "
+                "OCR any visible text, or summarize content. Reply always in the main language used by the customer. "
+                "If the last message was Chinese, reply in Chinese; if English, reply in English. "
+                "If unsure, reply in the language most used in conversation."
+            )
             vision_content = [
                 {"type": "image_url", "image_url": "data:image/jpeg;base64," + encoded}
             ]
@@ -130,19 +131,18 @@ def ai_interpret_file(file_url, file_type, lang='en'):
         return f"[{file_type.capitalize()} received, but could not interpret]"
 
 # --- Media/Text Extraction, 100% AI-driven ---
-def extract_text_from_message(msg, lang='en'):
+def extract_text_from_message(msg):
     text = ""
     raw_media_url = None
     if "body" in msg and msg["body"]:
         text = msg["body"]
     elif msg.get("type") in ("image", "sticker", "video", "audio", "document", "file"):
         raw_media_url = msg.get("mediaUrl") or msg.get("fileUrl")
-        text = ai_interpret_file(raw_media_url, msg["type"], lang=lang)
+        text = ai_interpret_file(raw_media_url, msg["type"])
     else:
         text = "[Unrecognized message type]"
     return text, raw_media_url
 
-# --- Wassenger Send Message (with delayed delivery via API) ---
 def send_wassenger_reply(phone, content, device_id, delay_seconds=0, msg_type="text"):
     phone = format_e164(phone)
     url = "https://api.wassenger.com/v1/messages"
@@ -179,7 +179,6 @@ def notify_sales_group(bot, message, error=False):
     else:
         logger.warning("[NOTIFY] Notification group or device_id missing in bot.config")
 
-# --- DB Utility ---
 def get_bot_by_phone(phone_number):
     bot = Bot.query.filter_by(phone_number=phone_number).first()
     logger.info(f"[DB] Bot lookup by phone: {phone_number} => {bot}")
@@ -222,7 +221,6 @@ def get_latest_history(bot_id, customer_phone, session_id, n=50):
     logger.info(f"[DB] History ({len(messages)} messages) loaded.")
     return messages
 
-# --- Template/Attachment Sending (if you use template tools) ---
 def send_template_by_id(phone, template_id, device_id):
     tmpl = Template.query.filter_by(template_id=template_id).first()
     if not tmpl:
@@ -236,11 +234,8 @@ def send_template_by_id(phone, template_id, device_id):
             send_wassenger_reply(phone, obj["content"], device_id, msg_type=obj["type"])
         time.sleep(1)
 
-# --- AI: Tool Decision (manager prompt) ---
-def decide_tool_with_manager_prompt(bot, history, lang='en'):
+def decide_tool_with_manager_prompt(bot, history):
     prompt = bot.manager_system_prompt
-    if "{LANG}" in prompt:
-        prompt = prompt.replace("{LANG}", lang)
     history_text = "\n".join([f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}" for m in history])
     logger.info(f"[AI DECISION] manager_system_prompt: {prompt}")
     logger.info(f"[AI DECISION] history: {history_text}")
@@ -258,14 +253,15 @@ def decide_tool_with_manager_prompt(bot, history, lang='en'):
     match = re.search(r'"TOOLS":\s*"([^"]+)"', tool_decision)
     return match.group(1) if match else None
 
-# --- AI: Final Reply Generator (Streaming) ---
-def compose_reply(bot, tool, history, context_input, lang='en'):
+def compose_reply(bot, tool, history, context_input):
     sys_prompt = (bot.system_prompt or "")
-    if "{LANG}" in sys_prompt:
-        sys_prompt = sys_prompt.replace("{LANG}", lang)
+    # INSTRUCT: Always reply in the main language of the latest customer message
+    sys_prompt += (
+        "\nAlways reply in the same language as the customer's latest message. "
+        "If unsure, reply in the language most used in the conversation history."
+        "\nKeep replies concise, human-like, and split replies using \\n\\n for new message parts."
+    )
     prompt = (sys_prompt + "\n" + (tool.prompt or "")) if tool else sys_prompt
-    prompt += "\n回复必须简短自然，2-3句话，每句话不超过60字。用/n/n分段。"
-    logger.info(f"[AI REPLY] Prompt: {prompt}")
     messages = [
         {"role": "system", "content": prompt},
         {"role": "user", "content": context_input}
@@ -284,8 +280,7 @@ def compose_reply(bot, tool, history, context_input, lang='en'):
     logger.info(f"\n[AI REPLY STREAMED]: {reply_accum}")
     return reply_accum
 
-# --- Universal Table Content Split and Send ---
-def send_split_messages_wassenger(phone, ai_reply, device_id, bot_id=None, user=None, session_id=None, auto_describe_media=True):
+def send_split_messages_wassenger(phone, ai_reply, device_id, bot_id=None, user=None, session_id=None):
     try:
         parsed = json.loads(ai_reply)
         if isinstance(parsed, list):
@@ -315,12 +310,10 @@ def send_split_messages_wassenger(phone, ai_reply, device_id, bot_id=None, user=
         if idx < len(parts) - 1:
             time.sleep(2)
 
-# --- Session/Goal/Status Logic (Goal tools in config) ---
 def is_goal_achieved(tool_id, bot_config):
     goal_tools = (bot_config or {}).get("goal_tools", [])
     return tool_id in goal_tools
 
-# --- Webhook Handler (main logic, all features) ---
 @app.route('/webhook', methods=['POST'])
 def webhook():
     logger.info("[WEBHOOK] Received POST /webhook")
@@ -340,10 +333,8 @@ def webhook():
         logger.error(f"[WEBHOOK] Invalid incoming data: {e}")
         return jsonify({"error": "Invalid request format"}), 400
 
-    lang = detect_language(msg.get("body", ""))  # fallback if text
-    msg_text, raw_media_url = extract_text_from_message(msg, lang=lang)
-    lang = detect_language(msg_text) or lang
-    customer = get_or_create_customer(user_phone, lang)
+    msg_text, raw_media_url = extract_text_from_message(msg)
+    customer = get_or_create_customer(user_phone)
 
     bot = get_bot_by_phone(bot_phone)
     if not bot:
@@ -357,7 +348,7 @@ def webhook():
 
     save_message(bot.id, user_phone, session_id, "in", msg_text, raw_media_url=raw_media_url)
     history = get_latest_history(bot.id, user_phone, session_id, n=50)
-    tool_id = decide_tool_with_manager_prompt(bot, history, lang=lang)
+    tool_id = decide_tool_with_manager_prompt(bot, history)
     tool = None
     if tool_id and tool_id.lower() != "default":
         for t in get_active_tools_for_bot(bot.id):
@@ -369,7 +360,7 @@ def webhook():
         "\n".join([f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}" for m in history])
         if tool else msg_text
     )
-    ai_reply = compose_reply(bot, tool, history, context_input, lang=lang)
+    ai_reply = compose_reply(bot, tool, history, context_input)
     send_split_messages_wassenger(user_phone, ai_reply, device_id, bot_id=bot.id, user=user_phone, session_id=session_id)
     if tool_id and is_goal_achieved(tool_id, bot.config):
         notify_sales_group(bot, f"Goal achieved for customer {user_phone}: {ai_reply}")
