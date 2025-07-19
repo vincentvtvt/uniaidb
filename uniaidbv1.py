@@ -359,13 +359,15 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
             msg_lines = [parsed["message"]]
     elif isinstance(parsed, str):
         msg_lines = [parsed]
+
+    SPLIT_MSG_DELAY = 7  # seconds between each message
+
     for idx, part in enumerate(msg_lines[:3]):
         if part:
-            send_wassenger_reply(customer_phone, part, device_id, delay_seconds=5)
+            delay = SPLIT_MSG_DELAY * (idx + 1)  # 7s, 14s, 21s, etc.
+            send_wassenger_reply(customer_phone, part, device_id, delay_seconds=delay)
             if bot_id and user and session_id:
                 save_message(bot_id, user, session_id, "out", part)
-            if idx < len(msg_lines[:3]) - 1:
-                time.sleep(5)
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
