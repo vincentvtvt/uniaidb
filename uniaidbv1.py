@@ -62,6 +62,18 @@ class Message(db.Model):
     raw_media_url = db.Column(db.Text)
     created_at = db.Column(db.DateTime)
 
+class Template(db.Model):
+    __tablename__ = 'templates'
+    id = db.Column(db.Integer, primary_key=True)
+    template_id = db.Column(db.String(50))
+    bot_id = db.Column(db.Integer)
+    description = db.Column(db.String(255))
+    content = db.Column(db.JSON)  # JSONB
+    language = db.Column(db.String(10))
+    active = db.Column(db.Boolean, default=True)
+    created_at = db.Column(db.DateTime)
+    updated_at = db.Column(db.DateTime)
+
 # --- Media/Text Extraction ---
 def download_file(url):
     r = requests.get(url)
@@ -133,6 +145,16 @@ def extract_text_from_message(msg):
         return "[Sticker received]", None
     else:
         return f"[Unrecognized message type: {msg_type}]", None
+
+# --- Template Fetch ---
+def get_template_content(template_id):
+    template = db.session.query(Template).filter_by(template_id=template_id, active=True).first()
+    if not template or not template.content:
+        return []
+    return template.content if isinstance(template.content, list) else json.loads(template.content)
+
+def send_whatsapp_image(to, image_url, device_id):
+    send_wassenger_reply(to, image_url, device_id, msg_type="image")
 
 # --- Wassenger Send Message (plain text, always flatten output) ---
 def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text"):
@@ -257,28 +279,48 @@ def compose_reply(bot, tool, history, context_input):
     logger.info(f"\n[AI REPLY STREAMED]: {reply_accum}")
     return reply_accum
 
-# --- Split and Send Multi-line (Flatten all JSON into text, max 3 WhatsApp messages) ---
-def send_split_messages_wassenger(phone, ai_reply, device_id, bot_id=None, user=None, session_id=None):
+# --- Template and Free-text Processing and Sending ---
+def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, user=None, session_id=None):
     # Always flatten/parse, never send JSON to user!
     try:
-        parsed = json.loads(ai_reply)
-        if isinstance(parsed, dict) and "message" in parsed:
-            flat = "\n\n".join([str(m).strip() for m in parsed["message"] if str(m).strip()])
-            parts = [p.strip() for p in flat.split('\n\n') if p.strip()]
-        elif isinstance(parsed, list):
-            flat = "\n\n".join([str(m).strip() for m in parsed if str(m).strip()])
-            parts = [p.strip() for p in flat.split('\n\n') if p.strip()]
-        else:
-            reply_str = ai_reply if isinstance(ai_reply, str) else str(ai_reply)
-            parts = [p.strip() for p in reply_str.split('\n\n') if p.strip()]
+        parsed = ai_reply if isinstance(ai_reply, dict) else json.loads(ai_reply)
     except Exception:
-        reply_str = ai_reply if isinstance(ai_reply, str) else str(ai_reply)
-        parts = [p.strip() for p in reply_str.split('\n\n') if p.strip()]
-    for idx, part in enumerate(parts[:3]):
-        send_wassenger_reply(phone, part, device_id)
+        logger.error("[SEND SPLIT MSGS] Failed to parse AI reply as JSON")
+        parsed = {}
+
+    # 1. Template
+    if "template" in parsed:
+        template_id = parsed["template"]
+        template_content = get_template_content(template_id)
+        for part in template_content:
+            if part.get("type") == "text":
+                send_wassenger_reply(customer_phone, part["content"], device_id)
+                if bot_id and user and session_id:
+                    save_message(bot_id, user, session_id, "out", part["content"])
+                time.sleep(1)
+            elif part.get("type") == "image":
+                send_whatsapp_image(customer_phone, part["content"], device_id)
+                if bot_id and user and session_id:
+                    save_message(bot_id, user, session_id, "out", f"[IMAGE]{part['content']}")
+                time.sleep(1)
+            # You can extend with "video", "audio" here.
+
+    # 2. AI free text
+    msg_lines = []
+    if "message" in parsed:
+        # message could be list or string
+        if isinstance(parsed["message"], list):
+            msg_lines = parsed["message"]
+        elif isinstance(parsed["message"], str):
+            msg_lines = [parsed["message"]]
+    elif isinstance(parsed, str):
+        msg_lines = [parsed]
+    # fallback if raw
+    for idx, part in enumerate(msg_lines[:3]):
+        send_wassenger_reply(customer_phone, part, device_id)
         if bot_id and user and session_id:
             save_message(bot_id, user, session_id, "out", part)
-        if idx < len(parts[:3]) - 1:
+        if idx < len(msg_lines[:3]) - 1:
             time.sleep(5)
 
 # --- Webhook Handler ---
@@ -339,8 +381,8 @@ def webhook():
     # Step 3: Compose AI reply (streamed)
     ai_reply = compose_reply(bot, tool, history, context_input)
 
-    # Step 4: Send split reply via Wassenger, 5s delay for each part
-    send_split_messages_wassenger(user_phone, ai_reply, device_id, bot_id=bot.id, user=user_phone, session_id=session_id)
+    # Step 4: Send template + split free text via Wassenger, 5s delay per text
+    process_ai_reply_and_send(user_phone, ai_reply, device_id, bot_id=bot.id, user=user_phone, session_id=session_id)
 
     # Step 5: Notify group if goal (customize logic here, e.g. tool_id has "88")
     if tool_id and "88" in tool_id:
