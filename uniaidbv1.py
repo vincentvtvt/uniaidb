@@ -156,7 +156,7 @@ def get_template_content(template_id):
         return []
     return template.content if isinstance(template.content, list) else json.loads(template.content)
 
-# --- Wassenger Send (FIXED for image) ---
+# --- Wassenger Send (ENHANCED for image, step 2) ---
 def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text", caption=None):
     logger.info(f"[WASSENGER] To: {phone} | Device: {device_id} | Text: {text} | Type: {msg_type}")
     url = "https://api.wassenger.com/v1/messages"
@@ -169,7 +169,9 @@ def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text
         payload["message"] = text
     elif msg_type == "image":
         payload["mediaUrl"] = text
-        payload["message"] = caption or ""
+        # ENHANCEMENT: Only include "message" (caption) if provided and non-empty
+        if caption:
+            payload["message"] = caption
     if delay_seconds > 0:
         deliver_at = datetime.utcnow() + timedelta(seconds=delay_seconds)
         payload["deliverAt"] = deliver_at.isoformat() + "Z"
@@ -309,12 +311,13 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
                     save_message(bot_id, user, session_id, "out", part["content"])
                 time.sleep(1)
             elif part.get("type") == "image":
+                # Only send 'message' (caption) if available, otherwise don't send it
                 send_wassenger_reply(
                     customer_phone,
                     part["content"],
                     device_id,
                     msg_type="image",
-                    caption=part.get("caption")
+                    caption=part.get("caption") if part.get("caption") else None
                 )
                 if bot_id and user and session_id:
                     save_message(bot_id, user, session_id, "out", f"[IMAGE]{part['content']}")
