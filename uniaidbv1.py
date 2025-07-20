@@ -170,7 +170,7 @@ def extract_text_from_image(img_url, prompt=None):
     img_b64 = encode_image_b64(image_bytes)
     logger.info("[VISION] Sending image to OpenAI Vision...")
     messages = [
-        {"role": "system", "content": prompt or "Extract all visible text from this image. If no text, describe what you see."},
+        {"role": "system", "content": prompt or "Extract all visible text from this image. If no text, describe what you see. Example output is 'user is sending a image with chicken eating chicken'"},
         {"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}]}
     ]
     result = openai.chat.completions.create(
