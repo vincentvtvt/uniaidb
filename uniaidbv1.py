@@ -484,8 +484,6 @@ def compose_reply(bot, tool, history, context_input):
 def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, user=None, session_id=None):
     try:
         parsed = ai_reply if isinstance(ai_reply, dict) else json.loads(ai_reply)
-        try:
-            parsed = ai_reply if isinstance(ai_reply, dict) else json.loads(ai_reply)
         except Exception as e:
             logger.error(f"[WEBHOOK] Could not parse AI reply as JSON: {ai_reply} ({e})")
             parsed = {}
