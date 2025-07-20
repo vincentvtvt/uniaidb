@@ -114,6 +114,26 @@ class Message(db.Model):
     raw_media_url = db.Column(db.Text)
     created_at = db.Column(db.DateTime)
 
+class Customer(db.Model):
+    __tablename__ = 'customers'
+    id = db.Column(db.Integer, primary_key=True)
+    phone_number = db.Column(db.String(50), unique=True, nullable=False)
+    name = db.Column(db.String(100))
+    language = db.Column(db.String(10))
+    meta = db.Column(db.JSON)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class Session(db.Model):
+    __tablename__ = 'sessions'
+    id = db.Column(db.Integer, primary_key=True)
+    customer_id = db.Column(db.Integer, db.ForeignKey('customers.id'))
+    bot_id = db.Column(db.Integer)
+    started_at = db.Column(db.DateTime, default=datetime.utcnow)
+    ended_at = db.Column(db.DateTime)
+    status = db.Column(db.String(20), default='open')  # 'open' or 'closed'
+    context = db.Column(db.JSON, default={})
+    customer = db.relationship("Customer")
+
 class Template(db.Model):
     __tablename__ = 'templates'
     id = db.Column(db.Integer, primary_key=True)
@@ -511,6 +531,37 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
             if bot_id and user and session_id:
                 save_message(bot_id, user, session_id, "out", part)
 
+def find_or_create_customer(phone, name=None):
+    customer = Customer.query.filter_by(phone_number=phone).first()
+    if not customer:
+        customer = Customer(phone_number=phone, name=name)
+        db.session.add(customer)
+        db.session.commit()
+    return customer
+
+def get_or_create_session(customer_id, bot_id):
+    session = Session.query.filter_by(customer_id=customer_id, bot_id=bot_id, status='open').first()
+    if not session:
+        session = Session(
+            customer_id=customer_id,
+            bot_id=bot_id,
+            started_at=datetime.now(),
+            status='open',
+            context={},
+        )
+        db.session.add(session)
+        db.session.commit()
+    return session
+
+def close_session(session, reason, info: dict = None):
+    session.ended_at = datetime.now()
+    session.status = 'closed'
+    if info:
+        session.context.update(info)
+    session.context['close_reason'] = reason
+    db.session.commit()
+
+
 @app.route('/webhook', methods=['POST'])
 def webhook():
     logger.info("[WEBHOOK] Received POST /webhook")
@@ -525,7 +576,19 @@ def webhook():
         bot_phone = msg.get("toNumber")
         user_phone = msg.get("fromNumber")
         device_id = data["device"]["id"]
-        session_id = user_phone
+        # --- Customer/session handling ---
+        customer = find_or_create_customer(user_phone)
+        session = get_or_create_session(customer.id, bot.id)
+        session_id = str(session.id)  # Always use session.id as session_id
+        if "name" in parsed:
+            customer.name = parsed["name"]
+            db.session.commit()
+        # (Do the same for area, language, etc as needed)
+
+        
+        save_message(bot.id, user_phone, session_id, "in", msg_text, raw_media_url=raw_media_url)
+        history = get_latest_history(bot.id, user_phone, session_id)
+
     except Exception as e:
         logger.error(f"[WEBHOOK] Invalid incoming data: {e}")
         return jsonify({"error": "Invalid request format"}), 400
@@ -564,10 +627,29 @@ def webhook():
 
     process_ai_reply_and_send(user_phone, ai_reply, device_id, bot_id=bot.id, user=user_phone, session_id=session_id)
 
-    if tool_id and "88" in tool_id:
-        notify_sales_group(bot, f"Goal achieved for customer {user_phone}: {ai_reply}")
+    try:
+    parsed = ai_reply if isinstance(ai_reply, dict) else json.loads(ai_reply)
+    except Exception:
+        parsed = {}
+    
+    # -- New: session close detection from AI reply instruction --
+    if parsed.get("instruction") == "close_session_and_notify_sales":
+        info_to_save = {}
+        for key in ("service", "platform", "industry", "business", "name", "area", "location", "meet_up_method", "meet_up_date"):
+            if key in parsed:
+                info_to_save[key] = parsed[key]
+        close_session(session, reason="goal_achieved", info=info_to_save)
+        notify_msg = parsed.get("notify_sales_message") or f"Goal achieved for customer {customer.name or user_phone}: {info_to_save}"
+        notify_sales_group(bot, notify_msg)
+        return jsonify({"status": "ok", "info": "session closed, sales notified"})
+    elif parsed.get("instruction") == "close_session_and_notify_sales_drop":
+        close_session(session, reason="drop", info=parsed)
+        notify_msg = parsed.get("notify_sales_message") or f"Session dropped for customer {customer.name or user_phone}"
+        notify_sales_group(bot, notify_msg)
+        return jsonify({"status": "ok", "info": "session dropped, sales notified"})
+    
+    # Only send reply if session NOT closed above
+    process_ai_reply_and_send(user_phone, ai_reply, device_id, bot_id=bot.id, user=user_phone, session_id=session_id)
 
-    return jsonify({"status": "ok", "ai_reply": ai_reply})
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    if __name__ == "__main__":
+        app.run(host="0.0.0.0", port=5000, debug=True)
