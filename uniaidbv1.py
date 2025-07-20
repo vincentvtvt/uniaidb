@@ -598,6 +598,7 @@ def webhook():
             return jsonify({"status": f"{msg_type} saved, no bot reply"}), 200
         
         if msg_type != 'text':
+            save_message(bot.id, user_phone, session_id, "in", msg_text, raw_media_url=raw_media_url)
             return jsonify({"status": "media event saved, ignored for reply"}), 200
 
 
@@ -607,7 +608,6 @@ def webhook():
         session_id = str(session.id)
 
         # 3. Only save incoming message ONCE, after customer/session created
-        save_message(bot.id, user_phone, session_id, "in", msg_text, raw_media_url=raw_media_url)
         history = get_latest_history(bot.id, user_phone, session_id)
 
         # 4. Compose tool and context
