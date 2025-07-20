@@ -616,6 +616,7 @@ def webhook():
         customer = find_or_create_customer(user_phone)
         session = get_or_create_session(customer.id, bot.id)
         session_id = str(session.id)
+        save_message(bot.id, user_phone, session_id, "in", msg_text)
 
         # 3. Only save incoming message ONCE, after customer/session created
         history = get_latest_history(bot.id, user_phone, session_id)
