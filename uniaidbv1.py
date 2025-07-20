@@ -182,165 +182,85 @@ def transcribe_audio_from_url(audio_url):
 def extract_text_from_message(msg):
     msg_type = msg.get("type", "text")
     logger.info(f"[MEDIA DETECT] Message type: {msg_type}")
-    if msg_type == "text":
-        return msg.get("body", ""), None
-    elif msg_type == "image":
-        img_url = msg.get("media", {}).get("url")
-    if img_url:
-        image_bytes = download_file(img_url)
-        img_b64 = encode_image_b64(image_bytes)
-        vision_msg = [
-            {
-                "role": "system",
-                "content": (
-                    "This is a WhatsApp image. "
-                    "Briefly describe what is shown in the image, focusing on the main subject, scene, or action. "
-                    "If there is text in the image, include it. "
-                    "Reply in a short, natural phrase, as if explaining to a friend on WhatsApp. "
-                    "Do not explain or add code formatting, just the phrase."
-                ),
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
-                    }
-                ],
-            }
-        ]
-        try:
-            result = openai.chat.completions.create(
-                model="gpt-4o",
-                messages=vision_msg,
-                max_tokens=8192
-            )
-            meaning = result.choices[0].message.content.strip()
-            return meaning or "[Image received, no text found]", img_url
-        except Exception as e:
-            logger.error(f"[IMAGE VISION] {e}")
-            return "[Image received, vision failed]", img_url
-    return "[Image received, no url]", img_url
 
-    elif msg_type == "audio":
-        audio_url = msg.get("media", {}).get("url")
-        try:
-            transcript = transcribe_audio_from_url(audio_url) if audio_url else "[Audio received, no url]"
-            if transcript and transcript != "[Audio received, no url]":
-                # Run through GPT for summarization/natural reply
-                ai_prompt = (
-                    "This is a WhatsApp voice message that was transcribed as:\n"
-                    f"'{transcript}'\n"
-                    "Briefly rephrase or summarize this as a WhatsApp message reply, as if you are the user."
-                )
+    # 1. Text Message (Normal)
+    if msg_type == "text":
+        body = msg.get("body", "")
+        # Check for links in text
+        import re
+        links = re.findall(r'(https?://\S+)', body)
+        if links:
+            link = links[0]
+            prompt = (
+                f"This is a WhatsApp message containing a link: {link}\n"
+                "Briefly describe what this link could be about or what the user might want."
+            )
+            try:
                 result = openai.chat.completions.create(
                     model="gpt-4o",
-                    messages=[
-                        {"role": "system", "content": ai_prompt},
-                    ],
+                    messages=[{"role": "system", "content": prompt}],
                     max_tokens=256
                 )
                 summary = result.choices[0].message.content.strip()
-                return summary or transcript, audio_url
-            else:
-                return transcript, audio_url
-        except Exception as e:
-            logger.error(f"[AUDIO TRANSCRIBE] {e}")
-            return "[Audio received, transcription failed]", audio_url
+                return summary or f"User sent a link: {link}", None
+            except Exception as e:
+                logger.error(f"[LINK ANALYZE] {e}")
+                return f"User sent a link: {link}", None
+        return body, None
 
-    elif msg_type == "document":
-        doc_url = msg.get("media", {}).get("url")
-        file_name = msg.get("media", {}).get("filename", "document")
-        # Vision or GPT-4o can't view actual file contents unless PDF/image, so handle as below:
-        if file_name.lower().endswith(('.pdf', '.jpg', '.jpeg', '.png')):
-            # Try vision for images, fallback to just summary for PDF
-            if file_name.lower().endswith('.pdf'):
-                # You can try to extract first page text using a PDF OCR utility, else:
-                return f"User sent a PDF document: {file_name}", doc_url
-            else:
-                # Use vision for image attachments
-                image_bytes = download_file(doc_url)
+    # 2. Image Message (Vision AI)
+    elif msg_type == "image":
+        img_url = msg.get("media", {}).get("url")
+        if img_url:
+            try:
+                image_bytes = download_file(img_url)
                 img_b64 = encode_image_b64(image_bytes)
                 vision_msg = [
                     {
                         "role": "system",
                         "content": (
-                            "This is a WhatsApp image sent as a document. "
-                            "Briefly describe the image, mentioning the main scene, subject, or any text. "
-                            "Keep it short and natural."
+                            "This is a WhatsApp image. "
+                            "Briefly describe what is shown, focusing on the main subject or text. "
+                            "Reply in a short, natural phrase as if explaining to a friend on WhatsApp."
                         ),
                     },
                     {
                         "role": "user",
                         "content": [
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
+                            }
                         ],
                     }
                 ]
-                try:
-                    result = openai.chat.completions.create(
-                        model="gpt-4o",
-                        messages=vision_msg,
-                        max_tokens=8192
-                    )
-                    meaning = result.choices[0].message.content.strip()
-                    return meaning or f"User sent an image: {file_name}", doc_url
-                except Exception as e:
-                    logger.error(f"[DOC IMAGE VISION] {e}")
-                    return f"User sent an image: {file_name}", doc_url
-        return f"User sent a document: {file_name}", doc_url
+                result = openai.chat.completions.create(
+                    model="gpt-4o",
+                    messages=vision_msg,
+                    max_tokens=512
+                )
+                meaning = result.choices[0].message.content.strip()
+                return meaning or "[Image received, no text found]", img_url
+            except Exception as e:
+                logger.error(f"[IMAGE VISION] {e}")
+                return "[Image received, vision failed]", img_url
+        return "[Image received, no url]", img_url
 
-    elif msg_type == "link" or (msg_type == "text" and "http" in msg.get("body", "")):
-        text = msg.get("body", "")
-        # Extract the link from the message
-        import re
-        links = re.findall(r'(https?://\S+)', text)
-        link = links[0] if links else None
-        # Use GPT to get a short, natural summary/intent
-        if link:
-            prompt = (
-                f"This is a WhatsApp message containing a link: {link}\n"
-                "Briefly describe what this link could be about or what the user might want."
-            )
-            result = openai.chat.completions.create(
-                model="gpt-4o",
-                messages=[{"role": "system", "content": prompt}],
-                max_tokens=256
-            )
-            summary = result.choices[0].message.content.strip()
-            return summary or f"User sent a link: {link}", None
-        else:
-            return text, None
-
+    # 3. Sticker Message (Vision AI)
     elif msg_type == "sticker":
-        media = msg.get("media", {})
-        img_url = media.get("url")
-        if not img_url and "links" in media and "download" in media["links"]:
-            img_url = "https://api.wassenger.com" + media["links"]["download"]
-        logger.info(f"[STICKER DEBUG] img_url for Vision: {img_url}")
+        img_url = msg.get("media", {}).get("url")
         if img_url:
-            image_bytes = download_wassenger_media(img_url)
-            # If .webp, convert to .png for Vision
-            if media.get("extension", "").lower() == "webp":
-                from PIL import Image
-                from io import BytesIO
-                im = Image.open(BytesIO(image_bytes)).convert("RGBA")
-                buf = BytesIO()
-                im.save(buf, format="PNG")
-                image_bytes = buf.getvalue()
             try:
-                img_b64 = encode_image_b64(image_bytes)
+                image_bytes = download_file(img_url)
                 img_b64 = encode_image_b64(image_bytes)
                 vision_msg = [
                     {
                         "role": "system",
                         "content": (
                             "This is a WhatsApp sticker. "
-                            "Briefly describe what is shown in the sticker, focusing on the main character, action, and emotion. "
-                            "If there is text in the sticker, include it in your answer. "
-                            "Reply in a short, natural phrase (e.g., 'user sent a sticker of a cat happily sitting', 'user sent a sticker of dog saying thank you', 'user sent a sticker of happy face with celebration text'). "
-                            "Do not explain or add code formatting, just the phrase."
+                            "Describe the main emotion or meaning in 1-2 words. "
+                            "If any text is visible, include it. "
+                            "Reply in a short phrase, no code formatting."
                         ),
                     },
                     {
@@ -353,21 +273,91 @@ def extract_text_from_message(msg):
                         ],
                     }
                 ]
-
                 result = openai.chat.completions.create(
                     model="gpt-4o",
                     messages=vision_msg,
-                    max_tokens=8192
+                    max_tokens=128
                 )
                 meaning = result.choices[0].message.content.strip()
                 return meaning or "[Sticker received]", img_url
             except Exception as e:
-                logger.error(f"[STICKER MEANING] {e}")
-                return "[Sticker received]", img_url
-        return "[Sticker received]", None
+                logger.error(f"[STICKER VISION] {e}")
+                return "[Sticker received, vision failed]", img_url
+        return "[Sticker received, no url]", img_url
 
+    # 4. Audio Message (Whisper + GPT summary)
+    elif msg_type == "audio":
+        audio_url = msg.get("media", {}).get("url")
+        try:
+            transcript = transcribe_audio_from_url(audio_url) if audio_url else "[Audio received, no url]"
+            if transcript and transcript != "[Audio received, no url]":
+                # Summarize with GPT
+                ai_prompt = (
+                    "This is a WhatsApp voice message that was transcribed as:\n"
+                    f"'{transcript}'\n"
+                    "Briefly rephrase or summarize this as a WhatsApp message reply, as if you are the user."
+                )
+                result = openai.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[{"role": "system", "content": ai_prompt}],
+                    max_tokens=128
+                )
+                summary = result.choices[0].message.content.strip()
+                return summary or transcript, audio_url
+            else:
+                return transcript, audio_url
+        except Exception as e:
+            logger.error(f"[AUDIO TRANSCRIBE] {e}")
+            return "[Audio received, transcription failed]", audio_url
+
+    # 5. Document Message (basic - can extend with OCR if needed)
+    elif msg_type == "document":
+        doc_url = msg.get("media", {}).get("url")
+        file_name = msg.get("media", {}).get("filename", "document")
+        ext = file_name.lower().split('.')[-1] if '.' in file_name else ""
+        # If image or PDF, try vision or OCR (optional)
+        if ext in ['jpg', 'jpeg', 'png']:
+            try:
+                image_bytes = download_file(doc_url)
+                img_b64 = encode_image_b64(image_bytes)
+                vision_msg = [
+                    {
+                        "role": "system",
+                        "content": (
+                            "This is an image sent as a document. "
+                            "Describe the main thing shown or written. "
+                            "Keep it short and natural."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
+                            }
+                        ],
+                    }
+                ]
+                result = openai.chat.completions.create(
+                    model="gpt-4o",
+                    messages=vision_msg,
+                    max_tokens=128
+                )
+                meaning = result.choices[0].message.content.strip()
+                return meaning or f"User sent an image document: {file_name}", doc_url
+            except Exception as e:
+                logger.error(f"[DOC IMAGE VISION] {e}")
+                return f"User sent an image document: {file_name}", doc_url
+        elif ext == "pdf":
+            return f"User sent a PDF document: {file_name}", doc_url
+        else:
+            return f"User sent a document: {file_name}", doc_url
+
+    # 6. Fallback: Unrecognized/other media
     else:
         return f"[Unrecognized message type: {msg_type}]", None
+
 
 def get_template_content(template_id):
     template = db.session.query(Template).filter_by(template_id=template_id, active=True).first()
