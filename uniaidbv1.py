@@ -528,7 +528,10 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
             delay = SPLIT_MSG_DELAY * (idx + 1)  # 7s, 14s, 21s, etc.
             send_wassenger_reply(customer_phone, part, device_id, delay_seconds=delay)
             if bot_id and user and session_id:
-                save_message(bot_id, user, session_id, "out", f"[IMAGE]{part['content']}")
+                if isinstance(part, dict) and part.get("type") == "image":
+                    save_message(bot_id, user, session_id, "out", "[IMAGE]", raw_media_url=part.get("content"))
+else:
+    save_message(bot_id, user, session_id, "out", part)
 
 def find_or_create_customer(phone, name=None):
     customer = Customer.query.filter_by(phone_number=phone).first()
@@ -565,10 +568,12 @@ def close_session(session, reason, info: dict = None):
 def webhook():
     logger.info("[WEBHOOK] Received POST /webhook")
     data = request.json
+    logger.info(f"[WEBHOOK] Full incoming message: {json.dumps(data)}")
     logger.info(f"[WEBHOOK] Incoming data: {data}")
 
     try:
         msg = data["data"]
+        msg_type = msg.get("type")
         if msg.get("flow") == "outbound":
             return jsonify({"status": "ignored"}), 200
 
@@ -583,6 +588,18 @@ def webhook():
             return jsonify({"error": "Bot not found"}), 404
 
         msg_text, raw_media_url = extract_text_from_message(msg)
+        # Only reply to text, but save all messages
+        if msg_type in ('image', 'audio', 'sticker', 'video', 'document'):
+            bot = get_bot_by_phone(bot_phone)
+            customer = find_or_create_customer(user_phone)
+            session = get_or_create_session(customer.id, bot.id)
+            session_id = str(session.id)
+            save_message(bot.id, user_phone, session_id, "in", msg_text, raw_media_url=raw_media_url)
+            return jsonify({"status": f"{msg_type} saved, no bot reply"}), 200
+        
+        if msg_type != 'text':
+            return jsonify({"status": "media event saved, ignored for reply"}), 200
+
 
         # 2. Now create/find customer/session
         customer = find_or_create_customer(user_phone)
