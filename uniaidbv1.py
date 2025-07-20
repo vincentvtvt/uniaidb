@@ -189,36 +189,57 @@ def transcribe_audio_from_url(audio_url):
         transcript = openai.audio.transcriptions.create(model="whisper-1", file=audio_file)
     return transcript.text.strip()
 
+import re
+from PIL import Image
+from io import BytesIO
+import logging
+
+logger = logging.getLogger("UniAI")
+
 def extract_text_from_message(msg):
+    import cv2
+    import numpy as np
+    from pdf2image import convert_from_bytes
+
     msg_type = msg.get("type")
     media = msg.get("media", {})
     msg_text, media_url = None, None
 
-    # Helper to get downloadable url
+    # Helper: get downloadable media URL (Wassenger)
     def get_media_url(media):
         url = media.get("url")
         if not url and "links" in media and "download" in media["links"]:
             url = "https://api.wassenger.com" + media["links"]["download"]
         return url
-    
+
+    # Helper: extract first frame from video (OpenCV)
     def extract_first_frame_from_video(video_bytes):
-        np_arr = np.frombuffer(video_bytes, np.uint8)
-        cap = cv2.VideoCapture(cv2.imdecode(np_arr, cv2.IMREAD_COLOR))
-        success, frame = cap.read()
-        if success:
-            _, buf = cv2.imencode('.png', frame)
-            return buf.tobytes()
+        try:
+            np_arr = np.frombuffer(video_bytes, np.uint8)
+            video_file = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+            if video_file is None:
+                temp_path = "/tmp/temp_video.mp4"
+                with open(temp_path, "wb") as f:
+                    f.write(video_bytes)
+                cap = cv2.VideoCapture(temp_path)
+            else:
+                cap = cv2.VideoCapture(video_file)
+            success, frame = cap.read()
+            if success and frame is not None:
+                _, buf = cv2.imencode('.png', frame)
+                return buf.tobytes()
+        except Exception as e:
+            logger.error(f"[VIDEO FRAME] Failed: {e}")
         return None
 
-
-    # STICKER (Vision)
+    # --- Sticker ---
     if msg_type == "sticker":
         img_url = get_media_url(media)
         logger.info(f"[STICKER DEBUG] img_url for Vision: {img_url}")
         if img_url:
             try:
                 image_bytes = download_wassenger_media(img_url)
-                # Convert webp to PNG for Vision
+                # Convert .webp to .png
                 if media.get("extension", "").lower() == "webp":
                     im = Image.open(BytesIO(image_bytes)).convert("RGBA")
                     buf = BytesIO()
@@ -229,10 +250,8 @@ def extract_text_from_message(msg):
                     {"role": "system", "content": (
                         "This is a WhatsApp sticker. "
                         "Briefly describe what is shown in the sticker, focusing on the main character, action, and emotion. "
-                        "If there is text in the sticker, include it in your answer. "
-                        "Reply in a short, natural phrase (e.g., 'user sent a sticker of a cat happily sitting', "
-                        "'user sent a sticker of a happy pig with money text', etc.). "
-                        "Do not explain or add code formatting, just the phrase."
+                        "If there is text in the sticker, include it. "
+                        "Reply in a short, natural phrase, no code formatting."
                     )},
                     {"role": "user", "content": [
                         {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
@@ -241,7 +260,7 @@ def extract_text_from_message(msg):
                 result = openai.chat.completions.create(
                     model="gpt-4o",
                     messages=vision_msg,
-                    max_tokens=256
+                    max_tokens=128
                 )
                 msg_text = result.choices[0].message.content.strip()
                 return msg_text or "[Sticker received]", img_url
@@ -250,7 +269,7 @@ def extract_text_from_message(msg):
                 return "[Sticker received]", img_url
         return "[Sticker received]", None
 
-    # IMAGE / PHOTO (Vision)
+    # --- Image ---
     elif msg_type == "image":
         img_url = get_media_url(media)
         logger.info(f"[IMAGE DEBUG] img_url for Vision: {img_url}")
@@ -261,9 +280,8 @@ def extract_text_from_message(msg):
                 vision_msg = [
                     {"role": "system", "content": (
                         "This is a photo/image received on WhatsApp. "
-                        "Summarize briefly what you see, focusing on main objects, scene, text, or any human faces. "
-                        "Reply in a short, natural phrase (e.g., 'user sent a image of a cat happily sitting' "
-                        "Reply in a short phrase. If there is text, mention it. Do not add code formatting."
+                        "Summarize briefly what you see, focusing on main objects, scene, or text. "
+                        "Reply in a short phrase. If there is text, mention it."
                     )},
                     {"role": "user", "content": [
                         {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
@@ -272,7 +290,7 @@ def extract_text_from_message(msg):
                 result = openai.chat.completions.create(
                     model="gpt-4o",
                     messages=vision_msg,
-                    max_tokens=256
+                    max_tokens=128
                 )
                 msg_text = result.choices[0].message.content.strip()
                 return msg_text or "[Image received]", img_url
@@ -281,7 +299,7 @@ def extract_text_from_message(msg):
                 return "[Image received]", img_url
         return "[Image received, no url]", None
 
-    # VIDEO (Vision - video not supported yet for GPT-4o, fallback to metadata)
+    # --- Video (first frame to Vision) ---
     elif msg_type == "video":
         vid_url = get_media_url(media)
         file_name = media.get("filename") or ""
@@ -314,36 +332,32 @@ def extract_text_from_message(msg):
                 return f"[Video received: {file_name}]", vid_url
         return "[Video received, no url]", None
 
+    # --- Audio (Whisper + GPT summary) ---
+    elif msg_type == "audio":
+        audio_url = get_media_url(media)
+        if audio_url:
+            try:
+                transcript = transcribe_audio_from_url(audio_url)
+                if transcript and transcript.lower() not in ("[audio received, no url]", "[audio received, transcription failed]"):
+                    gpt_prompt = (
+                        "This is a WhatsApp audio message transcribed as: "
+                        f"'{transcript}'. Reply in a short, natural phrase, as if you're the user."
+                    )
+                    result = openai.chat.completions.create(
+                        model="gpt-4o",
+                        messages=[{"role": "system", "content": gpt_prompt}],
+                        max_tokens=64
+                    )
+                    msg_text = result.choices[0].message.content.strip()
+                    return msg_text or transcript, audio_url
+                else:
+                    return transcript or "[Audio received, no speech detected]", audio_url
+            except Exception as e:
+                logger.error(f"[AUDIO MEANING] {e}")
+                return "[Audio received, error]", audio_url
+        return "[Audio received, no url]", None
 
-    # AUDIO (Whisper API)
-       elif msg_type == "audio":
-            audio_url = get_media_url(media)
-            if audio_url:
-                try:
-                    # Transcribe using Whisper first (your function)
-                    transcript = transcribe_audio_from_url(audio_url)  # Make sure this works!
-                    if transcript and transcript.lower() not in ("[audio received, no url]", "[audio received, transcription failed]"):
-                        # Optional: further summarize via GPT-4o
-                        gpt_prompt = (
-                            "This is a WhatsApp audio message transcribed as: "
-                            f"'{transcript}'. Reply in a short, natural phrase, as if you're the user."
-                        )
-                        result = openai.chat.completions.create(
-                            model="gpt-4o",
-                            messages=[{"role": "system", "content": gpt_prompt}],
-                            max_tokens=64
-                        )
-                        msg_text = result.choices[0].message.content.strip()
-                        return msg_text or transcript, audio_url
-                    else:
-                        return transcript or "[Audio received, no speech detected]", audio_url
-                except Exception as e:
-                    logger.error(f"[AUDIO MEANING] {e}")
-                    return "[Audio received, error]", audio_url
-            return "[Audio received, no url]", None
-
-
-    # DOCUMENT (PDF/Word, Vision if image/PDF, else metadata)
+    # --- Document (PDF/image: Vision, else filename) ---
     elif msg_type == "document":
         doc_url = get_media_url(media)
         file_name = media.get("filename") or ""
@@ -352,7 +366,6 @@ def extract_text_from_message(msg):
             try:
                 doc_bytes = download_wassenger_media(doc_url)
                 if ext == "pdf":
-                    # Extract first page as image
                     images = convert_from_bytes(doc_bytes, first_page=1, last_page=1)
                     if images:
                         buf = BytesIO()
@@ -393,17 +406,14 @@ def extract_text_from_message(msg):
                     msg_text = result.choices[0].message.content.strip()
                     return msg_text or f"[Document received: {file_name}]", doc_url
                 else:
-                    # Just show file name if not analyzable
                     return f"[Document received: {file_name}]", doc_url
             except Exception as e:
                 logger.error(f"[DOC MEANING] {e}")
                 return f"[Document received: {file_name}]", doc_url
         return "[Document received, no url]", None
 
-
-    # CATCH-ALL (other/unknown types)
+    # --- Fallback ---
     else:
-        # Fallback for link, contact, etc.
         msg_text = msg.get("body") or msg.get("caption") or f"[{msg_type} received]" if msg_type else "[Message received]"
         return msg_text, None
 
