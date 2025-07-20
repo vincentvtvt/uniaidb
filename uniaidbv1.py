@@ -506,8 +506,7 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
                     msg_type="image",
                     caption=part.get("caption") or None
                 )
-                if bot_id and user and session_id:
-                    save_message(bot_id, user, session_id, "out", f"[IMAGE]{part['content']}")
+
             # Always wait for a delay between template parts
             if idx < len(template_content) - 1:
                 time.sleep(5)
@@ -529,7 +528,7 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
             delay = SPLIT_MSG_DELAY * (idx + 1)  # 7s, 14s, 21s, etc.
             send_wassenger_reply(customer_phone, part, device_id, delay_seconds=delay)
             if bot_id and user and session_id:
-                save_message(bot_id, user, session_id, "out", part)
+                save_message(bot_id, user, session_id, "out", f"[IMAGE]{part['content']}")
 
 def find_or_create_customer(phone, name=None):
     customer = Customer.query.filter_by(phone_number=phone).first()
@@ -577,27 +576,24 @@ def webhook():
         user_phone = msg.get("fromNumber")
         device_id = data["device"]["id"]
 
-        msg_text, raw_media_url = extract_text_from_message(msg)
-
+        # 1. Extract bot and message first
         bot = get_bot_by_phone(bot_phone)
         if not bot:
             logger.error(f"[ERROR] No bot found for phone {bot_phone}")
             return jsonify({"error": "Bot not found"}), 404
 
-        # --- Customer/session handling ---
+        msg_text, raw_media_url = extract_text_from_message(msg)
+
+        # 2. Now create/find customer/session
         customer = find_or_create_customer(user_phone)
         session = get_or_create_session(customer.id, bot.id)
         session_id = str(session.id)
 
-        # Save incoming message
+        # 3. Only save incoming message ONCE, after customer/session created
         save_message(bot.id, user_phone, session_id, "in", msg_text, raw_media_url=raw_media_url)
         history = get_latest_history(bot.id, user_phone, session_id)
 
-        if not msg_text or msg_text.startswith("[Unrecognized") or msg_text.startswith("[Audio received, transcription failed]"):
-            logger.error("[ERROR] Failed to extract text from message.")
-            notify_sales_group(bot, f"Failed to process customer message: {raw_media_url}", error=True)
-            return jsonify({"error": "Failed to process customer message"}), 500
-
+        # 4. Compose tool and context
         tool_id = decide_tool_with_manager_prompt(bot, history)
         tool = None
         if tool_id and tool_id.lower() != "default":
@@ -614,18 +610,19 @@ def webhook():
 
         ai_reply = compose_reply(bot, tool, history, context_input)
 
-        # ---- Session closure/notify block BEFORE sending any reply! ----
+        # 5. Parse AI reply and handle customer info
         try:
             parsed = ai_reply if isinstance(ai_reply, dict) else json.loads(ai_reply)
         except Exception:
             parsed = {}
 
-        # Update customer info if parsed (e.g. name)
+        # 6. Update customer info only after parsed
         if "name" in parsed:
             customer.name = parsed["name"]
             db.session.commit()
-        # (Extend here: update area, language, etc as needed)
+        # (add more: area, language, etc. if in parsed)
 
+        # 7. Session closure/notify block before sending reply
         if parsed.get("instruction") == "close_session_and_notify_sales":
             info_to_save = {}
             for key in ("service", "platform", "industry", "business", "name", "area", "location", "meet_up_method", "meet_up_date"):
@@ -641,7 +638,7 @@ def webhook():
             notify_sales_group(bot, notify_msg)
             return jsonify({"status": "ok", "info": "session dropped, sales notified"})
 
-        # --- Only send reply if session NOT closed above
+        # 8. Only send/process reply if session is NOT closed
         process_ai_reply_and_send(user_phone, ai_reply, device_id, bot_id=bot.id, user=user_phone, session_id=session_id)
         return jsonify({"status": "ok"})
 
@@ -649,25 +646,6 @@ def webhook():
         logger.error(f"[WEBHOOK] Exception: {e}")
         return jsonify({"error": "Webhook processing error"}), 500
 
-    
-    # -- New: session close detection from AI reply instruction --
-    if parsed.get("instruction") == "close_session_and_notify_sales":
-        info_to_save = {}
-        for key in ("service", "platform", "industry", "business", "name", "area", "location", "meet_up_method", "meet_up_date"):
-            if key in parsed:
-                info_to_save[key] = parsed[key]
-        close_session(session, reason="goal_achieved", info=info_to_save)
-        notify_msg = parsed.get("notify_sales_message") or f"Goal achieved for customer {customer.name or user_phone}: {info_to_save}"
-        notify_sales_group(bot, notify_msg)
-        return jsonify({"status": "ok", "info": "session closed, sales notified"})
-    elif parsed.get("instruction") == "close_session_and_notify_sales_drop":
-        close_session(session, reason="drop", info=parsed)
-        notify_msg = parsed.get("notify_sales_message") or f"Session dropped for customer {customer.name or user_phone}"
-        notify_sales_group(bot, notify_msg)
-        return jsonify({"status": "ok", "info": "session dropped, sales notified"})
-    
-    # Only send reply if session NOT closed above
-    process_ai_reply_and_send(user_phone, ai_reply, device_id, bot_id=bot.id, user=user_phone, session_id=session_id)
-
-    if __name__ == "__main__":
-        app.run(host="0.0.0.0", port=5000, debug=True)
+# 9. Main run block at file bottom only!
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
