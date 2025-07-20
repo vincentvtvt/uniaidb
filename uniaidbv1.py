@@ -484,6 +484,21 @@ def compose_reply(bot, tool, history, context_input):
 def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, user=None, session_id=None):
     try:
         parsed = ai_reply if isinstance(ai_reply, dict) else json.loads(ai_reply)
+        try:
+            parsed = ai_reply if isinstance(ai_reply, dict) else json.loads(ai_reply)
+        except Exception as e:
+            logger.error(f"[WEBHOOK] Could not parse AI reply as JSON: {ai_reply} ({e})")
+            parsed = {}
+
+# Defensive: Only continue if parsed is a dict
+if not isinstance(parsed, dict):
+    logger.error(f"[WEBHOOK] AI reply did not return a dict. Raw reply: {parsed}")
+    parsed = {}
+
+# Now, you can safely do:
+if parsed.get("instruction") == "close_session_and_notify_sales":
+    # ... safe to proceed ...
+
     except Exception:
         logger.error("[SEND SPLIT MSGS] Failed to parse AI reply as JSON")
         parsed = {}
