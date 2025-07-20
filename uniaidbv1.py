@@ -9,6 +9,8 @@ from flask_sqlalchemy import SQLAlchemy
 import requests
 import openai
 import base64
+from PIL import Image
+from io import BytesIO
 
 
 # --- Universal JSON Prompt Builder ---
@@ -180,197 +182,160 @@ def transcribe_audio_from_url(audio_url):
     return transcript.text.strip()
 
 def extract_text_from_message(msg):
-    msg_type = msg.get("type", "text")
-    logger.info(f"[MEDIA DETECT] Message type: {msg_type}")
+    msg_type = msg.get("type")
+    media = msg.get("media", {})
+    msg_text, media_url = None, None
 
-    # 1. Text Message (Normal)
-    if msg_type == "text":
-        body = msg.get("body", "")
-        # Check for links in text
-        import re
-        links = re.findall(r'(https?://\S+)', body)
-        if links:
-            link = links[0]
-            prompt = (
-                f"This is a WhatsApp message containing a link: {link}\n"
-                "Briefly describe what this link could be about or what the user might want."
-            )
+    # Helper to get downloadable url
+    def get_media_url(media):
+        url = media.get("url")
+        if not url and "links" in media and "download" in media["links"]:
+            url = "https://api.wassenger.com" + media["links"]["download"]
+        return url
+
+    # STICKER (Vision)
+    if msg_type == "sticker":
+        img_url = get_media_url(media)
+        logger.info(f"[STICKER DEBUG] img_url for Vision: {img_url}")
+        if img_url:
             try:
+                image_bytes = download_wassenger_media(img_url)
+                # Convert webp to PNG for Vision
+                if media.get("extension", "").lower() == "webp":
+                    im = Image.open(BytesIO(image_bytes)).convert("RGBA")
+                    buf = BytesIO()
+                    im.save(buf, format="PNG")
+                    image_bytes = buf.getvalue()
+                img_b64 = encode_image_b64(image_bytes)
+                vision_msg = [
+                    {"role": "system", "content": (
+                        "This is a WhatsApp sticker. "
+                        "Briefly describe what is shown in the sticker, focusing on the main character, action, and emotion. "
+                        "If there is text in the sticker, include it in your answer. "
+                        "Reply in a short, natural phrase (e.g., 'user sent a sticker of a cat happily sitting', "
+                        "'user sent a sticker of a happy pig with money text', etc.). "
+                        "Do not explain or add code formatting, just the phrase."
+                    )},
+                    {"role": "user", "content": [
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
+                    ]}
+                ]
                 result = openai.chat.completions.create(
                     model="gpt-4o",
-                    messages=[{"role": "system", "content": prompt}],
+                    messages=vision_msg,
                     max_tokens=256
                 )
-                summary = result.choices[0].message.content.strip()
-                return summary or f"User sent a link: {link}", None
+                msg_text = result.choices[0].message.content.strip()
+                return msg_text or "[Sticker received]", img_url
             except Exception as e:
-                logger.error(f"[LINK ANALYZE] {e}")
-                return f"User sent a link: {link}", None
-        return body, None
+                logger.error(f"[STICKER MEANING] {e}")
+                return "[Sticker received]", img_url
+        return "[Sticker received]", None
 
-    # 2. Image Message (Vision AI)
+    # IMAGE / PHOTO (Vision)
     elif msg_type == "image":
-        img_url = msg.get("media", {}).get("url")
+        img_url = get_media_url(media)
+        logger.info(f"[IMAGE DEBUG] img_url for Vision: {img_url}")
         if img_url:
             try:
                 image_bytes = download_wassenger_media(img_url)
                 img_b64 = encode_image_b64(image_bytes)
                 vision_msg = [
-                    {
-                        "role": "system",
-                        "content": (
-                            "This is a WhatsApp image. "
-                            "Briefly describe what is shown, focusing on the main subject or text. "
-                            "Reply in a short, natural phrase as if explaining to a friend on WhatsApp."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
-                            }
-                        ],
-                    }
+                    {"role": "system", "content": (
+                        "This is a photo/image received on WhatsApp. "
+                        "Summarize briefly what you see, focusing on main objects, scene, text, or any human faces. "
+                        "Reply in a short phrase. If there is text, mention it. Do not add code formatting."
+                    )},
+                    {"role": "user", "content": [
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
+                    ]}
                 ]
                 result = openai.chat.completions.create(
                     model="gpt-4o",
                     messages=vision_msg,
-                    max_tokens=512
+                    max_tokens=256
                 )
-                meaning = result.choices[0].message.content.strip()
-                return meaning or "[Image received, no text found]", img_url
+                msg_text = result.choices[0].message.content.strip()
+                return msg_text or "[Image received]", img_url
             except Exception as e:
-                logger.error(f"[IMAGE VISION] {e}")
-                return "[Image received, vision failed]", img_url
-        return "[Image received, no url]", img_url
+                logger.error(f"[IMAGE MEANING] {e}")
+                return "[Image received]", img_url
+        return "[Image received, no url]", None
 
-    # 3. Sticker Message (Vision AI)
-        elif msg_type == "sticker":
-        media = msg.get("media", {})
-        img_url = media.get("url")
-        if not img_url and "links" in media and "download" in media["links"]:
-            img_url = "https://api.wassenger.com" + media["links"]["download"]
-        logger.info(f"[STICKER DEBUG] img_url for Vision: {img_url}")
-        if img_url:
-            image_bytes = download_wassenger_media(img_url)
-            # If .webp, convert to .png for Vision
-            if media.get("extension", "").lower() == "webp":
-                from PIL import Image
-                from io import BytesIO
-                im = Image.open(BytesIO(image_bytes)).convert("RGBA")
-                buf = BytesIO()
-                im.save(buf, format="PNG")
-                image_bytes = buf.getvalue()
-            try:
-                img_b64 = encode_image_b64(image_bytes)
-                img_b64 = encode_image_b64(image_bytes)
-                vision_msg = [
-                    {
-                        "role": "system",
-                        "content": (
-                            "This is a WhatsApp sticker. "
-                            "Briefly describe what is shown in the sticker, focusing on the main character, action, and emotion. "
-                            "If there is text in the sticker, include it in your answer. "
-                            "Reply in a short, natural phrase (e.g., 'user sent a sticker of a cat happily sitting', 'user sent a sticker of dog saying thank you', 'user sent a sticker of happy face with celebration text'). "
-                            "Do not explain or add code formatting, just the phrase."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/png;base64,{img_b64}"}
-                            }
-                        ],
-                    }
-                ]
+    # VIDEO (Vision - video not supported yet for GPT-4o, fallback to metadata)
+    elif msg_type == "video":
+        vid_url = get_media_url(media)
+        file_name = media.get("filename") or ""
+        duration = media.get("duration") or ""
+        msg_text = f"[Video received: {file_name or 'unnamed'}, duration {duration}s]"
+        return msg_text, vid_url
 
-                result = openai.chat.completions.create(
-                    model="gpt-4o",
-                    messages=vision_msg,
-                    max_tokens=8192
-                )
-                meaning = result.choices[0].message.content.strip()
-                return meaning or "[Sticker received]", img_url
-            except Exception as e:
-                logger.error(f"[STICKER MEANING] {e}")
-                return "[Sticker received]", img_url
-        return "[Sticker received]", None
-    # 4. Audio Message (Whisper + GPT summary)
+    # AUDIO (Whisper API)
     elif msg_type == "audio":
-        audio_url = msg.get("media", {}).get("url")
-        try:
-            transcript = transcribe_audio_from_url(audio_url) if audio_url else "[Audio received, no url]"
-            if transcript and transcript != "[Audio received, no url]":
-                # Summarize with GPT
-                ai_prompt = (
-                    "This is a WhatsApp voice message that was transcribed as:\n"
-                    f"'{transcript}'\n"
-                    "Briefly rephrase or summarize this as a WhatsApp message reply, as if you are the user."
-                )
+        audio_url = get_media_url(media)
+        if audio_url:
+            try:
+                audio_bytes = download_wassenger_media(audio_url)
+                audio_b64 = encode_image_b64(audio_bytes)
+                whisper_msg = [
+                    {"role": "system", "content": (
+                        "This is an audio message received via WhatsApp. "
+                        "Please transcribe the main spoken content. "
+                        "If non-speech, summarize what you hear. Reply with the main phrase or '[Audio not clear]'."
+                    )},
+                    {"role": "user", "content": [
+                        {"type": "audio_url", "audio_url": {"url": f"data:audio/ogg;base64,{audio_b64}"}}
+                    ]}
+                ]
                 result = openai.chat.completions.create(
                     model="gpt-4o",
-                    messages=[{"role": "system", "content": ai_prompt}],
-                    max_tokens=128
+                    messages=whisper_msg,
+                    max_tokens=256
                 )
-                summary = result.choices[0].message.content.strip()
-                return summary or transcript, audio_url
-            else:
-                return transcript, audio_url
-        except Exception as e:
-            logger.error(f"[AUDIO TRANSCRIBE] {e}")
-            return "[Audio received, transcription failed]", audio_url
+                msg_text = result.choices[0].message.content.strip()
+                return msg_text or "[Audio received]", audio_url
+            except Exception as e:
+                logger.error(f"[AUDIO MEANING] {e}")
+                return "[Audio received]", audio_url
+        return "[Audio received, no url]", None
 
-    # 5. Document Message (basic - can extend with OCR if needed)
+    # DOCUMENT (PDF/Word, Vision if image/PDF, else metadata)
     elif msg_type == "document":
-        doc_url = msg.get("media", {}).get("url")
-        file_name = msg.get("media", {}).get("filename", "document")
-        ext = file_name.lower().split('.')[-1] if '.' in file_name else ""
-        # If image or PDF, try vision or OCR (optional)
-        if ext in ['jpg', 'jpeg', 'png']:
+        doc_url = get_media_url(media)
+        file_name = media.get("filename") or ""
+        ext = (file_name.split(".")[-1] if file_name else "").lower()
+        if doc_url and ext in ("pdf", "png", "jpg", "jpeg"):
             try:
-                image_bytes = download_file(doc_url)
-                img_b64 = encode_image_b64(image_bytes)
+                doc_bytes = download_wassenger_media(doc_url)
+                doc_b64 = encode_image_b64(doc_bytes)
                 vision_msg = [
-                    {
-                        "role": "system",
-                        "content": (
-                            "This is an image sent as a document. "
-                            "Describe the main thing shown or written. "
-                            "Keep it short and natural."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
-                            }
-                        ],
-                    }
+                    {"role": "system", "content": (
+                        "This is a document received via WhatsApp. "
+                        "If image or PDF, summarize what you see or any visible text, tables, or key elements. "
+                        "Reply with a short summary phrase."
+                    )},
+                    {"role": "user", "content": [
+                        {"type": "image_url", "image_url": {"url": f"data:application/pdf;base64,{doc_b64}"}}
+                    ]}
                 ]
                 result = openai.chat.completions.create(
                     model="gpt-4o",
                     messages=vision_msg,
-                    max_tokens=128
+                    max_tokens=256
                 )
-                meaning = result.choices[0].message.content.strip()
-                return meaning or f"User sent an image document: {file_name}", doc_url
+                msg_text = result.choices[0].message.content.strip()
+                return msg_text or f"[Document received: {file_name}]", doc_url
             except Exception as e:
-                logger.error(f"[DOC IMAGE VISION] {e}")
-                return f"User sent an image document: {file_name}", doc_url
-        elif ext == "pdf":
-            return f"User sent a PDF document: {file_name}", doc_url
-        else:
-            return f"User sent a document: {file_name}", doc_url
+                logger.error(f"[DOC MEANING] {e}")
+                return f"[Document received: {file_name}]", doc_url
+        # For other doc types (xlsx, docx), just return filename
+        return f"[Document received: {file_name or 'unnamed'}]", doc_url
 
-    # 6. Fallback: Unrecognized/other media
+    # CATCH-ALL (other/unknown types)
     else:
-        return f"[Unrecognized message type: {msg_type}]", None
+        # Fallback for link, contact, etc.
+        msg_text = msg.get("body") or msg.get("caption") or f"[{msg_type} received]" if msg_type else "[Message received]"
+        return msg_text, None
 
 
 def get_template_content(template_id):
