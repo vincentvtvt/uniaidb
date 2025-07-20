@@ -225,29 +225,29 @@ def extract_text_from_message(msg):
 
     elif msg_type == "audio":
         audio_url = msg.get("media", {}).get("url")
-    try:
-        transcript = transcribe_audio_from_url(audio_url) if audio_url else "[Audio received, no url]"
-        if transcript and transcript != "[Audio received, no url]":
-            # Run through GPT for summarization/natural reply
-            ai_prompt = (
-                "This is a WhatsApp voice message that was transcribed as:\n"
-                f"'{transcript}'\n"
-                "Briefly rephrase or summarize this as a WhatsApp message reply, as if you are the user."
-            )
-            result = openai.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {"role": "system", "content": ai_prompt},
-                ],
-                max_tokens=256
-            )
-            summary = result.choices[0].message.content.strip()
-            return summary or transcript, audio_url
-        else:
-            return transcript, audio_url
-    except Exception as e:
-        logger.error(f"[AUDIO TRANSCRIBE] {e}")
-        return "[Audio received, transcription failed]", audio_url
+        try:
+            transcript = transcribe_audio_from_url(audio_url) if audio_url else "[Audio received, no url]"
+            if transcript and transcript != "[Audio received, no url]":
+                # Run through GPT for summarization/natural reply
+                ai_prompt = (
+                    "This is a WhatsApp voice message that was transcribed as:\n"
+                    f"'{transcript}'\n"
+                    "Briefly rephrase or summarize this as a WhatsApp message reply, as if you are the user."
+                )
+                result = openai.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[
+                        {"role": "system", "content": ai_prompt},
+                    ],
+                    max_tokens=256
+                )
+                summary = result.choices[0].message.content.strip()
+                return summary or transcript, audio_url
+            else:
+                return transcript, audio_url
+        except Exception as e:
+            logger.error(f"[AUDIO TRANSCRIBE] {e}")
+            return "[Audio received, transcription failed]", audio_url
 
     elif msg_type == "document":
         doc_url = msg.get("media", {}).get("url")
