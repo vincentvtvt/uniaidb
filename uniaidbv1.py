@@ -576,61 +576,79 @@ def webhook():
         bot_phone = msg.get("toNumber")
         user_phone = msg.get("fromNumber")
         device_id = data["device"]["id"]
+
+        msg_text, raw_media_url = extract_text_from_message(msg)
+
+        bot = get_bot_by_phone(bot_phone)
+        if not bot:
+            logger.error(f"[ERROR] No bot found for phone {bot_phone}")
+            return jsonify({"error": "Bot not found"}), 404
+
         # --- Customer/session handling ---
         customer = find_or_create_customer(user_phone)
         session = get_or_create_session(customer.id, bot.id)
-        session_id = str(session.id)  # Always use session.id as session_id
-        if "name" in parsed:
-            customer.name = parsed["name"]
-            db.session.commit()
-        # (Do the same for area, language, etc as needed)
+        session_id = str(session.id)
 
-        
+        # Save incoming message
         save_message(bot.id, user_phone, session_id, "in", msg_text, raw_media_url=raw_media_url)
         history = get_latest_history(bot.id, user_phone, session_id)
 
+        if not msg_text or msg_text.startswith("[Unrecognized") or msg_text.startswith("[Audio received, transcription failed]"):
+            logger.error("[ERROR] Failed to extract text from message.")
+            notify_sales_group(bot, f"Failed to process customer message: {raw_media_url}", error=True)
+            return jsonify({"error": "Failed to process customer message"}), 500
+
+        tool_id = decide_tool_with_manager_prompt(bot, history)
+        tool = None
+        if tool_id and tool_id.lower() != "default":
+            for t in get_active_tools_for_bot(bot.id):
+                if t.tool_id == tool_id:
+                    tool = t
+                    break
+        logger.info(f"[LOGIC] Tool selected: {tool_id}, tool obj: {tool}")
+
+        context_input = "\n".join([
+            f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}"
+            for m in history
+        ])
+
+        ai_reply = compose_reply(bot, tool, history, context_input)
+
+        # ---- Session closure/notify block BEFORE sending any reply! ----
+        try:
+            parsed = ai_reply if isinstance(ai_reply, dict) else json.loads(ai_reply)
+        except Exception:
+            parsed = {}
+
+        # Update customer info if parsed (e.g. name)
+        if "name" in parsed:
+            customer.name = parsed["name"]
+            db.session.commit()
+        # (Extend here: update area, language, etc as needed)
+
+        if parsed.get("instruction") == "close_session_and_notify_sales":
+            info_to_save = {}
+            for key in ("service", "platform", "industry", "business", "name", "area", "location", "meet_up_method", "meet_up_date"):
+                if key in parsed:
+                    info_to_save[key] = parsed[key]
+            close_session(session, reason="goal_achieved", info=info_to_save)
+            notify_msg = parsed.get("notify_sales_message") or f"Goal achieved for customer {customer.name or user_phone}: {info_to_save}"
+            notify_sales_group(bot, notify_msg)
+            return jsonify({"status": "ok", "info": "session closed, sales notified"})
+        elif parsed.get("instruction") == "close_session_and_notify_sales_drop":
+            close_session(session, reason="drop", info=parsed)
+            notify_msg = parsed.get("notify_sales_message") or f"Session dropped for customer {customer.name or user_phone}"
+            notify_sales_group(bot, notify_msg)
+            return jsonify({"status": "ok", "info": "session dropped, sales notified"})
+
+        # --- Only send reply if session NOT closed above
+        process_ai_reply_and_send(user_phone, ai_reply, device_id, bot_id=bot.id, user=user_phone, session_id=session_id)
+        return jsonify({"status": "ok"})
+
     except Exception as e:
-        logger.error(f"[WEBHOOK] Invalid incoming data: {e}")
-        return jsonify({"error": "Invalid request format"}), 400
+        logger.error(f"[WEBHOOK] Exception: {e}")
+        return jsonify({"error": "Webhook processing error"}), 500
 
-    msg_text, raw_media_url = extract_text_from_message(msg)
-
-    bot = get_bot_by_phone(bot_phone)
-    if not bot:
-        logger.error(f"[ERROR] No bot found for phone {bot_phone}")
-        return jsonify({"error": "Bot not found"}), 404
-
-    if not msg_text or msg_text.startswith("[Unrecognized") or msg_text.startswith("[Audio received, transcription failed]"):
-        logger.error("[ERROR] Failed to extract text from message.")
-        notify_sales_group(bot, f"Failed to process customer message: {raw_media_url}", error=True)
-        return jsonify({"error": "Failed to process customer message"}), 500
-
-    save_message(bot.id, user_phone, session_id, "in", msg_text, raw_media_url=raw_media_url)
-
-    history = get_latest_history(bot.id, user_phone, session_id)
-
-    tool_id = decide_tool_with_manager_prompt(bot, history)
-    tool = None
-    if tool_id and tool_id.lower() != "default":
-        for t in get_active_tools_for_bot(bot.id):
-            if t.tool_id == tool_id:
-                tool = t
-                break
-    logger.info(f"[LOGIC] Tool selected: {tool_id}, tool obj: {tool}")
-
-    context_input = "\n".join([
-        f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}"
-        for m in history
-    ])
-
-    ai_reply = compose_reply(bot, tool, history, context_input)
-
-    process_ai_reply_and_send(user_phone, ai_reply, device_id, bot_id=bot.id, user=user_phone, session_id=session_id)
-
-    try:
-    parsed = ai_reply if isinstance(ai_reply, dict) else json.loads(ai_reply)
-    except Exception:
-        parsed = {}
     
     # -- New: session close detection from AI reply instruction --
     if parsed.get("instruction") == "close_session_and_notify_sales":
