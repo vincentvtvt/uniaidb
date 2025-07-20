@@ -156,7 +156,7 @@ def encode_image_b64(img_bytes):
     return base64.b64encode(img_bytes).decode()
 
 def extract_text_from_image(img_url, prompt=None):
-    image_bytes = download_file(img_url)
+    image_bytes = download_wassenger_media(img_url)
     img_b64 = encode_image_b64(image_bytes)
     logger.info("[VISION] Sending image to OpenAI Vision...")
     messages = [
@@ -213,7 +213,7 @@ def extract_text_from_message(msg):
         img_url = msg.get("media", {}).get("url")
         if img_url:
             try:
-                image_bytes = download_file(img_url)
+                image_bytes = download_wassenger_media(img_url)
                 img_b64 = encode_image_b64(image_bytes)
                 vision_msg = [
                     {
@@ -251,7 +251,7 @@ def extract_text_from_message(msg):
         img_url = msg.get("media", {}).get("url")
         if img_url:
             try:
-                image_bytes = download_file(img_url)
+                image_bytes = download_wassenger_media(img_url)
                 img_b64 = encode_image_b64(image_bytes)
                 vision_msg = [
                     {
@@ -674,6 +674,10 @@ def close_session(session, reason, info: dict = None):
     session.context['close_reason'] = reason
     db.session.commit()
 
+def strip_json_markdown_blocks(text):
+    """Removes ```json ... ``` or ``` ... ``` wrappers from AI output."""
+    return re.sub(r'```[a-z]*\s*([\s\S]*?)```', r'\1', text, flags=re.MULTILINE).strip()
+
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -706,13 +710,6 @@ def webhook():
         session_id = str(session.id)
         save_message(bot.id, user_phone, session_id, "in", msg_text, raw_media_url=raw_media_url)
 
-
-
-        # 2. Now create/find customer/session
-        customer = find_or_create_customer(user_phone)
-        session = get_or_create_session(customer.id, bot.id)
-        session_id = str(session.id)
-
         # 3. Only save incoming message ONCE, after customer/session created
         history = get_latest_history(bot.id, user_phone, session_id)
 
@@ -735,9 +732,12 @@ def webhook():
 
         # 5. Parse AI reply and handle customer info
         try:
-            parsed = ai_reply if isinstance(ai_reply, dict) else json.loads(ai_reply)
-        except Exception:
+            ai_reply_stripped = strip_json_markdown_blocks(ai_reply)
+            parsed = ai_reply if isinstance(ai_reply, dict) else json.loads(ai_reply_stripped)
+        except Exception as e:
+            logger.error(f"[WEBHOOK] Could not parse AI reply as JSON: {ai_reply} ({e})")
             parsed = {}
+
 
         # 6. Update customer info only after parsed
         if "name" in parsed:
