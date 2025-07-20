@@ -33,6 +33,10 @@ def build_json_prompt(base_prompt, example_json, tag=None):
     )
     return base_prompt.strip() + json_instruction
 
+def strip_json_markdown_blocks(text):
+    """Removes ```json ... ``` or ``` ... ``` wrappers from AI output."""
+    return re.sub(r'```[a-z]*\s*([\s\S]*?)```', r'\1', text, flags=re.MULTILINE).strip()
+
 def build_json_prompt_with_reasoning(base_prompt, example_json, tag=None):
     tag_name = tag if tag else "ExampleOutput"
     reasoning_instruction = (
@@ -313,51 +317,69 @@ def extract_first_frame_from_video(video_bytes):
 
     # AUDIO (Whisper API)
    elif msg_type == "audio":
-    audio_url = get_media_url(media)
-    if audio_url:
-        try:
-            # Transcribe using Whisper first (your function)
-            transcript = transcribe_audio_from_url(audio_url)  # Make sure this works!
-            if transcript and transcript.lower() not in ("[audio received, no url]", "[audio received, transcription failed]"):
-                # Optional: further summarize via GPT-4o
-                gpt_prompt = (
-                    "This is a WhatsApp audio message transcribed as: "
-                    f"'{transcript}'. Reply in a short, natural phrase, as if you're the user."
-                )
-                result = openai.chat.completions.create(
-                    model="gpt-4o",
-                    messages=[{"role": "system", "content": gpt_prompt}],
-                    max_tokens=64
-                )
-                msg_text = result.choices[0].message.content.strip()
-                return msg_text or transcript, audio_url
-            else:
-                return transcript or "[Audio received, no speech detected]", audio_url
-        except Exception as e:
-            logger.error(f"[AUDIO MEANING] {e}")
-            return "[Audio received, error]", audio_url
-    return "[Audio received, no url]", None
+        audio_url = get_media_url(media)
+        if audio_url:
+            try:
+                # Transcribe using Whisper first (your function)
+                transcript = transcribe_audio_from_url(audio_url)  # Make sure this works!
+                if transcript and transcript.lower() not in ("[audio received, no url]", "[audio received, transcription failed]"):
+                    # Optional: further summarize via GPT-4o
+                    gpt_prompt = (
+                        "This is a WhatsApp audio message transcribed as: "
+                        f"'{transcript}'. Reply in a short, natural phrase, as if you're the user."
+                    )
+                    result = openai.chat.completions.create(
+                        model="gpt-4o",
+                        messages=[{"role": "system", "content": gpt_prompt}],
+                        max_tokens=64
+                    )
+                    msg_text = result.choices[0].message.content.strip()
+                    return msg_text or transcript, audio_url
+                else:
+                    return transcript or "[Audio received, no speech detected]", audio_url
+            except Exception as e:
+                logger.error(f"[AUDIO MEANING] {e}")
+                return "[Audio received, error]", audio_url
+        return "[Audio received, no url]", None
 
 
     # DOCUMENT (PDF/Word, Vision if image/PDF, else metadata)
     elif msg_type == "document":
-    doc_url = get_media_url(media)
-    file_name = media.get("filename") or ""
-    ext = (file_name.split(".")[-1] if file_name else "").lower()
-    if doc_url:
-        try:
-            doc_bytes = download_wassenger_media(doc_url)
-            if ext == "pdf":
-                # Extract first page as image
-                images = convert_from_bytes(doc_bytes, first_page=1, last_page=1)
-                if images:
-                    buf = BytesIO()
-                    images[0].save(buf, format="PNG")
-                    img_b64 = encode_image_b64(buf.getvalue())
+        doc_url = get_media_url(media)
+        file_name = media.get("filename") or ""
+        ext = (file_name.split(".")[-1] if file_name else "").lower()
+        if doc_url:
+            try:
+                doc_bytes = download_wassenger_media(doc_url)
+                if ext == "pdf":
+                    # Extract first page as image
+                    images = convert_from_bytes(doc_bytes, first_page=1, last_page=1)
+                    if images:
+                        buf = BytesIO()
+                        images[0].save(buf, format="PNG")
+                        img_b64 = encode_image_b64(buf.getvalue())
+                        vision_msg = [
+                            {"role": "system", "content": (
+                                "This is the first page of a PDF document sent via WhatsApp. "
+                                "Summarize what you see—any headings, tables, or visible text. Short natural phrase."
+                            )},
+                            {"role": "user", "content": [
+                                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
+                            ]}
+                        ]
+                        result = openai.chat.completions.create(
+                            model="gpt-4o",
+                            messages=vision_msg,
+                            max_tokens=128
+                        )
+                        msg_text = result.choices[0].message.content.strip()
+                        return msg_text or f"[Document received: {file_name}]", doc_url
+                elif ext in ("jpg", "jpeg", "png"):
+                    img_b64 = encode_image_b64(doc_bytes)
                     vision_msg = [
                         {"role": "system", "content": (
-                            "This is the first page of a PDF document sent via WhatsApp. "
-                            "Summarize what you see—any headings, tables, or visible text. Short natural phrase."
+                            "This is an image document received on WhatsApp. "
+                            "Summarize what you see—main subject, visible text. Short phrase."
                         )},
                         {"role": "user", "content": [
                             {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
@@ -370,31 +392,13 @@ def extract_first_frame_from_video(video_bytes):
                     )
                     msg_text = result.choices[0].message.content.strip()
                     return msg_text or f"[Document received: {file_name}]", doc_url
-            elif ext in ("jpg", "jpeg", "png"):
-                img_b64 = encode_image_b64(doc_bytes)
-                vision_msg = [
-                    {"role": "system", "content": (
-                        "This is an image document received on WhatsApp. "
-                        "Summarize what you see—main subject, visible text. Short phrase."
-                    )},
-                    {"role": "user", "content": [
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
-                    ]}
-                ]
-                result = openai.chat.completions.create(
-                    model="gpt-4o",
-                    messages=vision_msg,
-                    max_tokens=128
-                )
-                msg_text = result.choices[0].message.content.strip()
-                return msg_text or f"[Document received: {file_name}]", doc_url
-            else:
-                # Just show file name if not analyzable
+                else:
+                    # Just show file name if not analyzable
+                    return f"[Document received: {file_name}]", doc_url
+            except Exception as e:
+                logger.error(f"[DOC MEANING] {e}")
                 return f"[Document received: {file_name}]", doc_url
-        except Exception as e:
-            logger.error(f"[DOC MEANING] {e}")
-            return f"[Document received: {file_name}]", doc_url
-    return "[Document received, no url]", None
+        return "[Document received, no url]", None
 
 
     # CATCH-ALL (other/unknown types)
@@ -718,11 +722,6 @@ def close_session(session, reason, info: dict = None):
         session.context.update(info)
     session.context['close_reason'] = reason
     db.session.commit()
-
-def strip_json_markdown_blocks(text):
-    """Removes ```json ... ``` or ``` ... ``` wrappers from AI output."""
-    return re.sub(r'```[a-z]*\s*([\s\S]*?)```', r'\1', text, flags=re.MULTILINE).strip()
-
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
