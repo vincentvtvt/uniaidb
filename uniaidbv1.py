@@ -250,6 +250,7 @@ def extract_text_from_message(msg):
                     {"role": "system", "content": (
                         "This is a WhatsApp sticker. "
                         "Briefly describe what is shown in the sticker, focusing on the main character, action, and emotion. "
+                        "Example output is 'user is sending a sticker with chicken eating chicken'"
                         "If there is text in the sticker, include it. "
                         "Reply in a short, natural phrase, no code formatting."
                     )},
@@ -281,6 +282,7 @@ def extract_text_from_message(msg):
                     {"role": "system", "content": (
                         "This is a photo/image received on WhatsApp. "
                         "Summarize briefly what you see, focusing on main objects, scene, or text. "
+                        "Example output is 'user is sending a image with chicken eating chicken'"
                         "Reply in a short phrase. If there is text, mention it."
                     )},
                     {"role": "user", "content": [
@@ -313,6 +315,7 @@ def extract_text_from_message(msg):
                         {"role": "system", "content": (
                             "This is the first frame of a WhatsApp video. "
                             "Summarize the scene—main subject, action, or text. Short phrase."
+                            "Example output is 'user is sending a video with chicken eating chicken'"
                         )},
                         {"role": "user", "content": [
                             {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
@@ -374,6 +377,7 @@ def extract_text_from_message(msg):
                         vision_msg = [
                             {"role": "system", "content": (
                                 "This is the first page of a PDF document sent via WhatsApp. "
+                                "Example output is 'user is sending a document with details of abc'"
                                 "Summarize what you see—any headings, tables, or visible text. Short natural phrase."
                             )},
                             {"role": "user", "content": [
@@ -392,6 +396,7 @@ def extract_text_from_message(msg):
                     vision_msg = [
                         {"role": "system", "content": (
                             "This is an image document received on WhatsApp. "
+                            "Example output is 'user is sending a image with chicken eating chicken'"
                             "Summarize what you see—main subject, visible text. Short phrase."
                         )},
                         {"role": "user", "content": [
