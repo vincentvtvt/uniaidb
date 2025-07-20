@@ -598,18 +598,13 @@ def webhook():
             return jsonify({"error": "Bot not found"}), 404
 
         msg_text, raw_media_url = extract_text_from_message(msg)
-        # Only reply to text, but save all messages
-        if msg_type in ('image', 'audio', 'sticker', 'video', 'document'):
-            bot = get_bot_by_phone(bot_phone)
-            customer = find_or_create_customer(user_phone)
-            session = get_or_create_session(customer.id, bot.id)
-            session_id = str(session.id)
-            save_message(bot.id, user_phone, session_id, "in", msg_text, raw_media_url=raw_media_url)
-            return jsonify({"status": f"{msg_type} saved, no bot reply"}), 200
-        
-        if msg_type != 'text':
-            save_message(bot.id, user_phone, session_id, "in", msg_text, raw_media_url=raw_media_url)
-            return jsonify({"status": "media event saved, ignored for reply"}), 200
+
+        # For all message types, after finding customer and session, always save first
+        customer = find_or_create_customer(user_phone)
+        session = get_or_create_session(customer.id, bot.id)
+        session_id = str(session.id)
+        save_message(bot.id, user_phone, session_id, "in", msg_text, raw_media_url=raw_media_url)
+
 
 
         # 2. Now create/find customer/session
