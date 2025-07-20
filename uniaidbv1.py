@@ -195,20 +195,20 @@ def extract_text_from_message(msg):
     msg_text, media_url = None, None
 
     # Helper to get downloadable url
-def get_media_url(media):
-    url = media.get("url")
-    if not url and "links" in media and "download" in media["links"]:
-        url = "https://api.wassenger.com" + media["links"]["download"]
-    return url
-
-def extract_first_frame_from_video(video_bytes):
-    np_arr = np.frombuffer(video_bytes, np.uint8)
-    cap = cv2.VideoCapture(cv2.imdecode(np_arr, cv2.IMREAD_COLOR))
-    success, frame = cap.read()
-    if success:
-        _, buf = cv2.imencode('.png', frame)
-        return buf.tobytes()
-    return None
+    def get_media_url(media):
+        url = media.get("url")
+        if not url and "links" in media and "download" in media["links"]:
+            url = "https://api.wassenger.com" + media["links"]["download"]
+        return url
+    
+    def extract_first_frame_from_video(video_bytes):
+        np_arr = np.frombuffer(video_bytes, np.uint8)
+        cap = cv2.VideoCapture(cv2.imdecode(np_arr, cv2.IMREAD_COLOR))
+        success, frame = cap.read()
+        if success:
+            _, buf = cv2.imencode('.png', frame)
+            return buf.tobytes()
+        return None
 
 
     # STICKER (Vision)
@@ -316,31 +316,31 @@ def extract_first_frame_from_video(video_bytes):
 
 
     # AUDIO (Whisper API)
-   elif msg_type == "audio":
-        audio_url = get_media_url(media)
-        if audio_url:
-            try:
-                # Transcribe using Whisper first (your function)
-                transcript = transcribe_audio_from_url(audio_url)  # Make sure this works!
-                if transcript and transcript.lower() not in ("[audio received, no url]", "[audio received, transcription failed]"):
-                    # Optional: further summarize via GPT-4o
-                    gpt_prompt = (
-                        "This is a WhatsApp audio message transcribed as: "
-                        f"'{transcript}'. Reply in a short, natural phrase, as if you're the user."
-                    )
-                    result = openai.chat.completions.create(
-                        model="gpt-4o",
-                        messages=[{"role": "system", "content": gpt_prompt}],
-                        max_tokens=64
-                    )
-                    msg_text = result.choices[0].message.content.strip()
-                    return msg_text or transcript, audio_url
-                else:
-                    return transcript or "[Audio received, no speech detected]", audio_url
-            except Exception as e:
-                logger.error(f"[AUDIO MEANING] {e}")
-                return "[Audio received, error]", audio_url
-        return "[Audio received, no url]", None
+       elif msg_type == "audio":
+            audio_url = get_media_url(media)
+            if audio_url:
+                try:
+                    # Transcribe using Whisper first (your function)
+                    transcript = transcribe_audio_from_url(audio_url)  # Make sure this works!
+                    if transcript and transcript.lower() not in ("[audio received, no url]", "[audio received, transcription failed]"):
+                        # Optional: further summarize via GPT-4o
+                        gpt_prompt = (
+                            "This is a WhatsApp audio message transcribed as: "
+                            f"'{transcript}'. Reply in a short, natural phrase, as if you're the user."
+                        )
+                        result = openai.chat.completions.create(
+                            model="gpt-4o",
+                            messages=[{"role": "system", "content": gpt_prompt}],
+                            max_tokens=64
+                        )
+                        msg_text = result.choices[0].message.content.strip()
+                        return msg_text or transcript, audio_url
+                    else:
+                        return transcript or "[Audio received, no speech detected]", audio_url
+                except Exception as e:
+                    logger.error(f"[AUDIO MEANING] {e}")
+                    return "[Audio received, error]", audio_url
+            return "[Audio received, no url]", None
 
 
     # DOCUMENT (PDF/Word, Vision if image/PDF, else metadata)
