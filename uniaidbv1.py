@@ -484,22 +484,20 @@ def compose_reply(bot, tool, history, context_input):
 def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, user=None, session_id=None):
     try:
         parsed = ai_reply if isinstance(ai_reply, dict) else json.loads(ai_reply)
-        except Exception as e:
-            logger.error(f"[WEBHOOK] Could not parse AI reply as JSON: {ai_reply} ({e})")
-            parsed = {}
-
-# Defensive: Only continue if parsed is a dict
-if not isinstance(parsed, dict):
-    logger.error(f"[WEBHOOK] AI reply did not return a dict. Raw reply: {parsed}")
-    parsed = {}
-
-# Now, you can safely do:
-if parsed.get("instruction") == "close_session_and_notify_sales":
-    # ... safe to proceed ...
-
-    except Exception:
-        logger.error("[SEND SPLIT MSGS] Failed to parse AI reply as JSON")
+    except Exception as e:
+        logger.error(f"[WEBHOOK] Could not parse AI reply as JSON: {ai_reply} ({e})")
         parsed = {}
+
+    # Defensive: Only continue if parsed is a dict
+    if not isinstance(parsed, dict):
+        logger.error(f"[WEBHOOK] AI reply did not return a dict. Raw reply: {parsed}")
+        parsed = {}
+
+    # Now, you can safely do:
+    if parsed.get("instruction") == "close_session_and_notify_sales":
+        # ... safe to proceed ...
+        # handle closing here as needed
+        return  # Optionally exit function after session close (handled in webhook, too)
 
     # --- TEMPLATE PROCESSING ---
     if "template" in parsed:
@@ -519,7 +517,6 @@ if parsed.get("instruction") == "close_session_and_notify_sales":
                     msg_type="image",
                     caption=part.get("caption") or None
                 )
-
             # Always wait for a delay between template parts
             if idx < len(template_content) - 1:
                 time.sleep(5)
@@ -543,9 +540,9 @@ if parsed.get("instruction") == "close_session_and_notify_sales":
             if bot_id and user and session_id:
                 if isinstance(part, dict) and part.get("type") == "image":
                     save_message(bot_id, user, session_id, "out", "[IMAGE]", raw_media_url=part.get("content"))
-        else:
-            save_message(bot_id, user, session_id, "out", part)
-
+                else:
+                    save_message(bot_id, user, session_id, "out", part)
+                    
 def find_or_create_customer(phone, name=None):
     customer = Customer.query.filter_by(phone_number=phone).first()
     if not customer:
