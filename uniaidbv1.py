@@ -247,20 +247,34 @@ def extract_text_from_message(msg):
         return "[Image received, no url]", img_url
 
     # 3. Sticker Message (Vision AI)
-    elif msg_type == "sticker":
-        img_url = msg.get("media", {}).get("url")
+        elif msg_type == "sticker":
+        media = msg.get("media", {})
+        img_url = media.get("url")
+        if not img_url and "links" in media and "download" in media["links"]:
+            img_url = "https://api.wassenger.com" + media["links"]["download"]
+        logger.info(f"[STICKER DEBUG] img_url for Vision: {img_url}")
         if img_url:
+            image_bytes = download_wassenger_media(img_url)
+            # If .webp, convert to .png for Vision
+            if media.get("extension", "").lower() == "webp":
+                from PIL import Image
+                from io import BytesIO
+                im = Image.open(BytesIO(image_bytes)).convert("RGBA")
+                buf = BytesIO()
+                im.save(buf, format="PNG")
+                image_bytes = buf.getvalue()
             try:
-                image_bytes = download_wassenger_media(img_url)
+                img_b64 = encode_image_b64(image_bytes)
                 img_b64 = encode_image_b64(image_bytes)
                 vision_msg = [
                     {
                         "role": "system",
                         "content": (
                             "This is a WhatsApp sticker. "
-                            "Describe the main emotion or meaning in 1-2 words. "
-                            "If any text is visible, include it. "
-                            "Reply in a short phrase, no code formatting."
+                            "Briefly describe what is shown in the sticker, focusing on the main character, action, and emotion. "
+                            "If there is text in the sticker, include it in your answer. "
+                            "Reply in a short, natural phrase (e.g., 'user sent a sticker of a cat happily sitting', 'user sent a sticker of dog saying thank you', 'user sent a sticker of happy face with celebration text'). "
+                            "Do not explain or add code formatting, just the phrase."
                         ),
                     },
                     {
@@ -273,18 +287,18 @@ def extract_text_from_message(msg):
                         ],
                     }
                 ]
+
                 result = openai.chat.completions.create(
                     model="gpt-4o",
                     messages=vision_msg,
-                    max_tokens=128
+                    max_tokens=8192
                 )
                 meaning = result.choices[0].message.content.strip()
                 return meaning or "[Sticker received]", img_url
             except Exception as e:
-                logger.error(f"[STICKER VISION] {e}")
-                return "[Sticker received, vision failed]", img_url
-        return "[Sticker received, no url]", img_url
-
+                logger.error(f"[STICKER MEANING] {e}")
+                return "[Sticker received]", img_url
+        return "[Sticker received]", None
     # 4. Audio Message (Whisper + GPT summary)
     elif msg_type == "audio":
         audio_url = msg.get("media", {}).get("url")
