@@ -261,7 +261,7 @@ def extract_text_from_message(msg):
                 result = openai.chat.completions.create(
                     model="gpt-4o",
                     messages=vision_msg,
-                    max_tokens=128
+                    max_tokens=8192
                 )
                 msg_text = result.choices[0].message.content.strip()
                 return msg_text or "[Sticker received]", img_url
@@ -292,7 +292,7 @@ def extract_text_from_message(msg):
                 result = openai.chat.completions.create(
                     model="gpt-4o",
                     messages=vision_msg,
-                    max_tokens=128
+                    max_tokens=8192
                 )
                 msg_text = result.choices[0].message.content.strip()
                 return msg_text or "[Image received]", img_url
@@ -520,13 +520,18 @@ def send_wassenger_reply(phone, text, device_id, delay_seconds=5, msg_type="text
 
 
 def notify_sales_group(bot, message, error=False):
-    group_id = (bot.config or {}).get("notification_group")
-    device_id = (bot.config or {}).get("device_id")
+    import json
+    config = bot.config
+    if isinstance(config, str):
+        config = json.loads(config)
+    group_id = (config or {}).get("notification_group")
+    device_id = (config or {}).get("device_id")
     if group_id and device_id:
         note = f"[ALERT] {message}" if error else message
         send_wassenger_reply(group_id, note, device_id)
     else:
         logger.warning("[NOTIFY] Notification group or device_id missing in bot.config")
+
 
 def get_bot_by_phone(phone_number):
     num_variants = [
@@ -728,7 +733,7 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
     elif isinstance(parsed, str):
         msg_lines = [parsed]
 
-    SPLIT_MSG_DELAY = 7  # seconds between each message
+    SPLIT_MSG_DELAY = 1  # seconds between each message
 
     for idx, part in enumerate(msg_lines[:3]):
         if part:
@@ -739,6 +744,43 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
                     save_message(bot_id, user, session_id, "out", "[IMAGE]", raw_media_url=part.get("content"))
                 else:
                     save_message(bot_id, user, session_id, "out", part)
+
+if parsed.get("instruction") in ("close_session_and_notify_sales", "close_session_drop"):
+    # --- UNIVERSAL BACKEND CLOSING BLOCK ---
+
+    # 1. Gather all context to save (ignore reserved fields)
+    info_to_save = {}
+    for k, v in parsed.items():
+        if k not in ("message", "notification", "instruction") and v is not None:
+            info_to_save[k] = v
+
+    # 2. Set close reason (won/drop)
+    close_reason = parsed.get("close_reason")
+    if not close_reason:
+        close_reason = "won" if parsed["instruction"] == "close_session_and_notify_sales" else "drop"
+
+    # 3. Find and update the active session for this customer + bot
+    session_obj = (
+        db.session.query(Session)
+        .filter_by(bot_id=bot.id, customer_id=customer.id, status="open")
+        .order_by(Session.started_at.desc())
+        .first()
+    )
+    if session_obj:
+        session_obj.status = "closed"
+        session_obj.ended_at = datetime.now()
+        session_obj.context = {**session_obj.context, **info_to_save, "close_reason": close_reason}
+        db.session.commit()
+        logger.info(f"[SESSION] Closed session for user {customer_phone}, reason: {close_reason}, info: {info_to_save}")
+    else:
+        logger.warning(f"[SESSION] Tried to close session, but none found for user {customer_phone}, bot {bot.id}")
+
+    # 4. Only notify group for won/closed sales
+    if parsed["instruction"] == "close_session_and_notify_sales" and "notification" in parsed:
+        notify_sales_group(bot, parsed["notification"])
+
+    return jsonify({"status": "session closed", "reason": close_reason})
+
                     
 def find_or_create_customer(phone, name=None):
     customer = Customer.query.filter_by(phone_number=phone).first()
