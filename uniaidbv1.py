@@ -133,8 +133,8 @@ class Customer(db.Model):
     meta = db.Column(db.JSON)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
-class sessions(db.Model):
-    __tablename__ = 'sessions'
+class session(db.Model):
+    __tablename__ = 'session'
     id = db.Column(db.Integer, primary_key=True)
     customer_id = db.Column(db.Integer, db.ForeignKey('customers.id'))
     bot_id = db.Column(db.Integer)
@@ -424,7 +424,7 @@ def extract_text_from_message(msg):
 
 
 def get_template_content(template_id):
-    template = db.sessions.query(Template).filter_by(template_id=template_id, active=True).first()
+    template = db.session.query(Template).filter_by(template_id=template_id, active=True).first()
     if not template or not template.content:
         return []
     return template.content if isinstance(template.content, list) else json.loads(template.content)
@@ -547,7 +547,7 @@ def get_bot_by_phone(phone_number):
 
 def get_active_tools_for_bot(bot_id):
     tools = (
-        db.sessions.query(Tool)
+        db.session.query(Tool)
         .join(BotTool, (Tool.tool_id == BotTool.tool_id) & (BotTool.bot_id == bot_id) & (Tool.active == True) & (BotTool.active == True))
         .all()
     )
@@ -564,8 +564,8 @@ def save_message(bot_id, customer_phone, session_id, direction, content, raw_med
         raw_media_url=raw_media_url,
         created_at=datetime.now()
     )
-    db.sessions.add(msg)
-    db.sessions.commit()
+    db.session.add(msg)
+    db.session.commit()
     logger.info(f"[DB] Saved message ({direction}) for {customer_phone}: {content}")
 
 def get_latest_history(bot_id, customer_phone, session_id, n=20):
@@ -673,10 +673,10 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
         parsed = {}
 
     # Now, you can safely do:
-    if parsed.get("instruction") == "close_sessions_and_notify_sales":
+    if parsed.get("instruction") == "close_session_and_notify_sales":
         # ... safe to proceed ...
         # handle closing here as needed
-        return  # Optionally exit function after sessions close (handled in webhook, too)
+        return  # Optionally exit function after session close (handled in webhook, too)
 
     # --- TEMPLATE PROCESSING ---
     if "template" in parsed:
@@ -745,31 +745,31 @@ def find_or_create_customer(phone, name=None):
     customer = Customer.query.filter_by(phone_number=phone).first()
     if not customer:
         customer = Customer(phone_number=phone, name=name)
-        db.sessions.add(customer)
-        db.sessions.commit()
+        db.session.add(customer)
+        db.session.commit()
     return customer
 
-def get_or_create_sessions(customer_id, bot_id):
-    sessions = sessions.query.filter_by(customer_id=customer_id, bot_id=bot_id, status='open').first()
-    if not sessions:
-        sessions = sessions(
+def get_or_create_session(customer_id, bot_id):
+    session = session.query.filter_by(customer_id=customer_id, bot_id=bot_id, status='open').first()
+    if not session:
+        session = session(
             customer_id=customer_id,
             bot_id=bot_id,
             started_at=datetime.now(),
             status='open',
             context={},
         )
-        db.sessions.add(sessions)
-        db.sessions.commit()
-    return sessions
+        db.session.add(session)
+        db.session.commit()
+    return session
 
-def close_sessions(sessions, reason, info: dict = None):
-    sessions.ended_at = datetime.now()
-    sessions.status = 'closed'
+def close_session(session, reason, info: dict = None):
+    session.ended_at = datetime.now()
+    session.status = 'closed'
     if info:
-        sessions.context.update(info)
-    sessions.context['close_reason'] = reason
-    db.sessions.commit()
+        session.context.update(info)
+    session.context['close_reason'] = reason
+    db.session.commit()
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -796,13 +796,13 @@ def webhook():
 
         msg_text, raw_media_url = extract_text_from_message(msg)
 
-        # For all message types, after finding customer and sessions, always save first
+        # For all message types, after finding customer and session, always save first
         customer = find_or_create_customer(user_phone)
-        sessions = get_or_create_sessions(customer.id, bot.id)
-        session_id = str(sessions.id)
+        session = get_or_create_session(customer.id, bot.id)
+        session_id = str(session.id)
         save_message(bot.id, user_phone, session_id, "in", msg_text, raw_media_url=raw_media_url)
 
-        # 3. Only save incoming message ONCE, after customer/sessions created
+        # 3. Only save incoming message ONCE, after customer/session created
         history = get_latest_history(bot.id, user_phone, session_id)
 
         # 4. Compose tool and context
@@ -834,26 +834,26 @@ def webhook():
         # 6. Update customer info only after parsed
         if "name" in parsed:
             customer.name = parsed["name"]
-            db.sessions.commit()
+            db.session.commit()
         # (add more: area, language, etc. if in parsed)
 
-        # 7. sessions closure/notify block before sending reply
-        if parsed.get("instruction") == "close_sessions_and_notify_sales":
+        # 7. session closure/notify block before sending reply
+        if parsed.get("instruction") == "close_session_and_notify_sales":
             info_to_save = {}
             for key in ("service", "platform", "industry", "business", "name", "area", "location", "meet_up_method", "meet_up_date"):
                 if key in parsed:
                     info_to_save[key] = parsed[key]
-            close_sessions(sessions, reason="goal_achieved", info=info_to_save)
+            close_session(session, reason="goal_achieved", info=info_to_save)
             notify_msg = parsed.get("notify_sales_message") or f"Goal achieved for customer {customer.name or user_phone}: {info_to_save}"
             notify_sales_group(bot, notify_msg)
-            return jsonify({"status": "ok", "info": "sessions closed, sales notified"})
-        elif parsed.get("instruction") == "close_sessions_and_notify_sales_drop":
-            close_sessions(sessions, reason="drop", info=parsed)
-            notify_msg = parsed.get("notify_sales_message") or f"sessions dropped for customer {customer.name or user_phone}"
+            return jsonify({"status": "ok", "info": "session closed, sales notified"})
+        elif parsed.get("instruction") == "close_session_and_notify_sales_drop":
+            close_session(session, reason="drop", info=parsed)
+            notify_msg = parsed.get("notify_sales_message") or f"session dropped for customer {customer.name or user_phone}"
             notify_sales_group(bot, notify_msg)
-            return jsonify({"status": "ok", "info": "sessions dropped, sales notified"})
+            return jsonify({"status": "ok", "info": "session dropped, sales notified"})
 
-        # 8. Only send/process reply if sessions is NOT closed
+        # 8. Only send/process reply if session is NOT closed
         process_ai_reply_and_send(user_phone, ai_reply, device_id, bot_id=bot.id, user=user_phone, session_id=session_id)
         return jsonify({"status": "ok"})
 
