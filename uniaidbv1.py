@@ -424,7 +424,7 @@ def extract_text_from_message(msg):
 
 
 def get_template_content(template_id):
-    template = db.Session.query(Template).filter_by(template_id=template_id, active=True).first()
+    template = db.session.query(Template).filter_by(template_id=template_id, active=True).first()
     if not template or not template.content:
         return []
     return template.content if isinstance(template.content, list) else json.loads(template.content)
@@ -547,7 +547,7 @@ def get_bot_by_phone(phone_number):
 
 def get_active_tools_for_bot(bot_id):
     tools = (
-        db.Session.query(Tool)
+        db.session.query(Tool)
         .join(BotTool, (Tool.tool_id == BotTool.tool_id) & (BotTool.bot_id == bot_id) & (Tool.active == True) & (BotTool.active == True))
         .all()
     )
