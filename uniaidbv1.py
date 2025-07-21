@@ -706,31 +706,14 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
             elif part.get("type") == "image":
                 image_content = part["content"]
                 caption = part.get("caption") or None
-                if isinstance(image_content, str) and image_content.startswith("http"):
-                    # Public URL, send directly
-                    send_wassenger_reply(
-                        customer_phone,
-                        caption,
-                        device_id,
-                        msg_type="image",
-                        caption=caption,
-                        text=image_content
-                    )
-                else:
-                    # DB BLOB/base64: decode if needed, upload, then send
-                    if isinstance(image_content, str):
-                        import base64
-                        image_bytes = base64.b64decode(image_content)
-                    else:
-                        image_bytes = image_content
-                    send_wassenger_reply(
-                        customer_phone,
-                        caption,
-                        device_id,
-                        msg_type="image",
-                        caption=caption,
-                        text=image_bytes
-                    )
+                send_wassenger_reply(
+                    customer_phone,
+                    image_content,
+                    device_id,
+                    msg_type="image",
+                    caption=caption
+                )
+
             # Always wait for a delay between template parts
             if idx < len(template_content) - 1:
                 time.sleep(5)
