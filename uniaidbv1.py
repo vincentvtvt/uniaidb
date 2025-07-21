@@ -578,12 +578,28 @@ def get_latest_history(bot_id, customer_phone, session_id, n=20):
     logger.info(f"[DB] History ({len(messages)} messages) loaded.")
     return messages
 
+def build_tool_menu_for_prompt(bot_id):
+    tools = get_active_tools_for_bot(bot_id)
+    menu = []
+    for t in tools:
+        menu.append(f"{t.tool_id} ({t.name}): {t.description}")
+    return "\n".join(menu)
+
 def decide_tool_with_manager_prompt(bot, history):
     # Build history text as before
     history_text = "\n".join([f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}" for m in history])
-    # Use the new prompt builder with reasoning
+
+    # ---- NEW: Build the tool menu and append to system prompt ----
+    tool_menu = build_tool_menu_for_prompt(bot.id)
+    tool_menu_text = (
+        "Here are the available tools you can select (ID, name, and description):\n"
+        f"{tool_menu}\n"
+        "Choose the single most appropriate tool for this conversation."
+    )
+
+    # Merge with your manager prompt
     manager_prompt = build_json_prompt_with_reasoning(
-        bot.manager_system_prompt or "",
+        (bot.manager_system_prompt or "") + "\n" + tool_menu_text,
         '{\n  "TOOLS": "Default"\n}',
         tag="ExampleOutput"
     )
