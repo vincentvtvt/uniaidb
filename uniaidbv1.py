@@ -118,7 +118,7 @@ class Message(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     bot_id = db.Column(db.Integer)
     customer_phone = db.Column(db.String(50))
-    sessions_id = db.Column(db.String(50))
+    session_id = db.Column(db.String(50))
     direction = db.Column(db.String(10))  # 'in' or 'out'
     content = db.Column(db.Text)
     raw_media_url = db.Column(db.Text)
@@ -554,11 +554,11 @@ def get_active_tools_for_bot(bot_id):
     logger.info(f"[DB] Tools for bot_id={bot_id}: {[t.tool_id for t in tools]}")
     return tools
 
-def save_message(bot_id, customer_phone, sessions_id, direction, content, raw_media_url=None):
+def save_message(bot_id, customer_phone, session_id, direction, content, raw_media_url=None):
     msg = Message(
         bot_id=bot_id,
         customer_phone=customer_phone,
-        sessions_id=sessions_id,
+        session_id=session_id,
         direction=direction,
         content=content,
         raw_media_url=raw_media_url,
@@ -568,9 +568,9 @@ def save_message(bot_id, customer_phone, sessions_id, direction, content, raw_me
     db.sessions.commit()
     logger.info(f"[DB] Saved message ({direction}) for {customer_phone}: {content}")
 
-def get_latest_history(bot_id, customer_phone, sessions_id, n=20):
+def get_latest_history(bot_id, customer_phone, session_id, n=20):
     messages = (Message.query
-        .filter_by(bot_id=bot_id, customer_phone=customer_phone, sessions_id=sessions_id)
+        .filter_by(bot_id=bot_id, customer_phone=customer_phone, session_id=session_id)
         .order_by(Message.created_at.desc())
         .limit(n)
         .all())
@@ -660,7 +660,7 @@ def compose_reply(bot, tool, history, context_input):
     match = re.search(r'<ExampleOutput>(.*?)</ExampleOutput>', reply_accum, re.DOTALL)
     return match.group(1).strip() if match else reply_accum
 
-def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, user=None, sessions_id=None):
+def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, user=None, session_id=None):
     try:
         parsed = ai_reply if isinstance(ai_reply, dict) else json.loads(ai_reply)
     except Exception as e:
@@ -685,8 +685,8 @@ if "template" in parsed:
     for idx, part in enumerate(template_content):
         if part.get("type") == "text":
             send_wassenger_reply(customer_phone, part["content"], device_id, delay_seconds=5)
-            if bot_id and user and sessions_id:
-                save_message(bot_id, user, sessions_id, "out", part["content"])
+            if bot_id and user and session_id:
+                save_message(bot_id, user, session_id, "out", part["content"])
         elif part.get("type") == "image":
             image_content = part["content"]
             caption = part.get("caption") or None
@@ -735,11 +735,11 @@ if "template" in parsed:
         if part:
             delay = SPLIT_MSG_DELAY * (idx + 1)  # 7s, 14s, 21s, etc.
             send_wassenger_reply(customer_phone, part, device_id, delay_seconds=delay)
-            if bot_id and user and sessions_id:
+            if bot_id and user and session_id:
                 if isinstance(part, dict) and part.get("type") == "image":
-                    save_message(bot_id, user, sessions_id, "out", "[IMAGE]", raw_media_url=part.get("content"))
+                    save_message(bot_id, user, session_id, "out", "[IMAGE]", raw_media_url=part.get("content"))
                 else:
-                    save_message(bot_id, user, sessions_id, "out", part)
+                    save_message(bot_id, user, session_id, "out", part)
                     
 def find_or_create_customer(phone, name=None):
     customer = Customer.query.filter_by(phone_number=phone).first()
@@ -799,11 +799,11 @@ def webhook():
         # For all message types, after finding customer and sessions, always save first
         customer = find_or_create_customer(user_phone)
         sessions = get_or_create_sessions(customer.id, bot.id)
-        sessions_id = str(sessions.id)
-        save_message(bot.id, user_phone, sessions_id, "in", msg_text, raw_media_url=raw_media_url)
+        session_id = str(sessions.id)
+        save_message(bot.id, user_phone, session_id, "in", msg_text, raw_media_url=raw_media_url)
 
         # 3. Only save incoming message ONCE, after customer/sessions created
-        history = get_latest_history(bot.id, user_phone, sessions_id)
+        history = get_latest_history(bot.id, user_phone, session_id)
 
         # 4. Compose tool and context
         tool_id = decide_tool_with_manager_prompt(bot, history)
@@ -854,7 +854,7 @@ def webhook():
             return jsonify({"status": "ok", "info": "sessions dropped, sales notified"})
 
         # 8. Only send/process reply if sessions is NOT closed
-        process_ai_reply_and_send(user_phone, ai_reply, device_id, bot_id=bot.id, user=user_phone, sessions_id=sessions_id)
+        process_ai_reply_and_send(user_phone, ai_reply, device_id, bot_id=bot.id, user=user_phone, session_id=session_id)
         return jsonify({"status": "ok"})
 
     except Exception as e:
