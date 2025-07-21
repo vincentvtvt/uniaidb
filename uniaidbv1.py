@@ -749,18 +749,19 @@ def find_or_create_customer(phone, name=None):
     return customer
 
 def get_or_create_session(customer_id, bot_id):
-    session = Session.query.filter_by(customer_id=customer_id, bot_id=bot_id, status='open').first()
-    if not session:
-        session = session(
+    session_obj = Session.query.filter_by(customer_id=customer_id, bot_id=bot_id, status='open').first()
+    if not session_obj:
+        session_obj = Session(
             customer_id=customer_id,
             bot_id=bot_id,
             started_at=datetime.now(),
             status='open',
             context={},
         )
-        db.session.add(session)
+        db.session.add(session_obj)
         db.session.commit()
-    return session
+    return session_obj
+
 
 def close_session(session, reason, info: dict = None):
     session.ended_at = datetime.now()
