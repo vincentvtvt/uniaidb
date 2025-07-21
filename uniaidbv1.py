@@ -134,7 +134,7 @@ class Customer(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 class sessions(db.Model):
-    __tablename__ = 'sessionss'
+    __tablename__ = 'sessions'
     id = db.Column(db.Integer, primary_key=True)
     customer_id = db.Column(db.Integer, db.ForeignKey('customers.id'))
     bot_id = db.Column(db.Integer)
