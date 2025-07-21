@@ -133,7 +133,7 @@ class Customer(db.Model):
     meta = db.Column(db.JSON)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
-class session(db.Model):
+class Session(db.Model):
     __tablename__ = 'session'
     id = db.Column(db.Integer, primary_key=True)
     customer_id = db.Column(db.Integer, db.ForeignKey('customers.id'))
@@ -424,7 +424,7 @@ def extract_text_from_message(msg):
 
 
 def get_template_content(template_id):
-    template = db.session.query(Template).filter_by(template_id=template_id, active=True).first()
+    template = db.Session.query(Template).filter_by(template_id=template_id, active=True).first()
     if not template or not template.content:
         return []
     return template.content if isinstance(template.content, list) else json.loads(template.content)
@@ -547,7 +547,7 @@ def get_bot_by_phone(phone_number):
 
 def get_active_tools_for_bot(bot_id):
     tools = (
-        db.session.query(Tool)
+        db.Session.query(Tool)
         .join(BotTool, (Tool.tool_id == BotTool.tool_id) & (BotTool.bot_id == bot_id) & (Tool.active == True) & (BotTool.active == True))
         .all()
     )
@@ -750,7 +750,7 @@ def find_or_create_customer(phone, name=None):
     return customer
 
 def get_or_create_session(customer_id, bot_id):
-    session = session.query.filter_by(customer_id=customer_id, bot_id=bot_id, status='open').first()
+    session = Session.query.filter_by(customer_id=customer_id, bot_id=bot_id, status='open').first()
     if not session:
         session = session(
             customer_id=customer_id,
