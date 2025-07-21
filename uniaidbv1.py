@@ -687,9 +687,9 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
                 send_wassenger_reply(customer_phone, part["content"], device_id, delay_seconds=5)
                 if bot_id and user and session_id:
                     save_message(bot_id, user, session_id, "out", part["content"])
-            elif part.get("type") == "image":
-    image_content = part["content"]
-    caption = part.get("caption") or None
+                elif part.get("type") == "image":
+                    image_content = part["content"]
+                    caption = part.get("caption") or None
     if isinstance(image_content, str) and image_content.startswith("http"):
         # Public URL, send directly
         send_wassenger_reply(
