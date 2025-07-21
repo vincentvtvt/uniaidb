@@ -481,18 +481,32 @@ def send_wassenger_reply(phone, text, device_id, delay_seconds=5, msg_type="text
         payload["message"] = text
         payload["schedule"] = {"delay": delay_seconds}
     elif msg_type == "image":
-        # text is either an image URL or image bytes (URL for most templates)
-        file_id = upload_media_to_wassenger(text)
-        if not file_id:
-            logger.error("[SEND IMAGE] Failed to upload image to Wassenger")
-            return
-        payload["media"] = {"file": file_id}
-        if caption:
-            payload["message"] = caption
-        # Note: 'schedule' (delay) is not supported for media messages; image will be sent ASAP
+        if isinstance(text, str) and text.startswith("http"):
+            # Send via URL
+            payload["media"] = {"url": text}
+            if caption:
+                payload["message"] = caption
+        else:
+            # Send as bytes (upload to Wassenger first)
+            file_id = upload_media_to_wassenger(text)
+            if not file_id:
+                logger.error("[SEND IMAGE] Failed to upload image to Wassenger")
+                return
+            payload["media"] = {"file": file_id}
+            if caption:
+                payload["message"] = caption
     else:
         logger.error(f"Unsupported msg_type: {msg_type}")
         return
+
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=15)
+        logger.info(f"Wassenger response: {resp.status_code} {resp.text}")
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        logger.error(f"[SEND WASSENGER ERROR] {e}")
+        return None
 
     # Remove keys with empty values
     payload = {k: v for k, v in payload.items() if v is not None}
@@ -674,14 +688,33 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
                 if bot_id and user and session_id:
                     save_message(bot_id, user, session_id, "out", part["content"])
             elif part.get("type") == "image":
-                send_wassenger_reply(
-                    customer_phone,
-                    part["content"],
-                    device_id,
-                    delay_seconds=5,
-                    msg_type="image",
-                    caption=part.get("caption") or None
-                )
+    image_content = part["content"]
+    caption = part.get("caption") or None
+    if isinstance(image_content, str) and image_content.startswith("http"):
+        # Public URL, send directly
+        send_wassenger_reply(
+            customer_phone,
+            caption,
+            device_id,
+            msg_type="image",
+            caption=caption,
+            text=image_content
+        )
+    else:
+        # DB BLOB/base64: decode if needed, upload, then send
+        if isinstance(image_content, str):
+            import base64
+            image_bytes = base64.b64decode(image_content)
+        else:
+            image_bytes = image_content
+        send_wassenger_reply(
+            customer_phone,
+            caption,
+            device_id,
+            msg_type="image",
+            caption=caption,
+            text=image_bytes
+        )
             # Always wait for a delay between template parts
             if idx < len(template_content) - 1:
                 time.sleep(5)
