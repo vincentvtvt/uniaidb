@@ -520,15 +520,7 @@ def upload_and_send_media(recipient, file_url_or_path, device_id, caption=None, 
         caption=caption,
         delay_seconds=delay_seconds
     )
-2. send_wassenger_reply — No major changes needed!
-Just make sure download_to_bytes and upload_any_file_to_wassenger are always available/imported.
 
-Your current logic is good and covers all normal WhatsApp + Wassenger use cases!
-
-3. download_to_bytes Example for Completeness:
-python
-Copy
-Edit
 def download_to_bytes(url):
     resp = requests.get(url, timeout=30)
     resp.raise_for_status()
