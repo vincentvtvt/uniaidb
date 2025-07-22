@@ -994,7 +994,14 @@ def webhook():
                 "raw_media_url": raw_media_url, 
                 "created_at": datetime.now().isoformat()
             })
-            
+            return jsonify({"status": "buffered, will process in 30s"})
+
+        except Exception as e:
+            logger.error(f"ERROR: {e}")
+            # ... your error handling ...
+            return jsonify({"error": "some error"}), 500
+
+    
     def process_buffered_messages(buffer_key):
         from your_flask_entrypoint import app  # if not already imported at the top
     
