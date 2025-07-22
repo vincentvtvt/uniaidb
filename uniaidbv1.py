@@ -995,14 +995,14 @@ def webhook():
             "created_at": datetime.now().isoformat()
         })
         
-        def process_buffered_messages(buffer_key):
-            # Only proceed if buffer still exists
+    def process_buffered_messages(buffer_key):
+        from your_flask_entrypoint import app  # if not already imported at the top
+    
+        with app.app_context():
             messages = MESSAGE_BUFFER.pop(buffer_key, [])
             if not messages:
                 return
-            # Compose a single customer message for AI
             combined_text = "\n".join(m['msg_text'] for m in messages if m['msg_text'])
-            # Optionally: fetch last 20 messages from DB and add this as latest
             history = get_latest_history(buffer_key[0], buffer_key[1], buffer_key[2])
             context_input = "\n".join([
                 f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}"
