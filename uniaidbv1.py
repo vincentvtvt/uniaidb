@@ -14,6 +14,13 @@ from pdf2image import convert_from_bytes
 import cv2
 import uuid
 import os
+from threading import Timer
+from collections import defaultdict
+
+# Message buffer: {(bot_id, user_phone, session_id): [msg1, msg2, ...]}
+MESSAGE_BUFFER = defaultdict(list)
+TIMER_BUFFER = {}
+
 
 # --- Universal JSON Prompt Builder ---
 def build_json_prompt(base_prompt, example_json, tag=None):
@@ -980,6 +987,45 @@ def webhook():
             session_id = str(session.id)
             save_message(bot.id, user_phone, session_id, "in", msg_text, raw_media_url=raw_media_url)
 
+        # Add to message buffer
+        buffer_key = (bot.id, user_phone, session_id)
+        MESSAGE_BUFFER[buffer_key].append({
+            "msg_text": msg_text, 
+            "raw_media_url": raw_media_url, 
+            "created_at": datetime.now().isoformat()
+        })
+        
+        def process_buffered_messages(buffer_key):
+            # Only proceed if buffer still exists
+            messages = MESSAGE_BUFFER.pop(buffer_key, [])
+            if not messages:
+                return
+            # Compose a single customer message for AI
+            combined_text = "\n".join(m['msg_text'] for m in messages if m['msg_text'])
+            # Optionally: fetch last 20 messages from DB and add this as latest
+            history = get_latest_history(buffer_key[0], buffer_key[1], buffer_key[2])
+            context_input = "\n".join([
+                f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}"
+                for m in history
+            ] + [f"User: {combined_text}"])
+            # Your reply logic as before
+            tool_id = decide_tool_with_manager_prompt(bot, history)
+            tool = None
+            if tool_id and tool_id.lower() != "default":
+                for t in get_active_tools_for_bot(bot.id):
+                    if t.tool_id == tool_id:
+                        tool = t
+                        break
+            ai_reply = compose_reply(bot, tool, history, context_input)
+            process_ai_reply_and_send(user_phone, ai_reply, device_id, bot_id=bot.id, user=user_phone, session_id=session_id)
+        
+        # Buffer timer logic
+        if buffer_key in TIMER_BUFFER and TIMER_BUFFER[buffer_key]:
+            TIMER_BUFFER[buffer_key].cancel()  # Reset the timer
+        TIMER_BUFFER[buffer_key] = Timer(30, process_buffered_messages, args=(buffer_key,))
+        TIMER_BUFFER[buffer_key].start()
+
+        return jsonify({"status": "buffered, will process in 30s"})
 
         # 3. Only save incoming message ONCE, after customer/session created
         history = get_latest_history(bot.id, user_phone, session_id)
