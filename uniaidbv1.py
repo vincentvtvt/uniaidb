@@ -196,13 +196,13 @@ def transcribe_audio_from_url(audio_url):
         return "[audio received, transcription failed]"
 
     def download_to_bytes(url):
-    """
-    Download any file from a URL and return its bytes.
-    Raises an exception if the request fails.
-    """
-    resp = requests.get(url, timeout=30)
-    resp.raise_for_status()
-    return resp.content
+        """
+        Download any file from a URL and return its bytes.
+        Raises an exception if the request fails.
+        """
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        return resp.content
 
 
 logger = logging.getLogger("UniAI")
