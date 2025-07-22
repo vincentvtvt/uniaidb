@@ -938,18 +938,18 @@ def close_session(session, reason, info: dict = None):
     db.session.commit()
 
 def process_buffered_messages(buffer_key):
-    
     with app.app_context():
+        bot_id, user_phone, session_id = buffer_key
+        bot = Bot.query.get(bot_id)
         messages = MESSAGE_BUFFER.pop(buffer_key, [])
         if not messages:
             return
         combined_text = "\n".join(m['msg_text'] for m in messages if m['msg_text'])
-        history = get_latest_history(buffer_key[0], buffer_key[1], buffer_key[2])
+        history = get_latest_history(bot_id, user_phone, session_id)
         context_input = "\n".join([
             f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}"
             for m in history
         ] + [f"User: {combined_text}"])
-        # Your reply logic as before
         tool_id = decide_tool_with_manager_prompt(bot, history)
         tool = None
         if tool_id and tool_id.lower() != "default":
