@@ -196,14 +196,29 @@ def transcribe_audio_from_url(audio_url):
         logger.error(f"[WHISPER ERROR] {e}")
         return "[audio received, transcription failed]"
 
-    def download_to_bytes(url):
-        """
-        Download any file from a URL and return its bytes.
-        Raises an exception if the request fails.
-        """
-        resp = requests.get(url, timeout=30)
-        resp.raise_for_status()
-        return resp.content
+def download_to_bytes(url):
+    """
+    Download a file from a URL and return bytes.
+    """
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+    content = resp.content
+    logger.info(f"[DOWNLOAD] {len(content)} bytes downloaded from {url}. First 16 bytes: {content[:16]}")
+    return content
+
+def get_filename_from_url_or_path(input_value, default_ext=".pdf"):
+    """
+    Extracts filename from a URL or file path, or generates a random one.
+    """
+    if isinstance(input_value, str):
+        base = os.path.basename(input_value.split("?")[0])
+        if "." in base:
+            return base
+        else:
+            return base + default_ext
+    else:
+        # If bytes or other, generate a random one
+        return f"file-{uuid.uuid4().hex}{default_ext}"
 
 
 logger = logging.getLogger("UniAI")
@@ -506,12 +521,12 @@ def upload_any_file_to_wassenger(file_path_or_bytes, filename=None, msg_type=Non
     Uploads any file (PDF, image, etc.) to Wassenger via multipart/form-data.
     Accepts local file path, URL, or raw bytes. Returns file_id.
     Always sets a user-friendly or random filename.
+    Logs and checks file signature before upload.
     """
     url = "https://api.wassenger.com/v1/files"
     headers = {"Token": WASSENGER_API_KEY}
 
-    # --- Step 1: Get file content and filename ---
-    # If input is a local file path or URL, extract filename
+    # Step 1: Get file content and filename
     if isinstance(file_path_or_bytes, str) and not file_path_or_bytes.startswith("http"):
         if not filename:
             filename = os.path.basename(file_path_or_bytes)
@@ -519,18 +534,9 @@ def upload_any_file_to_wassenger(file_path_or_bytes, filename=None, msg_type=Non
             file_bytes = f.read()
     elif isinstance(file_path_or_bytes, str) and file_path_or_bytes.startswith("http"):
         # Download file from URL
-        resp = requests.get(file_path_or_bytes, timeout=30)
-        resp.raise_for_status()
-        file_bytes = resp.content
-        # Extract filename from URL or generate one
+        file_bytes = download_to_bytes(file_path_or_bytes)
         if not filename:
-            base = os.path.basename(file_path_or_bytes.split("?")[0])
-            if "." in base:
-                filename = base
-            else:
-                # Guess extension from msg_type
-                ext = ".pdf" if msg_type == "media" else ".jpg"
-                filename = base + ext
+            filename = get_filename_from_url_or_path(file_path_or_bytes, default_ext=".pdf" if msg_type == "media" else ".jpg")
     else:
         # Assume raw bytes (from memory), generate random filename if not provided
         file_bytes = file_path_or_bytes
@@ -538,14 +544,25 @@ def upload_any_file_to_wassenger(file_path_or_bytes, filename=None, msg_type=Non
             ext = ".pdf" if msg_type == "media" else ".jpg"
             filename = f"file-{uuid.uuid4().hex}{ext}"
 
+    # Debug: log file signature
+    logger.debug(f"[UPLOAD DEBUG] filename: {filename}, size: {len(file_bytes)}, first 16 bytes: {file_bytes[:16]}")
+    # Signature check (PDF, JPG, PNG)
+    if filename.lower().endswith('.pdf') and not file_bytes.startswith(b'%PDF'):
+        logger.error(f"[UPLOAD DEBUG] This is NOT a valid PDF file! (wrong header)")
+
+    if filename.lower().endswith(('.jpg', '.jpeg')) and not file_bytes.startswith(b'\xff\xd8'):
+        logger.warning(f"[UPLOAD DEBUG] This is NOT a valid JPG file! (wrong header)")
+
+    if filename.lower().endswith('.png') and not file_bytes.startswith(b'\x89PNG'):
+        logger.warning(f"[UPLOAD DEBUG] This is NOT a valid PNG file! (wrong header)")
+
     files = {"file": (filename, file_bytes)}
 
-    # --- Step 2: Upload to Wassenger ---
+    # Step 2: Upload to Wassenger
     try:
         resp = requests.post(url, headers=headers, files=files, timeout=30)
         if resp.status_code == 409:
             logger.warning(f"[MEDIA UPLOAD] Duplicate file detected (409 Conflict). {filename} already uploaded recently.")
-            # Wassenger does NOT return file_id on 409. You may want to implement your own file_id cache by hash.
             return None
         resp.raise_for_status()
         resp_json = resp.json()
@@ -561,7 +578,7 @@ def upload_any_file_to_wassenger(file_path_or_bytes, filename=None, msg_type=Non
     except Exception as e:
         logger.error(f"[MEDIA UPLOAD FAIL] Wassenger /files error: {e}")
         return None
-
+        
 def send_wassenger_reply(phone, text, device_id, delay_seconds=5, msg_type="text", caption=None):
     """
     Always upload image/pdf/media to Wassenger unless text is already a file_id.
