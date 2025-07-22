@@ -705,7 +705,7 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
         parsed = {}
 
     if parsed.get("instruction") in ("close_session_and_notify_sales", "close_session_drop"):
-    return process_ai_reply_and_send(user_phone, ai_reply, device_id, bot_id=bot.id, user=user_phone, session_id=session_id)
+        return process_ai_reply_and_send(user_phone, ai_reply, device_id, bot_id=bot.id, user=user_phone, session_id=session_id)
 
 
 
