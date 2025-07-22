@@ -987,14 +987,14 @@ def webhook():
             session_id = str(session.id)
             save_message(bot.id, user_phone, session_id, "in", msg_text, raw_media_url=raw_media_url)
 
-        # Add to message buffer
-        buffer_key = (bot.id, user_phone, session_id)
-        MESSAGE_BUFFER[buffer_key].append({
-            "msg_text": msg_text, 
-            "raw_media_url": raw_media_url, 
-            "created_at": datetime.now().isoformat()
-        })
-        
+            # Add to message buffer
+            buffer_key = (bot.id, user_phone, session_id)
+            MESSAGE_BUFFER[buffer_key].append({
+                "msg_text": msg_text, 
+                "raw_media_url": raw_media_url, 
+                "created_at": datetime.now().isoformat()
+            })
+            
     def process_buffered_messages(buffer_key):
         from your_flask_entrypoint import app  # if not already imported at the top
     
