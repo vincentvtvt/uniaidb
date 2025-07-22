@@ -495,12 +495,10 @@ def send_wassenger_reply(phone, text, device_id, delay_seconds=5, msg_type="text
         payload["schedule"] = {"delay": delay_seconds}
     elif msg_type == "image":
         if isinstance(text, str) and text.startswith("http"):
-            # Send via URL
             payload["media"] = {"url": text}
             if caption:
                 payload["message"] = caption
         else:
-            # Send as bytes (upload to Wassenger first)
             file_id = upload_media_to_wassenger(text)
             if not file_id:
                 logger.error("[SEND IMAGE] Failed to upload image to Wassenger")
@@ -508,9 +506,17 @@ def send_wassenger_reply(phone, text, device_id, delay_seconds=5, msg_type="text
             payload["media"] = {"file": file_id}
             if caption:
                 payload["message"] = caption
+    elif msg_type == "media":  # PATCH: handle documents, pdfs, videos
+        payload["media"] = {"url": text}
+        if caption:
+            payload["message"] = caption
     else:
         logger.error(f"Unsupported msg_type: {msg_type}")
         return
+
+    # Remove keys with empty values (optional, can be before send)
+    payload = {k: v for k, v in payload.items() if v is not None}
+    logger.debug(f"[WASSENGER PAYLOAD]: {payload}")
 
     try:
         resp = requests.post(url, json=payload, headers=headers, timeout=15)
@@ -521,14 +527,6 @@ def send_wassenger_reply(phone, text, device_id, delay_seconds=5, msg_type="text
         logger.error(f"[SEND WASSENGER ERROR] {e}")
         return None
 
-    # Remove keys with empty values
-    payload = {k: v for k, v in payload.items() if v is not None}
-    logger.debug(f"[WASSENGER PAYLOAD]: {payload}")
-    try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=20)
-        logger.info(f"Wassenger response: {resp.text}")
-    except Exception as e:
-        logger.error(f"WASSENGER send failed: {e}")
 
 
 
