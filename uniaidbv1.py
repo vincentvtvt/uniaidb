@@ -347,28 +347,28 @@ def extract_text_from_message(msg):
 
     # --- Audio (Whisper + GPT summary) ---
     elif msg_type == "audio":
-    audio_url = get_media_url(media)
-    if audio_url:
-        try:
-            transcript = transcribe_audio_from_url(audio_url)
-            if transcript and transcript.lower() not in ("[audio received, no url]", "[audio received, transcription failed]"):
-                gpt_prompt = (
-                    "This is a WhatsApp audio message transcribed as: "
-                    f"'{transcript}'. Reply in a short, natural phrase, as if you're the user."
-                )
-                result = openai.chat.completions.create(
-                    model="gpt-4o",
-                    messages=[{"role": "system", "content": gpt_prompt}],
-                    max_tokens=64
-                )
-                msg_text = result.choices[0].message.content.strip()
-                return {"transcript": transcript, "gpt_reply": msg_text}, audio_url
-            else:
-                return {"transcript": transcript or "[Audio received, no speech detected]", "gpt_reply": None}, audio_url
-        except Exception as e:
-            logger.error(f"[AUDIO MEANING] {e}")
-            return {"transcript": "[Audio received, error]", "gpt_reply": None}, audio_url
-    return {"transcript": "[Audio received, no url]", "gpt_reply": None}, None
+        audio_url = get_media_url(media)
+        if audio_url:
+            try:
+                transcript = transcribe_audio_from_url(audio_url)
+                if transcript and transcript.lower() not in ("[audio received, no url]", "[audio received, transcription failed]"):
+                    gpt_prompt = (
+                        "This is a WhatsApp audio message transcribed as: "
+                        f"'{transcript}'. Reply in a short, natural phrase, as if you're the user."
+                    )
+                    result = openai.chat.completions.create(
+                        model="gpt-4o",
+                        messages=[{"role": "system", "content": gpt_prompt}],
+                        max_tokens=64
+                    )
+                    msg_text = result.choices[0].message.content.strip()
+                    return {"transcript": transcript, "gpt_reply": msg_text}, audio_url
+                else:
+                    return {"transcript": transcript or "[Audio received, no speech detected]", "gpt_reply": None}, audio_url
+            except Exception as e:
+                logger.error(f"[AUDIO MEANING] {e}")
+                return {"transcript": "[Audio received, error]", "gpt_reply": None}, audio_url
+        return {"transcript": "[Audio received, no url]", "gpt_reply": None}, None
 
 
     # --- Document (PDF/image: Vision, else filename) ---
@@ -843,13 +843,24 @@ def webhook():
             logger.error(f"[ERROR] No bot found for phone {bot_phone}")
             return jsonify({"error": "Bot not found"}), 404
 
-        msg_text, raw_media_url = extract_text_from_message(msg)
+        msg_type = msg.get("type")
+        if msg_type == "audio":
+            extract_result, raw_media_url = extract_text_from_message(msg)
+            transcript = extract_result["transcript"]
+            gpt_reply = extract_result["gpt_reply"]
+            # Save the transcript as the 'in' message
+            customer = find_or_create_customer(user_phone)
+            session = get_or_create_session(customer.id, bot.id)
+            session_id = str(session.id)
+            save_message(bot.id, user_phone, session_id, "in", transcript, raw_media_url=raw_media_url)
+            msg_text = gpt_reply or transcript  # For downstream use (AI, etc)
+        else:
+            msg_text, raw_media_url = extract_text_from_message(msg)
+            customer = find_or_create_customer(user_phone)
+            session = get_or_create_session(customer.id, bot.id)
+            session_id = str(session.id)
+            save_message(bot.id, user_phone, session_id, "in", msg_text, raw_media_url=raw_media_url)
 
-        # For all message types, after finding customer and session, always save first
-        customer = find_or_create_customer(user_phone)
-        session = get_or_create_session(customer.id, bot.id)
-        session_id = str(session.id)
-        save_message(bot.id, user_phone, session_id, "in", msg_text, raw_media_url=raw_media_url)
 
         # 3. Only save incoming message ONCE, after customer/session created
         history = get_latest_history(bot.id, user_phone, session_id)
