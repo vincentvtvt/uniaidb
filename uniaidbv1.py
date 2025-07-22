@@ -441,32 +441,6 @@ def get_template_content(template_id):
         return []
     return template.content if isinstance(template.content, list) else json.loads(template.content)
 
-def upload_media_to_wassenger(img_url_or_bytes):
-    """
-    Uploads image to Wassenger via URL or bytes, returns file_id.
-    Accepts either a direct image URL or raw bytes.
-    """
-    url = "https://api.wassenger.com/v1/files"
-    headers = {"Content-Type": "application/json", "Token": WASSENGER_API_KEY}
-    # If string, treat as URL; else assume bytes and upload as base64
-    if isinstance(img_url_or_bytes, str):
-        payload = {"url": img_url_or_bytes}
-    else:
-        # For local bytes, convert to base64 and use payload {'data': ...}
-        import base64
-        payload = {"data": base64.b64encode(img_url_or_bytes).decode()}
-    try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=15)
-        resp.raise_for_status()
-        files = resp.json()
-        if files and isinstance(files, list) and files[0].get('id'):
-            return files[0]['id']
-        else:
-            logger.error(f"[MEDIA UPLOAD FAIL] Wassenger /files bad response: {resp.text}")
-    except Exception as e:
-        logger.error(f"[MEDIA UPLOAD FAIL] Wassenger /files error: {e}")
-    return None
-
 def download_wassenger_media(url):
     """
     Downloads a media file from Wassenger using API Key authentication.
