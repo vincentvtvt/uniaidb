@@ -958,8 +958,9 @@ def process_buffered_messages(buffer_key):
                 if t.tool_id == tool_id:
                     tool = t
                     break
-         ai_reply = compose_reply(bot, tool, history, context_input)
-         process_ai_reply_and_send(user_phone, ai_reply, device_id, bot_id=bot.id, user=user_phone, session_id=session_id)
+        ai_reply = compose_reply(bot, tool, history, context_input)
+        process_ai_reply_and_send(user_phone, ai_reply, device_id, bot_id=bot.id, user=user_phone, session_id=session_id)
+
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
