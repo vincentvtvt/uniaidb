@@ -937,6 +937,30 @@ def close_session(session, reason, info: dict = None):
     session.context['close_reason'] = reason
     db.session.commit()
 
+def process_buffered_messages(buffer_key):
+    from your_flask_entrypoint import app  # if not already imported at the top
+    
+    with app.app_context():
+        messages = MESSAGE_BUFFER.pop(buffer_key, [])
+        if not messages:
+            return
+        combined_text = "\n".join(m['msg_text'] for m in messages if m['msg_text'])
+        history = get_latest_history(buffer_key[0], buffer_key[1], buffer_key[2])
+        context_input = "\n".join([
+            f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}"
+            for m in history
+        ] + [f"User: {combined_text}"])
+        # Your reply logic as before
+        tool_id = decide_tool_with_manager_prompt(bot, history)
+        tool = None
+        if tool_id and tool_id.lower() != "default":
+            for t in get_active_tools_for_bot(bot.id):
+                if t.tool_id == tool_id:
+                    tool = t
+                    break
+         ai_reply = compose_reply(bot, tool, history, context_input)
+         process_ai_reply_and_send(user_phone, ai_reply, device_id, bot_id=bot.id, user=user_phone, session_id=session_id)
+
 @app.route('/webhook', methods=['POST'])
 def webhook():
     logger.info("[WEBHOOK] Received POST /webhook")
@@ -988,43 +1012,24 @@ def webhook():
             save_message(bot.id, user_phone, session_id, "in", msg_text, raw_media_url=raw_media_url)
 
             # Add to message buffer
-            buffer_key = (bot.id, user_phone, session_id)
-            MESSAGE_BUFFER[buffer_key].append({
-                "msg_text": msg_text, 
-                "raw_media_url": raw_media_url, 
-                "created_at": datetime.now().isoformat()
-            })
-            return jsonify({"status": "buffered, will process in 30s"})
+        # Add to message buffer and start/refresh the timer
+        buffer_key = (bot.id, user_phone, session_id)
+        MESSAGE_BUFFER[buffer_key].append({
+            "msg_text": msg_text,
+            "raw_media_url": raw_media_url,
+            "created_at": datetime.now().isoformat()
+        })
 
-        except Exception as e:
-            logger.error(f"ERROR: {e}")
-            # ... your error handling ...
-            return jsonify({"error": "some error"}), 500
+        # --- Start or reset the 30s buffer timer for this key ---
+        if buffer_key in TIMER_BUFFER and TIMER_BUFFER[buffer_key]:
+            TIMER_BUFFER[buffer_key].cancel()
+        TIMER_BUFFER[buffer_key] = Timer(30, process_buffered_messages, args=(buffer_key,))
+        TIMER_BUFFER[buffer_key].start()
+
+        return jsonify({"status": "buffered, will process in 30s"})
 
     
-    def process_buffered_messages(buffer_key):
-        from your_flask_entrypoint import app  # if not already imported at the top
-    
-        with app.app_context():
-            messages = MESSAGE_BUFFER.pop(buffer_key, [])
-            if not messages:
-                return
-            combined_text = "\n".join(m['msg_text'] for m in messages if m['msg_text'])
-            history = get_latest_history(buffer_key[0], buffer_key[1], buffer_key[2])
-            context_input = "\n".join([
-                f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}"
-                for m in history
-            ] + [f"User: {combined_text}"])
-            # Your reply logic as before
-            tool_id = decide_tool_with_manager_prompt(bot, history)
-            tool = None
-            if tool_id and tool_id.lower() != "default":
-                for t in get_active_tools_for_bot(bot.id):
-                    if t.tool_id == tool_id:
-                        tool = t
-                        break
-            ai_reply = compose_reply(bot, tool, history, context_input)
-            process_ai_reply_and_send(user_phone, ai_reply, device_id, bot_id=bot.id, user=user_phone, session_id=session_id)
+
         
         # Buffer timer logic
         if buffer_key in TIMER_BUFFER and TIMER_BUFFER[buffer_key]:
