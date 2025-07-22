@@ -705,40 +705,8 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
         parsed = {}
 
     if parsed.get("instruction") in ("close_session_and_notify_sales", "close_session_drop"):
-    # --- UNIVERSAL BACKEND CLOSING BLOCK ---
+    return process_ai_reply_and_send(user_phone, ai_reply, device_id, bot_id=bot.id, user=user_phone, session_id=session_id)
 
-        # 1. Gather all context to save (ignore reserved fields)
-        info_to_save = {}
-        for k, v in parsed.items():
-            if k not in ("message", "notification", "instruction") and v is not None:
-                info_to_save[k] = v
-    
-        # 2. Set close reason (won/drop)
-        close_reason = parsed.get("close_reason")
-        if not close_reason:
-            close_reason = "won" if parsed["instruction"] == "close_session_and_notify_sales" else "drop"
-    
-        # 3. Find and update the active session for this customer + bot
-        session_obj = (
-            db.session.query(Session)
-            .filter_by(bot_id=bot.id, customer_id=customer.id, status="open")
-            .order_by(Session.started_at.desc())
-            .first()
-        )
-        if session_obj:
-            session_obj.status = "closed"
-            session_obj.ended_at = datetime.now()
-            session_obj.context = {**session_obj.context, **info_to_save, "close_reason": close_reason}
-            db.session.commit()
-            logger.info(f"[SESSION] Closed session for user {customer_phone}, reason: {close_reason}, info: {info_to_save}")
-        else:
-            logger.warning(f"[SESSION] Tried to close session, but none found for user {customer_phone}, bot {bot.id}")
-
-        # 4. Only notify group for won/closed sales
-        if parsed["instruction"] == "close_session_and_notify_sales" and "notification" in parsed:
-            notify_sales_group(bot, parsed["notification"])
-    
-        return jsonify({"status": "session closed", "reason": close_reason})
 
 
     # --- TEMPLATE PROCESSING ---
