@@ -480,11 +480,59 @@ def download_wassenger_media(url):
         logger.error(f"[WASSENGER MEDIA DOWNLOAD ERROR] {e}")
         return None
 
+def upload_and_send_media(recipient, file_url_or_path, device_id, caption=None, msg_type=None, delay_seconds=5):
+    """
+    Universal helper: uploads image or PDF (from URL or file path), then sends via Wassenger.
+    - recipient: phone in E164 ('+6012...') or group ('....@g.us')
+    - file_url_or_path: remote URL or local path
+    - device_id: Wassenger device ID
+    - caption: WhatsApp message caption (optional)
+    - msg_type: "image" or "media" (if None, auto-detect)
+    """
+    # 1. Upload file to Wassenger, get file_id
+    filename = None
+    # Guess msg_type if not provided
+    if not msg_type:
+        # Simple guess by extension
+        if isinstance(file_url_or_path, str):
+            if file_url_or_path.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+                msg_type = "image"
+            elif file_url_or_path.lower().endswith(('.pdf', '.doc', '.docx')):
+                msg_type = "media"
+            else:
+                msg_type = "media"
+        else:
+            msg_type = "media"
+
+    # Upload (if not already a file id)
+    if isinstance(file_url_or_path, str) and len(file_url_or_path) == 24 and file_url_or_path.isalnum():
+        file_id = file_url_or_path  # Already a file id
+    else:
+        # Download/upload
+        file_id = upload_any_file_to_wassenger(file_url_or_path)
+
+    if not file_id:
+        logger.error(f"[UPLOAD & SEND] Failed to upload file for recipient {recipient}")
+        return None
+
+    # 2. Send via Wassenger
+    return send_wassenger_reply(
+        recipient,
+        file_id,
+        device_id,
+        msg_type=msg_type,
+        caption=caption,
+        delay_seconds=delay_seconds
+    )
+
+
 
 def send_wassenger_reply(phone, text, device_id, delay_seconds=5, msg_type="text", caption=None):
     url = "https://api.wassenger.com/v1/messages"
     headers = {"Content-Type": "application/json", "Token": WASSENGER_API_KEY}
     payload = {"device": device_id}
+
+    # Recipient: phone or group
     if isinstance(phone, str) and phone.endswith("@g.us"):
         payload["group"] = phone
     else:
@@ -493,28 +541,43 @@ def send_wassenger_reply(phone, text, device_id, delay_seconds=5, msg_type="text
     if msg_type == "text":
         payload["message"] = text
         payload["schedule"] = {"delay": delay_seconds}
+
     elif msg_type == "image":
-        if isinstance(text, str) and text.startswith("http"):
+        # Use file ID if already uploaded, else try to upload or send by URL
+        if isinstance(text, str) and len(text) == 24 and text.isalnum():
+            payload["media"] = {"file": text}
+        elif isinstance(text, str) and text.startswith("http"):
             payload["media"] = {"url": text}
-            if caption:
-                payload["message"] = caption
         else:
-            file_id = upload_media_to_wassenger(text)
+            # Assume local file path or bytes, upload and use file ID
+            file_id = upload_any_file_to_wassenger(text)
             if not file_id:
                 logger.error("[SEND IMAGE] Failed to upload image to Wassenger")
                 return
             payload["media"] = {"file": file_id}
-            if caption:
-                payload["message"] = caption
-    elif msg_type == "media":  # PATCH: handle documents, pdfs, videos
-        payload["media"] = {"url": text}
         if caption:
             payload["message"] = caption
+
+    elif msg_type == "media":  # PATCH: handle documents, pdfs, videos
+        # Use file ID if already uploaded, else try to send by URL
+        if isinstance(text, str) and len(text) == 24 and text.isalnum():
+            payload["media"] = {"file": text}
+        elif isinstance(text, str) and text.startswith("http"):
+            payload["media"] = {"url": text}
+        else:
+            # Assume local file path or bytes, upload and use file ID
+            file_id = upload_any_file_to_wassenger(text)
+            if not file_id:
+                logger.error("[SEND MEDIA] Failed to upload file to Wassenger")
+                return
+            payload["media"] = {"file": file_id}
+        if caption:
+            payload["message"] = caption
+
     else:
         logger.error(f"Unsupported msg_type: {msg_type}")
         return
 
-    # Remove keys with empty values (optional, can be before send)
     payload = {k: v for k, v in payload.items() if v is not None}
     logger.debug(f"[WASSENGER PAYLOAD]: {payload}")
 
@@ -526,9 +589,6 @@ def send_wassenger_reply(phone, text, device_id, delay_seconds=5, msg_type="text
     except Exception as e:
         logger.error(f"[SEND WASSENGER ERROR] {e}")
         return None
-
-
-
 
 def notify_sales_group(bot, message, error=False):
     import json
