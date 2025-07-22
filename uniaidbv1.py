@@ -712,40 +712,43 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
 
 
     # --- TEMPLATE PROCESSING ---
-    for idx, part in enumerate(template_content):
-        content_type = part.get("type")
-        content_value = part.get("content")
-        if content_type == "text":
-            send_wassenger_reply(customer_phone, content_value, device_id, delay_seconds=5)
-            if bot_id and user and session_id:
-                save_message(bot_id, user, session_id, "out", content_value)
-        elif content_type == "image":
-            caption = part.get("caption") or None
-            send_wassenger_reply(
-                customer_phone,
-                content_value,
-                device_id,
-                msg_type="image",
-                caption=caption
-            )
-            if bot_id and user and session_id:
-                save_message(bot_id, user, session_id, "out", "[Image sent]")
-        elif content_type == "document":
-            caption = part.get("caption") or None
-            send_wassenger_reply(
-                customer_phone,
-                content_value,
-                device_id,
-                msg_type="media",  # <--- THIS IS THE KEY: msg_type must be 'media' for PDFs/docs
-                caption=caption
-            )
-            if bot_id and user and session_id:
-                save_message(bot_id, user, session_id, "out", "[PDF sent]")
-        # Optionally: handle other types (video, audio, etc.) here
-    
-        # Always wait for a delay between template parts
-        if idx < len(template_content) - 1:
-            time.sleep(5)
+    if "template" in parsed:
+        template_id = parsed["template"]
+        template_content = get_template_content(template_id)
+        for idx, part in enumerate(template_content):
+            content_type = part.get("type")
+            content_value = part.get("content")
+            if content_type == "text":
+                send_wassenger_reply(customer_phone, content_value, device_id, delay_seconds=5)
+                if bot_id and user and session_id:
+                    save_message(bot_id, user, session_id, "out", content_value)
+            elif content_type == "image":
+                caption = part.get("caption") or None
+                send_wassenger_reply(
+                    customer_phone,
+                    content_value,
+                    device_id,
+                    msg_type="image",
+                    caption=caption
+                )
+                if bot_id and user and session_id:
+                    save_message(bot_id, user, session_id, "out", "[Image sent]")
+            elif content_type == "document":
+                caption = part.get("caption") or None
+                send_wassenger_reply(
+                    customer_phone,
+                    content_value,
+                    device_id,
+                    msg_type="media",  # <--- THIS IS THE KEY: msg_type must be 'media' for PDFs/docs
+                    caption=caption
+                )
+                if bot_id and user and session_id:
+                    save_message(bot_id, user, session_id, "out", "[PDF sent]")
+            # Optionally: handle other types (video, audio, etc.) here
+        
+            # Always wait for a delay between template parts
+            if idx < len(template_content) - 1:
+                time.sleep(5)
 
     # --- MESSAGE PARTS ---
     msg_lines = []
