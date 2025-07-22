@@ -1,4 +1,3 @@
-import os
 import re
 import logging
 import time
@@ -13,6 +12,8 @@ from PIL import Image
 from io import BytesIO
 from pdf2image import convert_from_bytes
 import cv2
+import uuid
+import os
 
 # --- Universal JSON Prompt Builder ---
 def build_json_prompt(base_prompt, example_json, tag=None):
@@ -500,31 +501,54 @@ def download_to_bytes(url):
     resp.raise_for_status()
     return resp.content
 
-def upload_any_file_to_wassenger(file_path_or_bytes, filename=None):
+def upload_any_file_to_wassenger(file_path_or_bytes, filename=None, msg_type=None):
     """
     Uploads any file (PDF, image, etc.) to Wassenger via multipart/form-data.
-    Accepts local file path or raw bytes. Returns file_id.
+    Accepts local file path, URL, or raw bytes. Returns file_id.
+    Always sets a user-friendly or random filename.
     """
     url = "https://api.wassenger.com/v1/files"
     headers = {"Token": WASSENGER_API_KEY}
-    files = None
 
-    # If input is a file path (string but not a URL), open as file
+    # --- Step 1: Get file content and filename ---
+    # If input is a local file path or URL, extract filename
     if isinstance(file_path_or_bytes, str) and not file_path_or_bytes.startswith("http"):
         if not filename:
             filename = os.path.basename(file_path_or_bytes)
-        files = {"file": (filename, open(file_path_or_bytes, "rb"))}
-    else:
-        # If it's bytes or downloaded content, or you want to force a filename
+        with open(file_path_or_bytes, "rb") as f:
+            file_bytes = f.read()
+    elif isinstance(file_path_or_bytes, str) and file_path_or_bytes.startswith("http"):
+        # Download file from URL
+        resp = requests.get(file_path_or_bytes, timeout=30)
+        resp.raise_for_status()
+        file_bytes = resp.content
+        # Extract filename from URL or generate one
         if not filename:
-            filename = "file"
-        files = {"file": (filename, file_path_or_bytes)}
+            base = os.path.basename(file_path_or_bytes.split("?")[0])
+            if "." in base:
+                filename = base
+            else:
+                # Guess extension from msg_type
+                ext = ".pdf" if msg_type == "media" else ".jpg"
+                filename = base + ext
+    else:
+        # Assume raw bytes (from memory), generate random filename if not provided
+        file_bytes = file_path_or_bytes
+        if not filename:
+            ext = ".pdf" if msg_type == "media" else ".jpg"
+            filename = f"file-{uuid.uuid4().hex}{ext}"
 
+    files = {"file": (filename, file_bytes)}
+
+    # --- Step 2: Upload to Wassenger ---
     try:
         resp = requests.post(url, headers=headers, files=files, timeout=30)
+        if resp.status_code == 409:
+            logger.warning(f"[MEDIA UPLOAD] Duplicate file detected (409 Conflict). {filename} already uploaded recently.")
+            # Wassenger does NOT return file_id on 409. You may want to implement your own file_id cache by hash.
+            return None
         resp.raise_for_status()
         resp_json = resp.json()
-        # Wassenger can return a dict (single file) or list (batch)
         if isinstance(resp_json, list) and resp_json and resp_json[0].get('id'):
             file_id = resp_json[0]['id']
         elif isinstance(resp_json, dict) and resp_json.get('id'):
@@ -537,7 +561,6 @@ def upload_any_file_to_wassenger(file_path_or_bytes, filename=None):
     except Exception as e:
         logger.error(f"[MEDIA UPLOAD FAIL] Wassenger /files error: {e}")
         return None
-
 
 def send_wassenger_reply(phone, text, device_id, delay_seconds=5, msg_type="text", caption=None):
     """
