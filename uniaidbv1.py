@@ -528,6 +528,11 @@ def upload_and_send_media(recipient, file_url_or_path, device_id, caption=None, 
 
 
 def send_wassenger_reply(phone, text, device_id, delay_seconds=5, msg_type="text", caption=None):
+    """
+    Always upload image/pdf/media to Wassenger unless text is already a file_id.
+    - For "media" or "image": handles url, file path, or bytes (auto-upload)
+    - For "text": sends as text
+    """
     url = "https://api.wassenger.com/v1/messages"
     headers = {"Content-Type": "application/json", "Token": WASSENGER_API_KEY}
     payload = {"device": device_id}
@@ -542,33 +547,27 @@ def send_wassenger_reply(phone, text, device_id, delay_seconds=5, msg_type="text
         payload["message"] = text
         payload["schedule"] = {"delay": delay_seconds}
 
-    elif msg_type == "image":
-        # Use file ID if already uploaded, else try to upload or send by URL
+    elif msg_type in ("image", "media"):
+        # Always upload unless text is already a file_id
         if isinstance(text, str) and len(text) == 24 and text.isalnum():
+            # Wassenger file id, use directly
             payload["media"] = {"file": text}
-        elif isinstance(text, str) and text.startswith("http"):
-            payload["media"] = {"url": text}
         else:
-            # Assume local file path or bytes, upload and use file ID
-            file_id = upload_any_file_to_wassenger(text)
+            # Upload any URL, file path, or bytes and get file_id
+            if isinstance(text, str) and text.startswith("http"):
+                # Download to bytes
+                file_bytes = download_to_bytes(text)
+                # Try to determine file extension/type
+                if msg_type == "image":
+                    filename = "image.jpg"
+                else:
+                    filename = "document.pdf"
+                file_id = upload_any_file_to_wassenger(file_bytes, filename=filename)
+            else:
+                # Local file path or bytes
+                file_id = upload_any_file_to_wassenger(text)
             if not file_id:
-                logger.error("[SEND IMAGE] Failed to upload image to Wassenger")
-                return
-            payload["media"] = {"file": file_id}
-        if caption:
-            payload["message"] = caption
-
-    elif msg_type == "media":  # PATCH: handle documents, pdfs, videos
-        # Use file ID if already uploaded, else try to send by URL
-        if isinstance(text, str) and len(text) == 24 and text.isalnum():
-            payload["media"] = {"file": text}
-        elif isinstance(text, str) and text.startswith("http"):
-            payload["media"] = {"url": text}
-        else:
-            # Assume local file path or bytes, upload and use file ID
-            file_id = upload_any_file_to_wassenger(text)
-            if not file_id:
-                logger.error("[SEND MEDIA] Failed to upload file to Wassenger")
+                logger.error(f"[SEND {msg_type.upper()}] Failed to upload to Wassenger")
                 return
             payload["media"] = {"file": file_id}
         if caption:
