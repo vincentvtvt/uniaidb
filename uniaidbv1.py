@@ -938,7 +938,6 @@ def close_session(session, reason, info: dict = None):
     db.session.commit()
 
 def process_buffered_messages(buffer_key):
-    from your_flask_entrypoint import app  # if not already imported at the top
     
     with app.app_context():
         messages = MESSAGE_BUFFER.pop(buffer_key, [])
