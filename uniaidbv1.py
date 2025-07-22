@@ -832,6 +832,15 @@ def webhook():
         msg_type = msg.get("type")
         if msg.get("flow") == "outbound":
             return jsonify({"status": "ignored"}), 200
+        # Ignore all group messages (from group chat)
+        if (
+            "@g.us" in msg.get("from", "")  # sender is a group
+            or (msg.get("chat", {}).get("type") == "group")  # chat type is group
+            or msg.get("meta", {}).get("isGroup") is True    # meta says is group
+        ):
+            logger.info(f"[WEBHOOK] Ignored group message from: {msg.get('from')}")
+            return jsonify({"status": "ignored_group"}), 200
+        
 
         bot_phone = msg.get("toNumber")
         user_phone = msg.get("fromNumber")
