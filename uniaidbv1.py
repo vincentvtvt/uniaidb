@@ -181,13 +181,23 @@ def extract_text_from_image(img_url, prompt=None):
     return result.choices[0].message.content.strip()
 
 def transcribe_audio_from_url(audio_url):
-    audio_bytes = download_file(audio_url)
+    # Use Wassenger media download for correct auth
+    audio_bytes = download_wassenger_media(audio_url)
+    if not audio_bytes or len(audio_bytes) < 1024:
+        logger.error("[AUDIO DOWNLOAD] Failed or too small")
+        return "[audio received, transcription failed]"
     temp_path = "/tmp/temp_audio.ogg"
     with open(temp_path, "wb") as f:
         f.write(audio_bytes)
-    with open(temp_path, "rb") as audio_file:
-        transcript = openai.audio.transcriptions.create(model="whisper-1", file=audio_file)
-    return transcript.text.strip()
+    try:
+        with open(temp_path, "rb") as audio_file:
+            transcript = openai.audio.transcriptions.create(model="whisper-1", file=audio_file)
+        logger.info(f"[WHISPER] Transcript: {transcript.text.strip()}")
+        return transcript.text.strip()
+    except Exception as e:
+        logger.error(f"[WHISPER ERROR] {e}")
+        return "[audio received, transcription failed]"
+
 
 import re
 from PIL import Image
