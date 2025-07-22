@@ -526,7 +526,43 @@ def download_to_bytes(url):
     resp.raise_for_status()
     return resp.content
 
+def upload_any_file_to_wassenger(file_path_or_bytes, filename=None):
+    """
+    Uploads any file (PDF, image, etc.) to Wassenger via multipart/form-data.
+    Accepts local file path or raw bytes. Returns file_id.
+    """
+    url = "https://api.wassenger.com/v1/files"
+    headers = {"Token": WASSENGER_API_KEY}
+    files = None
 
+    # If input is a file path (string but not a URL), open as file
+    if isinstance(file_path_or_bytes, str) and not file_path_or_bytes.startswith("http"):
+        if not filename:
+            filename = os.path.basename(file_path_or_bytes)
+        files = {"file": (filename, open(file_path_or_bytes, "rb"))}
+    else:
+        # If it's bytes or downloaded content, or you want to force a filename
+        if not filename:
+            filename = "file"
+        files = {"file": (filename, file_path_or_bytes)}
+
+    try:
+        resp = requests.post(url, headers=headers, files=files, timeout=30)
+        resp.raise_for_status()
+        resp_json = resp.json()
+        # Wassenger can return a dict (single file) or list (batch)
+        if isinstance(resp_json, list) and resp_json and resp_json[0].get('id'):
+            file_id = resp_json[0]['id']
+        elif isinstance(resp_json, dict) and resp_json.get('id'):
+            file_id = resp_json['id']
+        else:
+            logger.error(f"[MEDIA UPLOAD FAIL] Wassenger /files bad response: {resp.text}")
+            return None
+        logger.info(f"[MEDIA UPLOAD SUCCESS] file_id: {file_id} for {filename}")
+        return file_id
+    except Exception as e:
+        logger.error(f"[MEDIA UPLOAD FAIL] Wassenger /files error: {e}")
+        return None
 
 
 def send_wassenger_reply(phone, text, device_id, delay_seconds=5, msg_type="text", caption=None):
