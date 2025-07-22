@@ -14,9 +14,6 @@ from io import BytesIO
 from pdf2image import convert_from_bytes
 import cv2
 
-
-
-
 # --- Universal JSON Prompt Builder ---
 def build_json_prompt(base_prompt, example_json, tag=None):
     tag_name = tag if tag else "ExampleOutput"
@@ -198,11 +195,15 @@ def transcribe_audio_from_url(audio_url):
         logger.error(f"[WHISPER ERROR] {e}")
         return "[audio received, transcription failed]"
 
+    def download_to_bytes(url):
+    """
+    Download any file from a URL and return its bytes.
+    Raises an exception if the request fails.
+    """
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+    return resp.content
 
-import re
-from PIL import Image
-from io import BytesIO
-import logging
 
 logger = logging.getLogger("UniAI")
 
@@ -481,41 +482,36 @@ def download_wassenger_media(url):
         return None
 
 def upload_and_send_media(recipient, file_url_or_path, device_id, caption=None, msg_type=None, delay_seconds=5):
-    """
-    Universal helper: uploads image or PDF (from URL or file path), then sends via Wassenger.
-    - recipient: phone in E164 ('+6012...') or group ('....@g.us')
-    - file_url_or_path: remote URL or local path
-    - device_id: Wassenger device ID
-    - caption: WhatsApp message caption (optional)
-    - msg_type: "image" or "media" (if None, auto-detect)
-    """
-    # 1. Upload file to Wassenger, get file_id
+    # Guess file extension/type for filename and msg_type
     filename = None
-    # Guess msg_type if not provided
     if not msg_type:
-        # Simple guess by extension
         if isinstance(file_url_or_path, str):
-            if file_url_or_path.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+            ext = os.path.splitext(file_url_or_path.split("?")[0])[1].lower()
+            if ext in ('.jpg', '.jpeg', '.png', '.webp'):
                 msg_type = "image"
-            elif file_url_or_path.lower().endswith(('.pdf', '.doc', '.docx')):
+            elif ext in ('.pdf', '.doc', '.docx'):
                 msg_type = "media"
             else:
                 msg_type = "media"
+            filename = os.path.basename(file_url_or_path.split("?")[0])
         else:
             msg_type = "media"
-
-    # Upload (if not already a file id)
-    if isinstance(file_url_or_path, str) and len(file_url_or_path) == 24 and file_url_or_path.isalnum():
-        file_id = file_url_or_path  # Already a file id
+            filename = "file"
     else:
-        # Download/upload
-        file_id = upload_any_file_to_wassenger(file_url_or_path)
+        # Optionally guess filename if missing
+        if isinstance(file_url_or_path, str) and not filename:
+            filename = os.path.basename(file_url_or_path.split("?")[0])
+
+    # Upload if not a file_id
+    if isinstance(file_url_or_path, str) and len(file_url_or_path) == 24 and file_url_or_path.isalnum():
+        file_id = file_url_or_path
+    else:
+        file_id = upload_any_file_to_wassenger(file_url_or_path, filename=filename)
 
     if not file_id:
         logger.error(f"[UPLOAD & SEND] Failed to upload file for recipient {recipient}")
         return None
 
-    # 2. Send via Wassenger
     return send_wassenger_reply(
         recipient,
         file_id,
@@ -524,6 +520,20 @@ def upload_and_send_media(recipient, file_url_or_path, device_id, caption=None, 
         caption=caption,
         delay_seconds=delay_seconds
     )
+2. send_wassenger_reply — No major changes needed!
+Just make sure download_to_bytes and upload_any_file_to_wassenger are always available/imported.
+
+Your current logic is good and covers all normal WhatsApp + Wassenger use cases!
+
+3. download_to_bytes Example for Completeness:
+python
+Copy
+Edit
+def download_to_bytes(url):
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+    return resp.content
+
 
 
 
