@@ -484,10 +484,12 @@ def download_wassenger_media(url):
 def send_wassenger_reply(phone, text, device_id, delay_seconds=5, msg_type="text", caption=None):
     url = "https://api.wassenger.com/v1/messages"
     headers = {"Content-Type": "application/json", "Token": WASSENGER_API_KEY}
-    payload = {
-        "phone": phone,
-        "device": device_id
-    }
+    payload = {"device": device_id}
+    if isinstance(phone, str) and phone.endswith("@g.us"):
+        payload["group"] = phone
+    else:
+        payload["phone"] = phone
+
     if msg_type == "text":
         payload["message"] = text
         payload["schedule"] = {"delay": delay_seconds}
