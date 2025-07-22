@@ -907,11 +907,9 @@ def webhook():
         
             # 4. Only notify group for won/closed sales
             if parsed["instruction"] == "close_session_and_notify_sales" and "notification" in parsed:
-                if parsed["instruction"] == "close_session_and_notify_sales" and "notification" in parsed:
-                    notify_sales_group(bot, parsed["notification"])
-                return jsonify({"status": "session closed", "reason": close_reason})
-            if parsed.get("instruction") 
-            # 5. Always send closing message(s) to customer
+                notify_sales_group(bot, parsed["notification"])
+        
+            # 5. Always send final message(s) to customer, even if closing
             if "message" in parsed:
                 msg_lines = parsed["message"]
                 if isinstance(msg_lines, str):
@@ -921,6 +919,9 @@ def webhook():
                         delay = 1 * (idx + 1)
                         send_wassenger_reply(user_phone, part, device_id, delay_seconds=delay)
                         save_message(bot.id, user_phone, session_id, "out", part)
+        
+            return jsonify({"status": "session closed", "reason": close_reason})
+
 
 
         # 8. Only send/process reply if session is NOT closed
