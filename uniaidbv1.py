@@ -347,28 +347,29 @@ def extract_text_from_message(msg):
 
     # --- Audio (Whisper + GPT summary) ---
     elif msg_type == "audio":
-        audio_url = get_media_url(media)
-        if audio_url:
-            try:
-                transcript = transcribe_audio_from_url(audio_url)
-                if transcript and transcript.lower() not in ("[audio received, no url]", "[audio received, transcription failed]"):
-                    gpt_prompt = (
-                        "This is a WhatsApp audio message transcribed as: "
-                        f"'{transcript}'. Reply in a short, natural phrase, as if you're the user."
-                    )
-                    result = openai.chat.completions.create(
-                        model="gpt-4o",
-                        messages=[{"role": "system", "content": gpt_prompt}],
-                        max_tokens=64
-                    )
-                    msg_text = result.choices[0].message.content.strip()
-                    return msg_text or transcript, audio_url
-                else:
-                    return transcript or "[Audio received, no speech detected]", audio_url
-            except Exception as e:
-                logger.error(f"[AUDIO MEANING] {e}")
-                return "[Audio received, error]", audio_url
-        return "[Audio received, no url]", None
+    audio_url = get_media_url(media)
+    if audio_url:
+        try:
+            transcript = transcribe_audio_from_url(audio_url)
+            if transcript and transcript.lower() not in ("[audio received, no url]", "[audio received, transcription failed]"):
+                gpt_prompt = (
+                    "This is a WhatsApp audio message transcribed as: "
+                    f"'{transcript}'. Reply in a short, natural phrase, as if you're the user."
+                )
+                result = openai.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[{"role": "system", "content": gpt_prompt}],
+                    max_tokens=64
+                )
+                msg_text = result.choices[0].message.content.strip()
+                return {"transcript": transcript, "gpt_reply": msg_text}, audio_url
+            else:
+                return {"transcript": transcript or "[Audio received, no speech detected]", "gpt_reply": None}, audio_url
+        except Exception as e:
+            logger.error(f"[AUDIO MEANING] {e}")
+            return {"transcript": "[Audio received, error]", "gpt_reply": None}, audio_url
+    return {"transcript": "[Audio received, no url]", "gpt_reply": None}, None
+
 
     # --- Document (PDF/image: Vision, else filename) ---
     elif msg_type == "document":
