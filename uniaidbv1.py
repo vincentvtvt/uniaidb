@@ -852,38 +852,6 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
 
         return  # <- End here. Do not re-call self!
 
-    # --- Stream/send each message line-by-line ---
-# Only send customer-facing lines (no leads/notification)
-customer_lines = [line for line in parsed["message"]
-                  if not (isinstance(line, str) and ("leads" in line.lower() or "🥳" in line))]
-for idx, line in enumerate(customer_lines):
-    delay = 1 if idx == 0 else 2
-    send_wassenger_reply(
-        customer_phone,
-        line,
-        device_id,
-        delay_seconds=delay,
-        msg_type="text"
-    )
-    if bot_id and user and session_id:
-        save_message(bot_id, customer_phone, session_id, "out", line)
-    if idx < len(customer_lines) - 1:
-        time.sleep(delay)
-
-    else:
-        # fallback: send single message
-        send_wassenger_reply(
-            customer_phone,
-            str(ai_reply),
-            device_id,
-            delay_seconds=1,
-            msg_type="text"
-        )
-        if bot_id and user and session_id:
-            save_message(bot_id, customer_phone, session_id, "out", str(ai_reply))
-
-
-
     # --- TEMPLATE PROCESSING ---
     if "template" in parsed:
         template_id = parsed["template"]
