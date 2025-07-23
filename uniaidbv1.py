@@ -944,6 +944,8 @@ def process_buffered_messages(buffer_key):
         messages = MESSAGE_BUFFER.pop(buffer_key, [])
         if not messages:
             return
+        device_id = messages[-1].get("device_id") 
+        
         combined_text = "\n".join(m['msg_text'] for m in messages if m['msg_text'])
         history = get_latest_history(bot_id, user_phone, session_id)
         context_input = "\n".join([
@@ -1017,7 +1019,8 @@ def webhook():
         MESSAGE_BUFFER[buffer_key].append({
             "msg_text": msg_text,
             "raw_media_url": raw_media_url,
-            "created_at": datetime.now().isoformat()
+            "created_at": datetime.now().isoformat(),
+            "device_id": device_id,    # ADD THIS LINE
         })
 
         # --- Start or reset the 30s buffer timer for this key ---
