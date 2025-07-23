@@ -827,9 +827,21 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
 
     # Handle special instruction: for session closing, recursion allowed if needed
     if parsed.get("instruction") in ("close_session_and_notify_sales", "close_session_drop"):
-        return process_ai_reply_and_send(
-            customer_phone, ai_reply, device_id, bot_id=bot_id, user=user, session_id=session_id
-        )
+    # Only handle session close logic here, do not re-call process_ai_reply_and_send
+    # (Remove recursion, which causes double send)
+    # Handle group notification if needed
+    if "notification" in parsed:
+        notify_sales_group(bot, parsed["notification"])
+    # Send only customer-facing messages
+    if "message" in parsed:
+        for idx, line in enumerate(parsed["message"]):
+            delay = 1 if idx == 0 else 2
+            send_wassenger_reply(customer_phone, line, device_id, delay_seconds=delay, msg_type="text")
+            if bot_id and user and session_id:
+                save_message(bot_id, customer_phone, session_id, "out", line)
+            if idx < len(parsed["message"]) - 1:
+                time.sleep(delay)
+    return  # <- End here. Do not re-call self!
 
     # --- Stream/send each message line-by-line ---
     if "message" in parsed and isinstance(parsed["message"], list):
