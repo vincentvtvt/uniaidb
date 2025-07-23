@@ -833,14 +833,23 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
         if "notification" in parsed:
             notify_sales_group(bot, parsed["notification"])
         # Send only customer-facing messages
-        if "message" in parsed:
-            for idx, line in enumerate(parsed["message"]):
-                delay = 1 if idx == 0 else 2
-                send_wassenger_reply(customer_phone, line, device_id, delay_seconds=delay, msg_type="text")
-                if bot_id and user and session_id:
-                    save_message(bot_id, customer_phone, session_id, "out", line)
-                if idx < len(parsed["message"]) - 1:
-                    time.sleep(delay)
+                # Filter out sales notification lines
+        customer_lines = [line for line in parsed["message"] if not (isinstance(line, str) and ("Leads" in line or "lead" in line.lower()))]
+        for idx, line in enumerate(customer_lines):
+            delay = 1 if idx == 0 else 2
+            send_wassenger_reply(
+                customer_phone,
+                line,
+                device_id,
+                delay_seconds=delay,
+                msg_type="text"
+            )
+            # Save outgoing message to DB if info provided
+            if bot_id and user and session_id:
+                save_message(bot_id, customer_phone, session_id, "out", line)
+            if idx < len(customer_lines) - 1:
+                time.sleep(delay)
+
         return  # <- End here. Do not re-call self!
 
     # --- Stream/send each message line-by-line ---
