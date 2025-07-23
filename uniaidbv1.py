@@ -811,7 +811,10 @@ def compose_reply(bot, tool, history, context_input):
     return match.group(1).strip() if match else reply_accum
 
 def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, user=None, session_id=None):
-        """Streams each message in ai_reply['message'] (if array) as separate WhatsApp messages,with short delays between, and saves every outgoing message to DB."""
+    """
+    Streams each message in ai_reply['message'] (if array) as separate WhatsApp messages,
+    with short delays, and saves each outgoing message to DB.
+    """
     try:
         parsed = ai_reply if isinstance(ai_reply, dict) else json.loads(ai_reply)
     except Exception as e:
