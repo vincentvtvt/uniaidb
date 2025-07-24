@@ -811,19 +811,53 @@ def compose_reply(bot, tool, history, context_input):
     return match.group(1).strip() if match else reply_accum
 
 def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, user=None, session_id=None):
+    """
+    Streams each message in ai_reply['message'] (if array) as separate WhatsApp messages,
+    with short delays, and saves each outgoing message to DB.
+    """
     try:
         parsed = ai_reply if isinstance(ai_reply, dict) else json.loads(ai_reply)
     except Exception as e:
         logger.error(f"[WEBHOOK] Could not parse AI reply as JSON: {ai_reply} ({e})")
         parsed = {}
 
-    # Defensive: Only continue if parsed is a dict
     if not isinstance(parsed, dict):
         logger.error(f"[WEBHOOK] AI reply did not return a dict. Raw reply: {parsed}")
         parsed = {}
 
+    # Handle special instruction: for session closing, recursion allowed if needed
     if parsed.get("instruction") in ("close_session_and_notify_sales", "close_session_drop"):
-        return process_ai_reply_and_send(user_phone, ai_reply, device_id, bot_id=bot.id, user=user_phone, session_id=session_id)
+        return process_ai_reply_and_send(
+            customer_phone, ai_reply, device_id, bot_id=bot_id, user=user, session_id=session_id
+        )
+
+    # --- Stream/send each message line-by-line ---
+    if "message" in parsed and isinstance(parsed["message"], list):
+        for idx, line in enumerate(parsed["message"]):
+            delay = 1 if idx == 0 else 2
+            send_wassenger_reply(
+                customer_phone,
+                line,
+                device_id,
+                delay_seconds=delay,
+                msg_type="text"
+            )
+            # Save outgoing message to DB if info provided
+            if bot_id and user and session_id:
+                save_message(bot_id, customer_phone, session_id, "out", line)
+            if idx < len(parsed["message"]) - 1:
+                time.sleep(delay)
+    else:
+        # fallback: send single message
+        send_wassenger_reply(
+            customer_phone,
+            str(ai_reply),
+            device_id,
+            delay_seconds=1,
+            msg_type="text"
+        )
+        if bot_id and user and session_id:
+            save_message(bot_id, customer_phone, session_id, "out", str(ai_reply))
 
 
 
@@ -944,6 +978,8 @@ def process_buffered_messages(buffer_key):
         messages = MESSAGE_BUFFER.pop(buffer_key, [])
         if not messages:
             return
+        device_id = messages[-1].get("device_id") 
+        
         combined_text = "\n".join(m['msg_text'] for m in messages if m['msg_text'])
         history = get_latest_history(bot_id, user_phone, session_id)
         context_input = "\n".join([
@@ -1017,7 +1053,8 @@ def webhook():
         MESSAGE_BUFFER[buffer_key].append({
             "msg_text": msg_text,
             "raw_media_url": raw_media_url,
-            "created_at": datetime.now().isoformat()
+            "created_at": datetime.now().isoformat(),
+            "device_id": device_id,    # ADD THIS LINE
         })
 
         # --- Start or reset the 30s buffer timer for this key ---
