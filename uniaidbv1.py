@@ -827,9 +827,9 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
 
     # Handle special instruction: for session closing, recursion allowed if needed
     if parsed.get("instruction") in ("close_session_and_notify_sales", "close_session_drop"):
-        return process_ai_reply_and_send(
-            customer_phone, ai_reply, device_id, bot_id=bot_id, user=user, session_id=session_id
-        )
+        logger.info("[AI REPLY] Instruction: Session close detected. Not recursively calling.")
+        # Perform closing logic here if you need (optional: send notification, save DB, etc)
+        return 
 
     # --- Stream/send each message line-by-line ---
     if "message" in parsed and isinstance(parsed["message"], list):
