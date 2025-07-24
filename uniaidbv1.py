@@ -1130,7 +1130,7 @@ def webhook():
                         send_wassenger_reply(user_phone, part, device_id, delay_seconds=delay)
                         save_message(bot.id, user_phone, session_id, "out", part)
         
-            return jsonify({"status": "session closed", "reason": close_reason})
+            return
 
 
 
