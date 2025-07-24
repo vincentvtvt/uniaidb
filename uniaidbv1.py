@@ -915,31 +915,6 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
             if idx < len(template_content) - 1:
                 time.sleep(5)
 
-
-    # --- MESSAGE PARTS ---
-    msg_lines = []
-    if "message" in parsed:
-        if isinstance(parsed["message"], list):
-            msg_lines = parsed["message"]
-        elif isinstance(parsed["message"], str):
-            msg_lines = [parsed["message"]]
-    elif isinstance(parsed, str):
-        msg_lines = [parsed]
-
-    SPLIT_MSG_DELAY = 1  # seconds between each message
-
-    for idx, part in enumerate(msg_lines[:3]):
-        if part:
-            delay = SPLIT_MSG_DELAY * (idx + 1)  # 7s, 14s, 21s, etc.
-            send_wassenger_reply(customer_phone, part, device_id, delay_seconds=delay)
-            if bot_id and user and session_id:
-                if isinstance(part, dict) and part.get("type") == "image":
-                    save_message(bot_id, user, session_id, "out", "[IMAGE]", raw_media_url=part.get("content"))
-                else:
-                    save_message(bot_id, user, session_id, "out", part)
-
-
-                    
 def find_or_create_customer(phone, name=None):
     customer = Customer.query.filter_by(phone_number=phone).first()
     if not customer:
