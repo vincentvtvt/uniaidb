@@ -810,12 +810,9 @@ def compose_reply(bot, tool, history, context_input):
     match = re.search(r'<ExampleOutput>(.*?)</ExampleOutput>', reply_accum, re.DOTALL)
     return match.group(1).strip() if match else reply_accum
 
+import time
+
 def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, user=None, session_id=None):
-    """
-    Streams each message in ai_reply['message'] (if array) as separate WhatsApp messages,
-    with short delays, and saves each outgoing message to DB.
-    Handles special session-closing logic for notification/lead/closing.
-    """
     try:
         parsed = ai_reply if isinstance(ai_reply, dict) else json.loads(ai_reply)
     except Exception as e:
@@ -826,73 +823,28 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
         logger.error(f"[WEBHOOK] AI reply did not return a dict. Raw reply: {parsed}")
         parsed = {}
 
-    # --- UNIVERSAL BACKEND CLOSING BLOCK ---
+    # Handle session closing...
     if parsed.get("instruction") in ("close_session_and_notify_sales", "close_session_drop"):
-        logger.info("[AI REPLY] Instruction: Session close detected. Executing closing/notification logic.")
+        logger.info("[AI REPLY] Instruction: Session close detected. Not recursively calling.")
+        # (Your closing logic here)
+        return
 
-        # 1. Save any extra fields to session context and close session
-        info_to_save = {}
-        for k, v in parsed.items():
-            if k not in ("message", "notification", "instruction") and v is not None:
-                info_to_save[k] = v
-
-        close_reason = parsed.get("close_reason")
-        if not close_reason:
-            close_reason = "won" if parsed["instruction"] == "close_session_and_notify_sales" else "drop"
-
-        # 2. Find and update the active session for this customer + bot
-        if bot_id and user and session_id:
-            bot = Bot.query.get(bot_id)
-            customer = Customer.query.filter_by(phone_number=customer_phone).first()
-            session_obj = (
-                db.session.query(Session)
-                .filter_by(bot_id=bot_id, customer_id=customer.id, status="open")
-                .order_by(Session.started_at.desc())
-                .first()
-            )
-            if session_obj:
-                session_obj.status = "closed"
-                session_obj.ended_at = datetime.now()
-                session_obj.context = {**session_obj.context, **info_to_save, "close_reason": close_reason}
-                db.session.commit()
-                logger.info(f"[SESSION] Closed session for user {customer_phone}, reason: {close_reason}, info: {info_to_save}")
-            else:
-                logger.warning(f"[SESSION] Tried to close session, but none found for user {customer_phone}, bot {bot_id}")
-
-        # 3. Notify sales group if present
-        if parsed.get("notification"):
-            logger.info(f"[NOTIFY SALES GROUP]: {parsed['notification']}")
-            notify_sales_group(bot, parsed["notification"])
-
-        # 4. Send all customer-facing messages
-        if "message" in parsed:
-            msg_lines = parsed["message"]
-            if isinstance(msg_lines, str):
-                msg_lines = [msg_lines]
-            for idx, part in enumerate(msg_lines[:4]):  # up to 4 messages
-                if part:
-                    delay = 1 * (idx + 1)
-                    send_wassenger_reply(customer_phone, part, device_id, delay_seconds=delay)
-                    if bot_id and user and session_id:
-                        save_message(bot_id, customer_phone, session_id, "out", part)
-        return  # All done. Do not stream again!
-
-    # --- Stream/send each message line-by-line (normal flow) ---
+    # Stream/send each message line-by-line, **sequentially**
     if "message" in parsed and isinstance(parsed["message"], list):
         for idx, line in enumerate(parsed["message"]):
-            delay = 1 if idx == 0 else 2
+            delay = 2  # Always fixed, or adjust as needed
             send_wassenger_reply(
                 customer_phone,
                 line,
                 device_id,
-                delay_seconds=delay,
+                delay_seconds=delay,  # Actually, you can skip using API-side delay here!
                 msg_type="text"
             )
             # Save outgoing message to DB if info provided
             if bot_id and user and session_id:
                 save_message(bot_id, customer_phone, session_id, "out", line)
-            if idx < len(parsed["message"]) - 1:
-                time.sleep(delay)
+            # This is the most important: do NOT send next message until previous is "out"
+            time.sleep(delay)
     else:
         # fallback: send single message
         send_wassenger_reply(
@@ -904,9 +856,6 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
         )
         if bot_id and user and session_id:
             save_message(bot_id, customer_phone, session_id, "out", str(ai_reply))
-
-
-
 
     # --- TEMPLATE PROCESSING ---
     if "template" in parsed:
