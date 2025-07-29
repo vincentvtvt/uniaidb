@@ -23,56 +23,32 @@ TIMER_BUFFER = {}
 
 
 # --- Universal JSON Prompt Builder ---
-def build_json_prompt(base_prompt, example_json, tag=None):
-    tag_name = tag if tag else "ExampleOutput"
+def build_json_prompt(base_prompt, example_json):
     json_instruction = (
-        "\n\n<OutputFormat>\n"
-        "Always respond ONLY with a strict, valid JSON object. "
+        "\n\nAlways respond ONLY with a strict, valid JSON object. "
         "Use double quotes for all keys and string values. "
-        "Do not include any explanation, markdown, or code block formatting—just pure JSON.\n"
-        f"Wrap your response inside <{tag_name}> tags as shown below.\n"
-        "</OutputFormat>\n"
-        f"<{tag_name}>\n"
-        f"{example_json.strip()}\n"
-        f"</{tag_name}>"
+        "Do NOT include any explanation, markdown, code block formatting, or tags—just pure JSON.\n"
+        "Example:\n"
+        f"{example_json.strip()}"
     )
     return base_prompt.strip() + json_instruction
+
 
 def strip_json_markdown_blocks(text):
     """Removes ```json ... ``` or ``` ... ``` wrappers from AI output."""
     return re.sub(r'```[a-z]*\s*([\s\S]*?)```', r'\1', text, flags=re.MULTILINE).strip()
 
-def build_json_prompt_with_reasoning(base_prompt, example_json, tag=None):
-    tag_name = tag if tag else "ExampleOutput"
+def build_json_prompt_with_reasoning(base_prompt, example_json):
     reasoning_instruction = (
-        "\n\n<Reasoning>\n"
-        "Before answering, briefly explain your reasoning for the tool selection in 1-2 sentences."
-        " After your reasoning, output ONLY the strict JSON inside <{tag}> tags as shown below."
-        " Do not add code block formatting or any other explanation after the JSON.\n"
-        "</Reasoning>"
-    ).replace("{tag}", tag_name)
+        "Before answering, briefly explain your reasoning for the tool selection in 1-2 sentences. "
+        "After your reasoning, output ONLY the strict JSON. Do NOT add code block formatting, markdown, or any tags—just pure JSON.\n"
+    )
     json_instruction = (
         reasoning_instruction +
-        "\n\n<OutputFormat>\n"
-        "Always respond ONLY with a strict, valid JSON object. "
-        "Use double quotes for all keys and string values. "
-        "No markdown, no code block formatting.\n"
-        f"Wrap your response inside <{tag_name}> tags as shown below.\n"
-        "</OutputFormat>\n"
-        f"<{tag_name}>\n"
-        f"{example_json.strip()}\n"
-        f"</{tag_name}>"
+        "Example:\n"
+        f"{example_json.strip()}"
     )
-    return base_prompt.strip() + json_instruction
-
-
-
-
-# Example usage (manager decision):
-# manager_prompt = build_json_prompt(bot.manager_system_prompt, '{\n  "TOOLS": "Default"\n}', tag="ExampleOutput")
-
-# Example usage (reply/tool generation):
-# reply_prompt = build_json_prompt(bot.system_prompt, '{\n  "message": ["hello", "world"]\n}', tag="ExampleOutput")
+    return base_prompt.strip() + "\n\n" + json_instruction
 
 
 logging.basicConfig(
@@ -735,7 +711,6 @@ def decide_tool_with_manager_prompt(bot, history):
     manager_prompt = build_json_prompt_with_reasoning(
         (bot.manager_system_prompt or "") + "\n" + tool_menu_text,
         '{\n  "TOOLS": "Default"\n}',
-        tag="ExampleOutput"
     )
     logger.info(f"[AI DECISION] manager_system_prompt: {manager_prompt}")
     logger.info(f"[AI DECISION] history: {history_text}")
@@ -759,9 +734,6 @@ def decide_tool_with_manager_prompt(bot, history):
     else:
         logger.info("[AI TOOL DECISION REASONING]: None found")
 
-    # Extract the JSON block inside <ExampleOutput>
-    match = re.search(r'<ExampleOutput>(.*?)</ExampleOutput>', tool_decision, re.DOTALL)
-    json_block = match.group(1).strip() if match else tool_decision
     match_json = re.search(r'"TOOLS":\s*"([^"]+)"', json_block)
     return match_json.group(1) if match_json else None
 
@@ -806,9 +778,8 @@ def compose_reply(bot, tool, history, context_input):
             reply_accum += chunk.choices[0].delta.content
             print(chunk.choices[0].delta.content, end="", flush=True)
     logger.info(f"\n[AI REPLY STREAMED]: {reply_accum}")
-    # Extract JSON inside <ExampleOutput>
-    match = re.search(r'<ExampleOutput>(.*?)</ExampleOutput>', reply_accum, re.DOTALL)
-    return match.group(1).strip() if match else reply_accum
+    return strip_json_markdown_blocks(reply_accum)
+
 
 import time
 
