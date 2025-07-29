@@ -761,7 +761,7 @@ def compose_reply(bot, tool, history, context_input):
     "nak proceed sila isi borang ye cik"
   ]
 }'''
-    reply_prompt = build_json_prompt(prompt, example_json, tag="ExampleOutput")
+    reply_prompt = build_json_prompt(prompt, example_json)
     logger.info(f"[AI REPLY] Prompt: {reply_prompt}")
     messages = [
         {"role": "system", "content": reply_prompt},
