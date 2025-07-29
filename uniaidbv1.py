@@ -734,8 +734,11 @@ def decide_tool_with_manager_prompt(bot, history):
     else:
         logger.info("[AI TOOL DECISION REASONING]: None found")
 
+    # No more tag extraction, just clean for markdown/code fencing
+    json_block = strip_json_markdown_blocks(tool_decision)
     match_json = re.search(r'"TOOLS":\s*"([^"]+)"', json_block)
     return match_json.group(1) if match_json else None
+
 
 
 def compose_reply(bot, tool, history, context_input):
