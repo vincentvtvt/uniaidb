@@ -1053,6 +1053,32 @@ def webhook():
             session_id = str(session.id)
             save_message(bot.id, user_phone, session_id, "in", msg_text, raw_media_url=raw_media_url)
 
+                # ✅ ✅ ADD TRIGGER HANDLER HERE ✅ ✅
+        if msg_text.strip() == "*.*":
+            # Delete all previous conversation & restart session
+            Message.query.filter_by(bot_id=bot.id, customer_phone=user_phone).delete()
+            db.session.commit()
+            # Close existing session & start a new one
+            session.status = "closed"
+            session.ended_at = datetime.now()
+            db.session.commit()
+            new_session = get_or_create_session(customer.id, bot.id)
+            send_wassenger_reply(user_phone, "Convo Refreshed", device_id, delay_seconds=1)
+            return jsonify({"status": "conversation_refreshed"}), 200
+
+        if msg_text.strip().lower() == "*off*":
+            # Force close session, do not reply to customer
+            session.status = "closed"
+            session.ended_at = datetime.now()
+            session.context['close_reason'] = "force_closed"
+            db.session.commit()
+            logger.info(f"[SESSION] Force closed for {user_phone}")
+            # Notify sales group (optional but recommended for audit trail)
+            note = f"Session for {user_phone} was force closed by agent/trigger."
+            notify_sales_group(bot, note)
+            return jsonify({"status": "force_closed"}), 200
+        # ✅ ✅ END OF TRIGGER HANDLER ✅ ✅
+
             # Add to message buffer
         # Add to message buffer and start/refresh the timer
         buffer_key = (bot.id, user_phone, session_id)
