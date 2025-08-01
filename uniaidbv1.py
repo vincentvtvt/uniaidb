@@ -847,7 +847,12 @@ if parsed.get("instruction") in ("close_session_and_notify_sales", "close_sessio
         close_reason = "won" if parsed["instruction"] == "close_session_and_notify_sales" else "drop"
 
     # Try to capture specific drop/loss reason
-    lose_reason = parsed.get("lose_reason") or parsed.get("drop_reason") or info_to_save.get("lose_reason") or info_to_save.get("drop_reason")
+    lose_reason = (
+        parsed.get("lose_reason")
+        or parsed.get("drop_reason")
+        or info_to_save.get("lose_reason")
+        or info_to_save.get("drop_reason")
+    )
     if close_reason in ("drop", "lost", "lose") and lose_reason:
         close_reason = f"{close_reason}: {lose_reason}"
 
@@ -862,57 +867,52 @@ if parsed.get("instruction") in ("close_session_and_notify_sales", "close_sessio
 
     session_obj = None
     if bot and customer:
-    session_obj = (
-        db.session.query(Session)
-        .filter_by(bot_id=bot.id, customer_id=customer.id, status="open")
-        .order_by(Session.started_at.desc())
-        .first()
-    )
-    if not session_obj:
-        logger.error(f"[SESSION CLOSE] No open session found for bot_id={bot.id}, customer_id={customer.id}")
-else:
-    session_obj = None
-    logger.warning("[SESSION CLOSE] Could not look up session (bot or customer missing)")
+        session_obj = (
+            db.session.query(Session)
+            .filter_by(bot_id=bot.id, customer_id=customer.id, status="open")
+            .order_by(Session.started_at.desc())
+            .first()
+        )
+        if not session_obj:
+            logger.error(f"[SESSION CLOSE] No open session found for bot_id={bot.id}, customer_id={customer.id}")
+    else:
+        session_obj = None
+        logger.warning("[SESSION CLOSE] Could not look up session (bot or customer missing)")
 
-# Defensive: Only save lead if all of these:
-#   1. close_reason is win
-#   2. instruction is close_session_and_notify_sales
-#   3. name and contact are present
-if (
-    parsed.get("instruction") == "close_session_and_notify_sales"
-    and close_reason.startswith("won")
-    and name and contact
-):
-    lead = Lead(
-        name=name,
-        contact=contact,
-        info=info_fields,
-        bot_id=bot_id,
-        business_id=getattr(bot, 'business_id', None),
-        session_id=session_obj.id if session_obj else None,
-        status="open"
-    )
-    db.session.add(lead)
-    db.session.commit()
-    logger.info(f"[LEAD] Lead saved: {lead.id}, {lead.name}, {lead.contact}, {lead.info}")
-else:
-    logger.warning(
-        f"[LEAD] Not saving lead: missing required field(s) or not a win. "
-        f"name={name}, contact={contact}, instruction={parsed.get('instruction')}, close_reason={close_reason}"
-    )
+    # 3. Close session context
+    if session_obj:
+        session_obj.status = "closed"
+        session_obj.ended_at = datetime.now()
+        session_obj.context = {**session_obj.context, **info_to_save, "close_reason": close_reason}
+        db.session.commit()
+        logger.info(f"[SESSION] Closed session for user {customer_phone}, reason: {close_reason}, info: {info_to_save}")
+    else:
+        logger.warning(f"[SESSION] Tried to close session, but none found for user {customer_phone}, bot {bot_id}")
 
+    # --- [NEW BLOCK] Only save lead if it's a win/successful close and all critical fields are present! ---
+    name = parsed.get("name") or info_to_save.get("name")
+    contact = parsed.get("contact") or info_to_save.get("contact") or customer_phone
+    if contact and str(contact).strip().lower() in [
+        "whatsapp number", "[whatsapp number]", "same", "this", "use this", "ok", "yes"
+    ]:
+        contact = customer_phone
 
-        # Defensive: Ensure all critical fields are present
-        if not all([name, contact, service, problem, date, time_]):
-            logger.warning(f"[LEAD] Not saving incomplete lead (missing required fields). name={name}, contact={contact}, service={service}, problem={problem}, date={date}, time={time_}. Parsed: {parsed}")
-            # Optionally notify sales group/admin here if you want
-            return
+    # Gather ALL other fields into info dict (combine both dicts to be thorough)
+    critical_keys = ["name", "contact"]
+    info_fields = {}
+    for k, v in {**parsed, **info_to_save}.items():
+        if k not in critical_keys and v is not None:
+            info_fields[k] = v
 
-        info_fields = info_to_save.copy()
-        for key in ("name", "contact", "service", "problem", "date", "time", "notification", "instruction", "message", "close_reason"):
-            info_fields.pop(key, None)
-        if parsed.get("notification"):
-            info_fields["notification"] = parsed["notification"]
+    # Defensive: Only save lead if ALL of these:
+    #   1. close_reason is win
+    #   2. instruction is close_session_and_notify_sales
+    #   3. name and contact are present
+    if (
+        parsed.get("instruction") == "close_session_and_notify_sales"
+        and close_reason.startswith("won")
+        and name and contact
+    ):
         lead = Lead(
             name=name,
             contact=contact,
@@ -926,12 +926,12 @@ else:
         db.session.commit()
         logger.info(f"[LEAD] Lead saved: {lead.id}, {lead.name}, {lead.contact}, {lead.info}")
 
-        # 3. Notify sales group if present
+        # 4. Notify sales group if present
         if parsed.get("notification"):
             logger.info(f"[NOTIFY SALES GROUP]: {parsed['notification']}")
             notify_sales_group(bot, parsed["notification"])
 
-        # 4. Send all customer-facing messages
+        # 5. Send all customer-facing messages
         if "message" in parsed:
             msg_lines = parsed["message"]
             if isinstance(msg_lines, str):
@@ -943,6 +943,11 @@ else:
                     if bot_id and user and session_id:
                         save_message(bot_id, customer_phone, session_id, "out", part)
         return  # All done, prevents rest of function from running
+    else:
+        logger.warning(
+            f"[LEAD] Not saving lead: missing required field(s) or not a win. "
+            f"name={name}, contact={contact}, instruction={parsed.get('instruction')}, close_reason={close_reason}"
+        )
 
     # If drop/lost/etc., DO NOT create a lead, just close session with context (already done above)
 
