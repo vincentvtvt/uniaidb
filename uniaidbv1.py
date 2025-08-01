@@ -862,34 +862,45 @@ if parsed.get("instruction") in ("close_session_and_notify_sales", "close_sessio
 
     session_obj = None
     if bot and customer:
-        session_obj = (
-            db.session.query(Session)
-            .filter_by(bot_id=bot.id, customer_id=customer.id, status="open")
-            .order_by(Session.started_at.desc())
-            .first()
-        )
-        if not session_obj:
-            logger.error(f"[SESSION CLOSE] No open session found for bot_id={bot.id}, customer_id={customer.id}")
-    else:
-        logger.warning("[SESSION CLOSE] Could not look up session (bot or customer missing)")
+    session_obj = (
+        db.session.query(Session)
+        .filter_by(bot_id=bot.id, customer_id=customer.id, status="open")
+        .order_by(Session.started_at.desc())
+        .first()
+    )
+    if not session_obj:
+        logger.error(f"[SESSION CLOSE] No open session found for bot_id={bot.id}, customer_id={customer.id}")
+else:
+    session_obj = None
+    logger.warning("[SESSION CLOSE] Could not look up session (bot or customer missing)")
 
-    if session_obj:
-        session_obj.status = "closed"
-        session_obj.ended_at = datetime.now()
-        session_obj.context = {**session_obj.context, **info_to_save, "close_reason": close_reason}
-        db.session.commit()
-        logger.info(f"[SESSION] Closed session for user {customer_phone}, reason: {close_reason}, info: {info_to_save}")
-    else:
-        logger.warning(f"[SESSION] Tried to close session, but none found for user {customer_phone}, bot {bot_id}")
+# Defensive: Only save lead if all of these:
+#   1. close_reason is win
+#   2. instruction is close_session_and_notify_sales
+#   3. name and contact are present
+if (
+    parsed.get("instruction") == "close_session_and_notify_sales"
+    and close_reason.startswith("won")
+    and name and contact
+):
+    lead = Lead(
+        name=name,
+        contact=contact,
+        info=info_fields,
+        bot_id=bot_id,
+        business_id=getattr(bot, 'business_id', None),
+        session_id=session_obj.id if session_obj else None,
+        status="open"
+    )
+    db.session.add(lead)
+    db.session.commit()
+    logger.info(f"[LEAD] Lead saved: {lead.id}, {lead.name}, {lead.contact}, {lead.info}")
+else:
+    logger.warning(
+        f"[LEAD] Not saving lead: missing required field(s) or not a win. "
+        f"name={name}, contact={contact}, instruction={parsed.get('instruction')}, close_reason={close_reason}"
+    )
 
-    # --- [NEW BLOCK] Only save lead if it's a win/successful close and all critical fields are present! ---
-    if parsed.get("instruction") == "close_session_and_notify_sales" and close_reason.startswith("won"):
-        name = parsed.get("name") or info_to_save.get("name")
-        contact = parsed.get("contact") or customer_phone
-        service = parsed.get("service") or info_to_save.get("service")
-        problem = parsed.get("problem") or info_to_save.get("problem")
-        date = parsed.get("date") or info_to_save.get("date")
-        time_ = parsed.get("time") or info_to_save.get("time")
 
         # Defensive: Ensure all critical fields are present
         if not all([name, contact, service, problem, date, time_]):
