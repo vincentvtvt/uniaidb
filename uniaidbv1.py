@@ -76,6 +76,19 @@ class Bot(db.Model):
     system_prompt = db.Column(db.Text)
     manager_system_prompt = db.Column(db.Text)
 
+class Lead(db.Model):
+    __tablename__ = 'leads'
+    id = db.Column(db.Integer, primary_key=True)
+    bot_id = db.Column(db.Integer)
+    business_id = db.Column(db.Integer)
+    session_id = db.Column(db.String(50))
+    name = db.Column(db.String(100), nullable=False)
+    contact = db.Column(db.String(50), nullable=False)
+    info = db.Column(db.JSON, default={})      # Flexible field for all extra info (dict)
+    status = db.Column(db.String(20), default='open')
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, onupdate=datetime.utcnow)
+
 class Tool(db.Model):
     __tablename__ = 'tools'
     id = db.Column(db.Integer, primary_key=True)
@@ -454,6 +467,23 @@ def download_wassenger_media(url):
         logger.error(f"[WASSENGER MEDIA DOWNLOAD ERROR] {e}")
         return None
 
+def save_lead(
+    name, contact, info_dict, bot_id=None, business_id=None, session_id=None, status="open"
+):
+    lead = Lead(
+        name=name,
+        contact=contact,
+        info=info_dict,
+        bot_id=bot_id,
+        business_id=business_id,
+        session_id=session_id,
+        status=status
+    )
+    db.session.add(lead)
+    db.session.commit()
+    return lead
+
+
 def upload_and_send_media(recipient, file_url_or_path, device_id, caption=None, msg_type=None, delay_seconds=5):
     # Guess file extension/type for filename and msg_type
     filename = None
@@ -802,50 +832,77 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
         logger.error(f"[WEBHOOK] AI reply did not return a dict. Raw reply: {parsed}")
         parsed = {}
 
-    # --- UNIVERSAL BACKEND CLOSING BLOCK ---
-    if parsed.get("instruction") in ("close_session_and_notify_sales", "close_session_drop"):
-        logger.info("[AI REPLY] Instruction: Session close detected. Executing closing/notification logic.")
+# --- UNIVERSAL BACKEND CLOSING BLOCK ---
+if parsed.get("instruction") in ("close_session_and_notify_sales", "close_session_drop"):
+    logger.info("[AI REPLY] Instruction: Session close detected. Executing closing/notification logic.")
 
-        # 1. Save any extra fields to session context and close session
-        info_to_save = {}
-        for k, v in parsed.items():
-            if k not in ("message", "notification", "instruction") and v is not None:
-                info_to_save[k] = v
+    # 1. Save any extra fields to session context and close session
+    info_to_save = {}
+    for k, v in parsed.items():
+        if k not in ("message", "notification", "instruction") and v is not None:
+            info_to_save[k] = v
 
-        close_reason = parsed.get("close_reason")
-        if not close_reason:
-            close_reason = "won" if parsed["instruction"] == "close_session_and_notify_sales" else "drop"
+    close_reason = parsed.get("close_reason")
+    if not close_reason:
+        close_reason = "won" if parsed["instruction"] == "close_session_and_notify_sales" else "drop"
 
-        # 2. Find and update the active session for this customer + bot
-        bot = Bot.query.get(bot_id) if bot_id else None
-        customer = Customer.query.filter_by(phone_number=customer_phone).first()
-        
-        if not customer:
-            logger.error(f"[SESSION CLOSE] Customer not found for phone: {customer_phone}")
-        if not bot:
-            logger.error(f"[SESSION CLOSE] Bot not found for bot_id: {bot_id}")
-        
-        session_obj = None
-        if bot and customer:
-            session_obj = (
-                db.session.query(Session)
-                .filter_by(bot_id=bot.id, customer_id=customer.id, status="open")
-                .order_by(Session.started_at.desc())
-                .first()
-            )
-            if not session_obj:
-                logger.error(f"[SESSION CLOSE] No open session found for bot_id={bot.id}, customer_id={customer.id}")
-        else:
-            logger.warning("[SESSION CLOSE] Could not look up session (bot or customer missing)")
+    # Try to capture specific drop/loss reason
+    lose_reason = parsed.get("lose_reason") or parsed.get("drop_reason") or info_to_save.get("lose_reason") or info_to_save.get("drop_reason")
+    if close_reason in ("drop", "lost", "lose") and lose_reason:
+        close_reason = f"{close_reason}: {lose_reason}"
 
-        if session_obj:
-            session_obj.status = "closed"
-            session_obj.ended_at = datetime.now()
-            session_obj.context = {**session_obj.context, **info_to_save, "close_reason": close_reason}
-            db.session.commit()
-            logger.info(f"[SESSION] Closed session for user {customer_phone}, reason: {close_reason}, info: {info_to_save}")
-        else:
-            logger.warning(f"[SESSION] Tried to close session, but none found for user {customer_phone}, bot {bot_id}")
+    # 2. Find and update the active session for this customer + bot
+    bot = Bot.query.get(bot_id) if bot_id else None
+    customer = Customer.query.filter_by(phone_number=customer_phone).first()
+
+    if not customer:
+        logger.error(f"[SESSION CLOSE] Customer not found for phone: {customer_phone}")
+    if not bot:
+        logger.error(f"[SESSION CLOSE] Bot not found for bot_id: {bot_id}")
+
+    session_obj = None
+    if bot and customer:
+        session_obj = (
+            db.session.query(Session)
+            .filter_by(bot_id=bot.id, customer_id=customer.id, status="open")
+            .order_by(Session.started_at.desc())
+            .first()
+        )
+        if not session_obj:
+            logger.error(f"[SESSION CLOSE] No open session found for bot_id={bot.id}, customer_id={customer.id}")
+    else:
+        logger.warning("[SESSION CLOSE] Could not look up session (bot or customer missing)")
+
+    if session_obj:
+        session_obj.status = "closed"
+        session_obj.ended_at = datetime.now()
+        session_obj.context = {**session_obj.context, **info_to_save, "close_reason": close_reason}
+        db.session.commit()
+        logger.info(f"[SESSION] Closed session for user {customer_phone}, reason: {close_reason}, info: {info_to_save}")
+    else:
+        logger.warning(f"[SESSION] Tried to close session, but none found for user {customer_phone}, bot {bot_id}")
+
+    # --- [NEW BLOCK] Only save lead if it's a win/successful close! ---
+    if parsed.get("instruction") == "close_session_and_notify_sales" and close_reason.startswith("won"):
+        name = parsed.get("name") or info_to_save.get("name")
+        contact = parsed.get("contact") or customer_phone
+        info_fields = info_to_save.copy()
+        for key in ("name", "contact", "notification", "instruction", "message", "close_reason"):
+            info_fields.pop(key, None)
+        if parsed.get("notification"):
+            info_fields["notification"] = parsed["notification"]
+        lead = Lead(
+            name=name,
+            contact=contact,
+            info=info_fields,
+            bot_id=bot_id,
+            business_id=getattr(bot, 'business_id', None),
+            session_id=session_obj.id if session_obj else None,
+            status="open"
+        )
+        db.session.add(lead)
+        db.session.commit()
+        logger.info(f"[LEAD] Lead saved: {lead.id}, {lead.name}, {lead.contact}, {lead.info}")
 
         # 3. Notify sales group if present
         if parsed.get("notification"):
@@ -864,6 +921,9 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
                     if bot_id and user and session_id:
                         save_message(bot_id, customer_phone, session_id, "out", part)
         return  # All done, prevents rest of function from running
+
+    # If drop/lost/etc., DO NOT create a lead, just close session with context (already done above)
+
 
     # --- Stream/send each message line-by-line (normal flow) ---
     if "message" in parsed and isinstance(parsed["message"], list):
