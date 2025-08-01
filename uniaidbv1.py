@@ -931,23 +931,22 @@ if parsed.get("instruction") in ("close_session_and_notify_sales", "close_sessio
             logger.info(f"[NOTIFY SALES GROUP]: {parsed['notification']}")
             notify_sales_group(bot, parsed["notification"])
 
-        # 5. Send all customer-facing messages
         if "message" in parsed:
-            msg_lines = parsed["message"]
-            if isinstance(msg_lines, str):
-                msg_lines = [msg_lines]
-            for idx, part in enumerate(msg_lines[:4]):  # up to 4 messages
-                if part:
-                    delay = max(1, idx * 5)
-                    send_wassenger_reply(customer_phone, part, device_id, delay_seconds=delay)
-                    if bot_id and user and session_id:
-                        save_message(bot_id, customer_phone, session_id, "out", part)
-        return  # All done, prevents rest of function from running
-    else:
-        logger.warning(
-            f"[LEAD] Not saving lead: missing required field(s) or not a win. "
-            f"name={name}, contact={contact}, instruction={parsed.get('instruction')}, close_reason={close_reason}"
-        )
+                msg_lines = parsed["message"]
+                if isinstance(msg_lines, str):
+                    msg_lines = [msg_lines]
+                for idx, part in enumerate(msg_lines[:4]):  # up to 4 messages
+                    if part:
+                        delay = max(1, idx * 5)
+                        send_wassenger_reply(customer_phone, part, device_id, delay_seconds=delay)
+                        if bot_id and user and session_id:
+                            save_message(bot_id, customer_phone, session_id, "out", part)
+            return  # All done, prevents rest of function from running
+        else:
+            logger.warning(
+                f"[LEAD] Not saving lead: missing required field(s) or not a win. "
+                f"name={name}, contact={contact}, instruction={parsed.get('instruction')}, close_reason={close_reason}"
+            )
 
     # If drop/lost/etc., DO NOT create a lead, just close session with context (already done above)
 
