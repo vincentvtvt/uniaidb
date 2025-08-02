@@ -601,7 +601,7 @@ def send_wassenger_reply(phone, text, device_id, api_key, delay_seconds=0, msg_t
     """
     Send a WhatsApp message using Wassenger API with scheduling support.
     """
-    url = f"https://api.wassenger.com/v1/messages?token={api_key}"
+    url = f"https://api.wassenger.com/v1/messages?token={WASSENGER_API_KEY}"
     headers = {"Content-Type": "application/json"}
     scheduled_time = (datetime.utcnow() + timedelta(seconds=delay_seconds)).isoformat() + "Z"
     payload = {
