@@ -606,7 +606,7 @@ def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text
     scheduled_time = (datetime.utcnow() + timedelta(seconds=delay_seconds)).replace(microsecond=0).isoformat() + "Z"
     url = "https://api.wassenger.com/v1/messages"
     headers = {"Content-Type": "application/json", "Token": WASSENGER_API_KEY}
-    payload = {"device": device_id, "schedule": scheduled_time}
+    payload = {"device": device_id}
 
     # Recipient: phone or group
     if isinstance(phone, str) and phone.endswith("@g.us"):
@@ -616,6 +616,7 @@ def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text
 
     if msg_type == "text":
         payload["message"] = text
+        payload["schedule"] = scheduled_time
 
     elif msg_type in ("image", "media"):
         # Always upload unless text is already a file_id
