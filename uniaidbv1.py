@@ -751,7 +751,7 @@ def decide_tool_with_manager_prompt(bot, history):
     logger.info(f"[AI DECISION] history: {history_text}")
     # Decision - Claude (non-streaming)
     response = client.messages.create(
-        model="claude-3-sonnet-20240229",  # update to latest Sonnet
+        model="claude-sonnet-4-20250514",  # update to latest Sonnet
         max_tokens=2048,
         temperature=0.2,
         system=manager_prompt,
@@ -802,7 +802,7 @@ def compose_reply(bot, tool, history, context_input):
         {"role": "user", "content": context_input}
     ]
     stream = client.messages.create(
-        model="claude-3-sonnet-20240229",
+        model="claude-sonnet-4-20250514",
         max_tokens=2048,
         temperature=0.3,
         system=your_system_prompt,
