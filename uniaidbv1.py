@@ -17,6 +17,17 @@ import os
 from threading import Timer
 from collections import defaultdict
 import anthropic
+client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+openai.api_key = os.getenv("OPENAI_API_KEY")
+WASSENGER_API_KEY = os.getenv("WASSENGER_API_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+
+app = Flask(__name__)
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv("DATABASE_URL")
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
+
 
 
 # Message buffer: {(bot_id, user_phone, session_id): [msg1, msg2, ...]}
@@ -59,16 +70,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("UniAI")
 
-openai.api_key = os.getenv("OPENAI_API_KEY")
-WASSENGER_API_KEY = os.getenv("WASSENGER_API_KEY")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-# Instantiate Anthropic client
-claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-app = Flask(__name__)
-app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv("DATABASE_URL")
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-db = SQLAlchemy(app)
 
 # --- Models ---
 class Bot(db.Model):
