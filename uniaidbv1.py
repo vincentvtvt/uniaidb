@@ -595,16 +595,27 @@ def upload_any_file_to_wassenger(file_path_or_bytes, filename=None, msg_type=Non
     except Exception as e:
         logger.error(f"[MEDIA UPLOAD FAIL] Wassenger /files error: {e}")
         return None
-        
-def send_wassenger_reply(phone, text, device_id, delay_seconds=5, msg_type="text", caption=None):
+
+
+def send_wassenger_reply(phone, text, device_id, api_key, delay_seconds=0, msg_type="text", caption=None):
     """
-    Always upload image/pdf/media to Wassenger unless text is already a file_id.
-    - For "media" or "image": handles url, file path, or bytes (auto-upload)
-    - For "text": sends as text
+    Send a WhatsApp message using Wassenger API with scheduling support.
     """
-    url = "https://api.wassenger.com/v1/messages"
-    headers = {"Content-Type": "application/json", "Token": WASSENGER_API_KEY}
-    payload = {"device": device_id}
+    url = f"https://api.wassenger.com/v1/messages?token={api_key}"
+    headers = {"Content-Type": "application/json"}
+    scheduled_time = (datetime.utcnow() + timedelta(seconds=delay_seconds)).isoformat() + "Z"
+    payload = {
+        "phone": phone,
+        "message": text,
+        "device": device_id,
+        "scheduled": scheduled_time
+    }
+    # Optionally handle media/caption here in the future
+
+    response = requests.post(url, json=payload, headers=headers)
+    print(f"Scheduled message: {scheduled_time} | Status: {response.status_code} | Response: {response.text}")
+    return response
+
 
     # Recipient: phone or group
     if isinstance(phone, str) and phone.endswith("@g.us"):
