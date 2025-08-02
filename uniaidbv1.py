@@ -608,7 +608,7 @@ def send_wassenger_reply(phone, text, device_id, api_key=None, delay_seconds=0, 
     url = f"https://api.wassenger.com/v1/messages?token={api_key}"
     headers = {"Content-Type": "application/json"}
 
-    scheduled_time = (datetime.utcnow() + timedelta(seconds=delay_seconds)).isoformat() + "Z"
+    scheduled_time = (datetime.utcnow() + timedelta(seconds=delay_seconds)).replace(microsecond=0).isoformat() + "Z"
 
     payload = {
         "device": device_id,
