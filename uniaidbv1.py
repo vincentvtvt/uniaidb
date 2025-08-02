@@ -597,23 +597,16 @@ def upload_any_file_to_wassenger(file_path_or_bytes, filename=None, msg_type=Non
         return None
 
 
-def send_wassenger_reply(phone, text, device_id, api_key=None, delay_seconds=0, msg_type="text", caption=None):
+def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text", caption=None):
     """
-    Send a WhatsApp message using Wassenger API (supports text and media) with scheduling.
+    Always upload image/pdf/media to Wassenger unless text is already a file_id.
+    - For "media" or "image": handles url, file path, or bytes (auto-upload)
+    - For "text": sends as text
     """
-    if api_key is None:
-        api_key = os.getenv("WASSENGER_API_KEY")
-    assert api_key, "WASSENGER_API_KEY is required"
-
-    url = f"https://api.wassenger.com/v1/messages?token={api_key}"
-    headers = {"Content-Type": "application/json"}
-
     scheduled_time = (datetime.utcnow() + timedelta(seconds=delay_seconds)).replace(microsecond=0).isoformat() + "Z"
-
-    payload = {
-        "device": device_id,
-        "scheduled": scheduled_time
-    }
+    url = "https://api.wassenger.com/v1/messages"
+    headers = {"Content-Type": "application/json", "Token": WASSENGER_API_KEY}
+    payload = {"device": device_id, "scheduled": scheduled_time}
 
     # Recipient: phone or group
     if isinstance(phone, str) and phone.endswith("@g.us"):
