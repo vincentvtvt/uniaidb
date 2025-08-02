@@ -749,7 +749,7 @@ def decide_tool_with_manager_prompt(bot, history):
     logger.info(f"[AI DECISION] manager_system_prompt: {manager_prompt}")
     logger.info(f"[AI DECISION] history: {history_text}")
     # Decision - Claude (non-streaming)
-    anthropic.Anthropic().messages.create(
+    response = anthropic.Anthropic().messages.create(
         model="claude-sonnet-4-20250514",  # update to latest Sonnet
         max_tokens=8192,
         temperature=0.3,
