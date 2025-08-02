@@ -597,25 +597,19 @@ def upload_any_file_to_wassenger(file_path_or_bytes, filename=None, msg_type=Non
         return None
 
 
-def send_wassenger_reply(phone, text, device_id, api_key, delay_seconds=0, msg_type="text", caption=None):
+def send_wassenger_reply(phone, text, device_id, WASSENGER_API_KEY, delay_seconds=0, msg_type="text", caption=None):
     """
-    Send a WhatsApp message using Wassenger API with scheduling support.
+    Send a WhatsApp message using Wassenger API (supports text and media) with scheduling.
     """
     url = f"https://api.wassenger.com/v1/messages?token={WASSENGER_API_KEY}"
     headers = {"Content-Type": "application/json"}
+
     scheduled_time = (datetime.utcnow() + timedelta(seconds=delay_seconds)).isoformat() + "Z"
+
     payload = {
-        "phone": phone,
-        "message": text,
         "device": device_id,
         "scheduled": scheduled_time
     }
-    # Optionally handle media/caption here in the future
-
-    response = requests.post(url, json=payload, headers=headers)
-    print(f"Scheduled message: {scheduled_time} | Status: {response.status_code} | Response: {response.text}")
-    return response
-
 
     # Recipient: phone or group
     if isinstance(phone, str) and phone.endswith("@g.us"):
@@ -625,7 +619,6 @@ def send_wassenger_reply(phone, text, device_id, api_key, delay_seconds=0, msg_t
 
     if msg_type == "text":
         payload["message"] = text
-        payload["schedule"] = {"delay": delay_seconds}
 
     elif msg_type in ("image", "media"):
         # Always upload unless text is already a file_id
@@ -635,28 +628,23 @@ def send_wassenger_reply(phone, text, device_id, api_key, delay_seconds=0, msg_t
         else:
             # Upload any URL, file path, or bytes and get file_id
             if isinstance(text, str) and text.startswith("http"):
-                # Download to bytes
                 file_bytes = download_to_bytes(text)
-                # Try to determine file extension/type
-                if msg_type == "image":
-                    filename = "image.jpg"
-                else:
-                    filename = "document.pdf"
+                filename = "image.jpg" if msg_type == "image" else "document.pdf"
                 file_id = upload_any_file_to_wassenger(file_bytes, filename=filename)
             else:
-                # Local file path or bytes
                 file_id = upload_any_file_to_wassenger(text)
             if not file_id:
                 logger.error(f"[SEND {msg_type.upper()}] Failed to upload to Wassenger")
-                return
+                return None
             payload["media"] = {"file": file_id}
         if caption:
             payload["message"] = caption
 
     else:
         logger.error(f"Unsupported msg_type: {msg_type}")
-        return
+        return None
 
+    # Remove None values from payload
     payload = {k: v for k, v in payload.items() if v is not None}
     logger.debug(f"[WASSENGER PAYLOAD]: {payload}")
 
@@ -668,7 +656,7 @@ def send_wassenger_reply(phone, text, device_id, api_key, delay_seconds=0, msg_t
     except Exception as e:
         logger.error(f"[SEND WASSENGER ERROR] {e}")
         return None
-
+        
 def notify_sales_group(bot, message, error=False):
     import json
     config = bot.config
