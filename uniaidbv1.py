@@ -62,8 +62,6 @@ logger = logging.getLogger("UniAI")
 openai.api_key = os.getenv("OPENAI_API_KEY")
 WASSENGER_API_KEY = os.getenv("WASSENGER_API_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-# Instantiate Anthropic client
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv("DATABASE_URL")
@@ -750,10 +748,10 @@ def decide_tool_with_manager_prompt(bot, history):
     logger.info(f"[AI DECISION] manager_system_prompt: {manager_prompt}")
     logger.info(f"[AI DECISION] history: {history_text}")
     # Decision - Claude (non-streaming)
-    response = client.messages.create(
+    response = anthropic.Anthropic().messages.create(
         model="claude-sonnet-4-20250514",  # update to latest Sonnet
-        max_tokens=2048,
-        temperature=0.2,
+        max_tokens=8192,
+        temperature=0.3,
         system=manager_prompt,
         messages=[{"role": "user", "content": history_text}]
     )
@@ -801,9 +799,9 @@ def compose_reply(bot, tool, history, context_input):
         {"role": "system", "content": reply_prompt},
         {"role": "user", "content": context_input}
     ]
-    stream = client.messages.create(
+    stream = anthropic.Anthropic().messages.create(
         model="claude-sonnet-4-20250514",
-        max_tokens=2048,
+        max_tokens=8192,
         temperature=0.3,
         system=your_system_prompt,
         messages=[{"role": "user", "content": context_input}],
