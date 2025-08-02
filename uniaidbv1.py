@@ -819,6 +819,14 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
     with short delays, and saves each outgoing message to DB.
     Handles special session-closing logic for notification/lead/closing.
     """
+
+    def extract_field_from_notification(notification, field):
+        if not notification:
+            return None
+        pattern = r'{field}[:：]\s*([^\n]+)'.format(field=re.escape(field))
+        m = re.search(pattern, notification)
+        return m.group(1).strip() if m else None
+
     try:
         parsed = ai_reply if isinstance(ai_reply, dict) else json.loads(ai_reply)
     except Exception as e:
@@ -876,176 +884,144 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
             session_obj = None
             logger.warning("[SESSION CLOSE] Could not look up session (bot or customer missing)")
 
-        # 3. Close session context
-        if session_obj:
-            session_obj.status = "closed"
-            session_obj.ended_at = datetime.now()
-            session_obj.context = {**session_obj.context, **info_to_save, "close_reason": close_reason}
-            db.session.commit()
-            logger.info(f"[SESSION] Closed session for user {customer_phone}, reason: {close_reason}, info: {info_to_save}")
-        else:
-            logger.warning(f"[SESSION] Tried to close session, but none found for user {customer_phone}, bot {bot_id}")
+        # --- Gather critical fields with fallback/defensive extraction ---
+        critical_keys = ["name", "contact"]
+        notification = parsed.get("notification") or info_to_save.get("notification") or ""
 
-        # --- Only save lead if it's a win/successful close and all critical fields are present! ---
-        name = parsed.get("name") or info_to_save.get("name")
-        contact = parsed.get("contact") or info_to_save.get("contact") or customer_phone
-        if contact and str(contact).strip().lower() in [
+        name = parsed.get("name") or info_to_save.get("name") or extract_field_from_notification(notification, "Name")
+        contact = (
+            parsed.get("contact")
+            or info_to_save.get("contact")
+            or extract_field_from_notification(notification, "Contact")
+            or extract_field_from_notification(notification, "Phone")
+        )
+        if not contact or str(contact).strip().lower() in [
             "whatsapp number", "[whatsapp number]", "same", "this", "use this", "ok", "yes"
         ]:
             contact = customer_phone
 
-    def extract_field_from_notification(notification, field):
-        """Extracts value for a specific field from a notification string."""
-        if not notification:
-            return None
-        # Accept both English and Chinese colons
-        pattern = r'{field}[:：]\s*([^\n]+)'.format(field=re.escape(field))
-        m = re.search(pattern, notification)
-        return m.group(1).strip() if m else None
-    
-    # --- Gather critical fields with fallback/defensive extraction ---
-    critical_keys = ["name", "contact"]
-    notification = parsed.get("notification") or info_to_save.get("notification") or ""
-    
-    name = parsed.get("name") or info_to_save.get("name") or extract_field_from_notification(notification, "Name")
-    contact = parsed.get("contact") or info_to_save.get("contact") or extract_field_from_notification(notification, "Contact") or extract_field_from_notification(notification, "Phone")
-    
-    # Final fallback: always default to WhatsApp number if contact field is generic
-    if not contact or str(contact).strip().lower() in [
-        "whatsapp number", "[whatsapp number]", "same", "this", "use this", "ok", "yes"
-    ]:
-        contact = customer_phone
-    
-    # --- Gather ALL other fields into info dict (combine both dicts to be thorough) ---
-    info_fields = {}
-    for k, v in {**parsed, **info_to_save}.items():
-        if k not in critical_keys and v is not None:
-            info_fields[k] = v
-    
-    # --- Save Lead only if all conditions are met ---
-    if (
-        parsed.get("instruction") == "close_session_and_notify_sales"
-        and close_reason.startswith("won")
-        and name and contact
-    ):
-        lead = Lead(
-            name=name,
-            contact=contact,
-            info=info_fields,
-            bot_id=bot_id,
-            business_id=getattr(bot, 'business_id', None),
-            session_id=session_obj.id if session_obj else None,
-            status="open"
-        )
-        db.session.add(lead)
-        db.session.commit()
-        logger.info(f"[LEAD] Lead saved: {lead.id}, {lead.name}, {lead.contact}, {lead.info}")
-    
-        # Notify sales group if present
-        if parsed.get("notification"):
-            logger.info(f"[NOTIFY SALES GROUP]: {parsed['notification']}")
-            notify_sales_group(bot, parsed["notification"])
-    else:
-        logger.warning(
-            f"[LEAD] Not saving lead: missing required field(s) or not a win. "
-            f"name={name}, contact={contact}, instruction={parsed.get('instruction')}, close_reason={close_reason}"
-        )
-    
-    # --- Always send all customer-facing messages (up to 4) ---
-    if "message" in parsed:
-        msg_lines = parsed["message"]
-        if isinstance(msg_lines, str):
-            msg_lines = [msg_lines]
-        for idx, part in enumerate(msg_lines[:4]):  # up to 4 messages
-            if part:
-                delay = max(1, idx * 5)
-                send_wassenger_reply(customer_phone, part, device_id, delay_seconds=delay)
-                if bot_id and user and session_id:
-                    save_message(bot_id, customer_phone, session_id, "out", part)
-    
-    return  # All done, prevents rest of function from running
-    
-    
-        # --- Stream/send each message line-by-line (normal flow) ---
-        if "message" in parsed and isinstance(parsed["message"], list):
-            for idx, line in enumerate(parsed["message"]):
-                delay = max(1, idx * 5)
-                send_wassenger_reply(
-                    customer_phone,
-                    line,
-                    device_id,
-                    delay_seconds=delay,
-                    msg_type="text"
-                )
-                if bot_id and user and session_id:
-                    save_message(bot_id, customer_phone, session_id, "out", line)
+        info_fields = {}
+        for k, v in {**parsed, **info_to_save}.items():
+            if k not in critical_keys and v is not None:
+                info_fields[k] = v
+
+        if (
+            parsed.get("instruction") == "close_session_and_notify_sales"
+            and close_reason.startswith("won")
+            and name and contact
+        ):
+            lead = Lead(
+                name=name,
+                contact=contact,
+                info=info_fields,
+                bot_id=bot_id,
+                business_id=getattr(bot, 'business_id', None),
+                session_id=session_obj.id if session_obj else None,
+                status="open"
+            )
+            db.session.add(lead)
+            db.session.commit()
+            logger.info(f"[LEAD] Lead saved: {lead.id}, {lead.name}, {lead.contact}, {lead.info}")
+
+            # Notify sales group if present
+            if parsed.get("notification"):
+                logger.info(f"[NOTIFY SALES GROUP]: {parsed['notification']}")
+                notify_sales_group(bot, parsed["notification"])
         else:
-            # fallback: send single message
+            logger.warning(
+                f"[LEAD] Not saving lead: missing required field(s) or not a win. "
+                f"name={name}, contact={contact}, instruction={parsed.get('instruction')}, close_reason={close_reason}"
+            )
+
+        # --- Always send all customer-facing messages (up to 4) ---
+        if "message" in parsed:
+            msg_lines = parsed["message"]
+            if isinstance(msg_lines, str):
+                msg_lines = [msg_lines]
+            for idx, part in enumerate(msg_lines[:4]):  # up to 4 messages
+                if part:
+                    delay = max(1, idx * 5)
+                    send_wassenger_reply(customer_phone, part, device_id, delay_seconds=delay)
+                    if bot_id and user and session_id:
+                        save_message(bot_id, customer_phone, session_id, "out", part)
+
+        return  # All done, prevents rest of function from running
+
+    # --- Stream/send each message line-by-line (normal flow) ---
+    if "message" in parsed and isinstance(parsed["message"], list):
+        for idx, line in enumerate(parsed["message"]):
+            delay = max(1, idx * 5)
             send_wassenger_reply(
                 customer_phone,
-                str(ai_reply),
+                line,
                 device_id,
-                delay_seconds=5,
+                delay_seconds=delay,
                 msg_type="text"
             )
             if bot_id and user and session_id:
-                save_message(bot_id, customer_phone, session_id, "out", str(ai_reply))
-    
-    
-    
-        # --- TEMPLATE PROCESSING ---
-        if "template" in parsed:
-            template_id = parsed["template"]
-            template_content = get_template_content(template_id)
-            doc_counter = 1
-            img_counter = 1
-            for idx, part in enumerate(template_content):
-                content_type = part.get("type")
-                content_value = part.get("content")
-                caption = part.get("caption") or None
-                delay = max(1, idx * 5)  # <--- Add this line
-    
-                if content_type == "text":
-                    send_wassenger_reply(customer_phone, content_value, device_id, delay_seconds=delay)
+                save_message(bot_id, customer_phone, session_id, "out", line)
+    elif "message" in parsed:
+        # fallback: send single message
+        send_wassenger_reply(
+            customer_phone,
+            str(ai_reply),
+            device_id,
+            delay_seconds=5,
+            msg_type="text"
+        )
+        if bot_id and user and session_id:
+            save_message(bot_id, customer_phone, session_id, "out", str(ai_reply))
+
+    # --- TEMPLATE PROCESSING ---
+    if "template" in parsed:
+        template_id = parsed["template"]
+        template_content = get_template_content(template_id)
+        doc_counter = 1
+        img_counter = 1
+        for idx, part in enumerate(template_content):
+            content_type = part.get("type")
+            content_value = part.get("content")
+            caption = part.get("caption") or None
+            delay = max(1, idx * 5)
+            if content_type == "text":
+                send_wassenger_reply(customer_phone, content_value, device_id, delay_seconds=delay)
+                if bot_id and user and session_id:
+                    save_message(bot_id, user, session_id, "out", content_value)
+            elif content_type == "image":
+                filename = f"image{img_counter}.jpg"
+                img_counter += 1
+                file_id = upload_media_file(content_value, db.session, filename=filename)
+                if file_id:
+                    send_wassenger_reply(
+                        customer_phone,
+                        file_id,
+                        device_id,
+                        msg_type="image",
+                        caption=caption,
+                        delay_seconds=delay
+                    )
                     if bot_id and user and session_id:
-                        save_message(bot_id, user, session_id, "out", content_value)
-    
-                elif content_type == "image":
-                    filename = f"image{img_counter}.jpg"
-                    img_counter += 1
-                    file_id = upload_media_file(content_value, db.session, filename=filename)
-                    if file_id:
-                        send_wassenger_reply(
-                            customer_phone,
-                            file_id,
-                            device_id,
-                            msg_type="image",
-                            caption=caption,
-                            delay_seconds=delay   # <-- add delay here
-                        )
-                        if bot_id and user and session_id:
-                            save_message(bot_id, user, session_id, "out", "[Image sent]")
-                    else:
-                        logger.warning(f"[MEDIA SEND] Failed to upload/send image: {filename}")
-    
-                elif content_type == "document":
-                    filename = f"document{doc_counter}.pdf"
-                    doc_counter += 1
-                    file_id = upload_media_file(content_value, db.session, filename=filename)
-                    if file_id:
-                        send_wassenger_reply(
-                            customer_phone,
-                            file_id,
-                            device_id,
-                            msg_type="media",
-                            caption=caption,
-                            delay_seconds=delay   # <-- add delay here
-                        )
-                        if bot_id and user and session_id:
-                            save_message(bot_id, user, session_id, "out", "[PDF sent]")
-                    else:
-                        logger.warning(f"[MEDIA SEND] Failed to upload/send document: {filename}")
-                        return  # All done, prevents rest of function from running
+                        save_message(bot_id, user, session_id, "out", "[Image sent]")
+                else:
+                    logger.warning(f"[MEDIA SEND] Failed to upload/send image: {filename}")
+            elif content_type == "document":
+                filename = f"document{doc_counter}.pdf"
+                doc_counter += 1
+                file_id = upload_media_file(content_value, db.session, filename=filename)
+                if file_id:
+                    send_wassenger_reply(
+                        customer_phone,
+                        file_id,
+                        device_id,
+                        msg_type="media",
+                        caption=caption,
+                        delay_seconds=delay
+                    )
+                    if bot_id and user and session_id:
+                        save_message(bot_id, user, session_id, "out", "[PDF sent]")
+                else:
+                    logger.warning(f"[MEDIA SEND] Failed to upload/send document: {filename}")
+        return  # All done, prevents rest of function from running
 
 def find_or_create_customer(phone, name=None):
     customer = Customer.query.filter_by(phone_number=phone).first()
