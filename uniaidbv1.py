@@ -603,7 +603,7 @@ def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text
     - For "media" or "image": handles url, file path, or bytes (auto-upload)
     - For "text": sends as text
     """
-    scheduled_time = (datetime.utcnow() + timedelta(seconds=delay_seconds)).replace(microsecond=0).isoformat() + "Z"
+    scheduled_time = (datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
     url = "https://api.wassenger.com/v1/messages"
     headers = {"Content-Type": "application/json", "Token": WASSENGER_API_KEY}
     payload = {"device": device_id}
@@ -616,7 +616,7 @@ def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text
 
     if msg_type == "text":
         payload["message"] = text
-        payload["schedule"] = scheduled_time
+        payload["deliverAt"] = scheduled_time
 
     elif msg_type in ("image", "media"):
         # Always upload unless text is already a file_id
