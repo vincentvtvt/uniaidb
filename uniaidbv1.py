@@ -803,7 +803,6 @@ def compose_reply(bot, tool, history, context_input):
         model="claude-sonnet-4-20250514",
         max_tokens=8192,
         temperature=0.3,
-        system=your_system_prompt,
         messages=[{"role": "user", "content": context_input}],
         stream=True,
     )
