@@ -894,52 +894,77 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
         ]:
             contact = customer_phone
 
-        # Gather ALL other fields into info dict (combine both dicts to be thorough)
-        critical_keys = ["name", "contact"]
-        info_fields = {}
-        for k, v in {**parsed, **info_to_save}.items():
-            if k not in critical_keys and v is not None:
-                info_fields[k] = v
+       import re
 
-        if (
-            parsed.get("instruction") == "close_session_and_notify_sales"
-            and close_reason.startswith("won")
-            and name and contact
-        ):
-            lead = Lead(
-                name=name,
-                contact=contact,
-                info=info_fields,
-                bot_id=bot_id,
-                business_id=getattr(bot, 'business_id', None),
-                session_id=session_obj.id if session_obj else None,
-                status="open"
-            )
-            db.session.add(lead)
-            db.session.commit()
-            logger.info(f"[LEAD] Lead saved: {lead.id}, {lead.name}, {lead.contact}, {lead.info}")
-
-            # Notify sales group if present
-            if parsed.get("notification"):
-                logger.info(f"[NOTIFY SALES GROUP]: {parsed['notification']}")
-                notify_sales_group(bot, parsed["notification"])
-        else:
-            logger.warning(
-                f"[LEAD] Not saving lead: missing required field(s) or not a win. "
-                f"name={name}, contact={contact}, instruction={parsed.get('instruction')}, close_reason={close_reason}"
-            )
-
-        # --- Always send all customer-facing messages ---
-        if "message" in parsed:
-            msg_lines = parsed["message"]
-            if isinstance(msg_lines, str):
-                msg_lines = [msg_lines]
-            for idx, part in enumerate(msg_lines[:4]):  # up to 4 messages
-                if part:
-                    delay = max(1, idx * 5)
-                    send_wassenger_reply(customer_phone, part, device_id, delay_seconds=delay)
-                    if bot_id and user and session_id:
-                        save_message(bot_id, customer_phone, session_id, "out", part)
+    def extract_field_from_notification(notification, field):
+        """Extracts value for a specific field from a notification string."""
+        if not notification:
+            return None
+        # Accept both English and Chinese colons
+        pattern = r'{field}[:：]\s*([^\n]+)'.format(field=re.escape(field))
+        m = re.search(pattern, notification)
+        return m.group(1).strip() if m else None
+    
+    # --- Gather critical fields with fallback/defensive extraction ---
+    critical_keys = ["name", "contact"]
+    notification = parsed.get("notification") or info_to_save.get("notification") or ""
+    
+    name = parsed.get("name") or info_to_save.get("name") or extract_field_from_notification(notification, "Name")
+    contact = parsed.get("contact") or info_to_save.get("contact") or extract_field_from_notification(notification, "Contact") or extract_field_from_notification(notification, "Phone")
+    
+    # Final fallback: always default to WhatsApp number if contact field is generic
+    if not contact or str(contact).strip().lower() in [
+        "whatsapp number", "[whatsapp number]", "same", "this", "use this", "ok", "yes"
+    ]:
+        contact = customer_phone
+    
+    # --- Gather ALL other fields into info dict (combine both dicts to be thorough) ---
+    info_fields = {}
+    for k, v in {**parsed, **info_to_save}.items():
+        if k not in critical_keys and v is not None:
+            info_fields[k] = v
+    
+    # --- Save Lead only if all conditions are met ---
+    if (
+        parsed.get("instruction") == "close_session_and_notify_sales"
+        and close_reason.startswith("won")
+        and name and contact
+    ):
+        lead = Lead(
+            name=name,
+            contact=contact,
+            info=info_fields,
+            bot_id=bot_id,
+            business_id=getattr(bot, 'business_id', None),
+            session_id=session_obj.id if session_obj else None,
+            status="open"
+        )
+        db.session.add(lead)
+        db.session.commit()
+        logger.info(f"[LEAD] Lead saved: {lead.id}, {lead.name}, {lead.contact}, {lead.info}")
+    
+        # Notify sales group if present
+        if parsed.get("notification"):
+            logger.info(f"[NOTIFY SALES GROUP]: {parsed['notification']}")
+            notify_sales_group(bot, parsed["notification"])
+    else:
+        logger.warning(
+            f"[LEAD] Not saving lead: missing required field(s) or not a win. "
+            f"name={name}, contact={contact}, instruction={parsed.get('instruction')}, close_reason={close_reason}"
+        )
+    
+    # --- Always send all customer-facing messages (up to 4) ---
+    if "message" in parsed:
+        msg_lines = parsed["message"]
+        if isinstance(msg_lines, str):
+            msg_lines = [msg_lines]
+        for idx, part in enumerate(msg_lines[:4]):  # up to 4 messages
+            if part:
+                delay = max(1, idx * 5)
+                send_wassenger_reply(customer_phone, part, device_id, delay_seconds=delay)
+                if bot_id and user and session_id:
+                    save_message(bot_id, customer_phone, session_id, "out", part)
+    
         return  # All done, prevents rest of function from running
 
     # --- Stream/send each message line-by-line (normal flow) ---
