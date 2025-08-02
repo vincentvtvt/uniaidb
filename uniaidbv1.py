@@ -59,6 +59,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("UniAI")
 
+client = anthropic.Anthropic()
 openai.api_key = os.getenv("OPENAI_API_KEY")
 WASSENGER_API_KEY = os.getenv("WASSENGER_API_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
@@ -748,11 +749,10 @@ def decide_tool_with_manager_prompt(bot, history):
     logger.info(f"[AI DECISION] manager_system_prompt: {manager_prompt}")
     logger.info(f"[AI DECISION] history: {history_text}")
     # Decision - Claude (non-streaming)
-    response = anthropic.Anthropic().messages.create(
+    anthropic.Anthropic().messages.create(
         model="claude-sonnet-4-20250514",  # update to latest Sonnet
         max_tokens=8192,
         temperature=0.3,
-        system=manager_prompt,
         messages=[{"role": "user", "content": history_text}]
     )
     tool_decision = response.content[0].text
@@ -799,7 +799,7 @@ def compose_reply(bot, tool, history, context_input):
         {"role": "system", "content": reply_prompt},
         {"role": "user", "content": context_input}
     ]
-    stream = anthropic.Anthropic().messages.create(
+    with client.messages.stream(
         model="claude-sonnet-4-20250514",
         max_tokens=8192,
         temperature=0.3,
