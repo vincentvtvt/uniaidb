@@ -16,6 +16,8 @@ import uuid
 import os
 from threading import Timer
 from collections import defaultdict
+import anthropic
+
 
 # Message buffer: {(bot_id, user_phone, session_id): [msg1, msg2, ...]}
 MESSAGE_BUFFER = defaultdict(list)
@@ -59,6 +61,9 @@ logger = logging.getLogger("UniAI")
 
 openai.api_key = os.getenv("OPENAI_API_KEY")
 WASSENGER_API_KEY = os.getenv("WASSENGER_API_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+# Instantiate Anthropic client
+claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv("DATABASE_URL")
@@ -744,16 +749,15 @@ def decide_tool_with_manager_prompt(bot, history):
     )
     logger.info(f"[AI DECISION] manager_system_prompt: {manager_prompt}")
     logger.info(f"[AI DECISION] history: {history_text}")
-    response = openai.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "system", "content": manager_prompt},
-            {"role": "user", "content": history_text}
-        ],
-        max_tokens=8192,
-        temperature=0
+    # Decision - Claude (non-streaming)
+    response = client.messages.create(
+        model="claude-3-sonnet-20240229",  # update to latest Sonnet
+        max_tokens=2048,
+        temperature=0.2,
+        system=manager_prompt,
+        messages=[{"role": "user", "content": history_text}]
     )
-    tool_decision = response.choices[0].message.content
+    tool_decision = response.content[0].text
 
     # Extract reasoning (for logging/printout)
     reasoning_match = re.search(r'<Reasoning>(.*?)</Reasoning>', tool_decision, re.DOTALL)
@@ -797,12 +801,13 @@ def compose_reply(bot, tool, history, context_input):
         {"role": "system", "content": reply_prompt},
         {"role": "user", "content": context_input}
     ]
-    stream = openai.chat.completions.create(
-        model="gpt-4o",
-        messages=messages,
-        max_tokens=8192,
+    stream = client.messages.create(
+        model="claude-3-sonnet-20240229",
+        max_tokens=2048,
         temperature=0.3,
-        stream=True
+        system=your_system_prompt,
+        messages=[{"role": "user", "content": context_input}],
+        stream=True,
     )
     reply_accum = ""
     print("[STREAM] Streaming model reply:")
@@ -862,7 +867,7 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
             close_reason = f"{close_reason}: {lose_reason}"
 
         # 2. Find and update the active session for this customer + bot
-        bot = Bot.query.get(bot_id) if bot_id else None
+        bot = db.session.get(Bot, bot_id) if bot_id else None
         customer = Customer.query.filter_by(phone_number=customer_phone).first()
 
         if not customer:
@@ -1057,7 +1062,7 @@ def close_session(session, reason, info: dict = None):
 def process_buffered_messages(buffer_key):
     with app.app_context():
         bot_id, user_phone, session_id = buffer_key
-        bot = Bot.query.get(bot_id)
+        bot = db.session.get(Bot, bot_id)
         messages = MESSAGE_BUFFER.pop(buffer_key, [])
         if not messages:
             return
