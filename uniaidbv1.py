@@ -804,7 +804,7 @@ def compose_reply(bot, tool, history, context_input):
         max_tokens=8192,
         temperature=0.3,
         messages=[{"role": "user", "content": context_input}],
-        stream=True,
+        stream=True;
     )
     reply_accum = ""
     print("[STREAM] Streaming model reply:")
