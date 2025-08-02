@@ -597,11 +597,15 @@ def upload_any_file_to_wassenger(file_path_or_bytes, filename=None, msg_type=Non
         return None
 
 
-def send_wassenger_reply(phone, text, device_id, WASSENGER_API_KEY, delay_seconds=0, msg_type="text", caption=None):
+def send_wassenger_reply(phone, text, device_id, api_key, delay_seconds=0, msg_type="text", caption=None):
     """
     Send a WhatsApp message using Wassenger API (supports text and media) with scheduling.
     """
-    url = f"https://api.wassenger.com/v1/messages?token={WASSENGER_API_KEY}"
+    if api_key is None:
+        api_key = os.getenv("WASSENGER_API_KEY")
+    assert api_key, "WASSENGER_API_KEY is required"
+
+    url = f"https://api.wassenger.com/v1/messages?token={api_key}"
     headers = {"Content-Type": "application/json"}
 
     scheduled_time = (datetime.utcnow() + timedelta(seconds=delay_seconds)).isoformat() + "Z"
