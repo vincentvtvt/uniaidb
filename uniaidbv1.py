@@ -2,7 +2,7 @@ import re
 import logging
 import time
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 import requests
