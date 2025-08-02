@@ -733,7 +733,7 @@ def decide_tool_with_manager_prompt(bot, history):
     # Build history text as before
     history_text = "\n".join([f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}" for m in history])
 
-    # ---- NEW: Build the tool menu and append to system prompt ----
+    # Build the tool menu and append to system prompt
     tool_menu = build_tool_menu_for_prompt(bot.id)
     tool_menu_text = (
         "Here are the available tools you can select (ID, name, and description):\n"
@@ -746,31 +746,56 @@ def decide_tool_with_manager_prompt(bot, history):
         (bot.manager_system_prompt or "") + "\n" + tool_menu_text,
         '{\n  "TOOLS": "Default"\n}',
     )
+    
     logger.info(f"[AI DECISION] manager_system_prompt: {manager_prompt}")
     logger.info(f"[AI DECISION] history: {history_text}")
-    # Decision - Claude (non-streaming)
-    response = anthropic.Anthropic().messages.create(
-        model="claude-sonnet-4-20250514",  # update to latest Sonnet
-        max_tokens=8192,
-        temperature=0.3,
-        messages=[{"role": "user", "content": history_text}]
-    )
-    tool_decision = json.loads(response.content[0].text)
+    
+    try:
+        # FIX 1: Use the manager_prompt as system message
+        response = anthropic.Anthropic().messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=8192,
+            temperature=0.3,
+            system=manager_prompt,  # Add this line!
+            messages=[{"role": "user", "content": history_text}]
+        )
+        
+        raw_response = response.content[0].text
+        logger.info(f"[AI DECISION] Raw response: {raw_response}")
+        
+        # FIX 2: Extract reasoning first, then clean JSON
+        reasoning_match = re.search(r'(.*?)(?=\{)', raw_response, re.DOTALL)
+        if reasoning_match:
+            reasoning = reasoning_match.group(1).strip()
+            logger.info(f"[AI TOOL DECISION REASONING]: {reasoning}")
+            print("\n[AI TOOL DECISION REASONING]:", reasoning)
+        else:
+            logger.info("[AI TOOL DECISION REASONING]: None found")
 
-    # Extract reasoning (for logging/printout)
-    reasoning_match = re.search(r'<Reasoning>(.*?)</Reasoning>', tool_decision, re.DOTALL)
-    if reasoning_match:
-        reasoning = reasoning_match.group(1).strip()
-        logger.info(f"[AI TOOL DECISION REASONING]: {reasoning}")
-        print("\n[AI TOOL DECISION REASONING]:", reasoning)
-    else:
-        logger.info("[AI TOOL DECISION REASONING]: None found")
-
-    # No more tag extraction, just clean for markdown/code fencing
-    json_block = strip_json_markdown_blocks(tool_decision)
-    match_json = re.search(r'"TOOLS":\s*"([^"]+)"', json_block)
-    return match_json.group(1) if match_json else None
-
+        # FIX 3: Clean and parse JSON more robustly
+        json_block = strip_json_markdown_blocks(raw_response)
+        
+        # Try to extract JSON object from the response
+        json_match = re.search(r'\{[^}]*"TOOLS"[^}]*\}', json_block)
+        if json_match:
+            json_str = json_match.group(0)
+            tool_decision = json.loads(json_str)
+            
+            # Extract the TOOLS value
+            tools_value = tool_decision.get("TOOLS")
+            logger.info(f"[AI DECISION] Selected tool: {tools_value}")
+            return tools_value
+        else:
+            logger.error(f"[AI DECISION] No valid JSON found in response: {json_block}")
+            return "Default"
+            
+    except json.JSONDecodeError as e:
+        logger.error(f"[AI DECISION] JSON decode error: {e}")
+        logger.error(f"[AI DECISION] Raw response was: {raw_response}")
+        return "Default"
+    except Exception as e:
+        logger.error(f"[AI DECISION] Unexpected error: {e}")
+        return "Default"
 
 
 def compose_reply(bot, tool, history, context_input):
@@ -793,29 +818,42 @@ def compose_reply(bot, tool, history, context_input):
     "nak proceed sila isi borang ye cik"
   ]
 }'''
+    
     reply_prompt = build_json_prompt(prompt, example_json)
     logger.info(f"[AI REPLY] Prompt: {reply_prompt}")
-    messages = [
-        {"role": "system", "content": reply_prompt},
-        {"role": "user", "content": context_input}
-    ]
-    with client.messages.stream(
-        model="claude-sonnet-4-20250514",
-        max_tokens=8192,
-        temperature=0.3,
-        messages=[{"role": "user", "content": context_input}
-        ]
-    ) as stream:
-        reply_accum = ""
-        print("[STREAM] Streaming model reply:")
-        for text in stream.text_stream:
-            reply_accum += text
-            print(text, end="", flush=True)
-        logger.info(f"\n[AI REPLY STREAMED]: {reply_accum}")
-        # Clean and parse JSON response
-        cleaned_response = strip_json_markdown_blocks(reply_accum)
-        tool_decision = json.loads(cleaned_response)
-        return tool_decision
+    
+    try:
+        # FIX: Use system parameter correctly
+        with client.messages.stream(
+            model="claude-sonnet-4-20250514",
+            max_tokens=8192,
+            temperature=0.3,
+            system=reply_prompt,  # Add this line!
+            messages=[{"role": "user", "content": context_input}]
+        ) as stream:
+            reply_accum = ""
+            print("[STREAM] Streaming model reply:")
+            for text in stream.text_stream:
+                reply_accum += text
+                print(text, end="", flush=True)
+            
+            logger.info(f"\n[AI REPLY STREAMED]: {reply_accum}")
+            
+            # Clean and parse JSON response
+            cleaned_response = strip_json_markdown_blocks(reply_accum)
+            
+            try:
+                tool_decision = json.loads(cleaned_response)
+                return tool_decision
+            except json.JSONDecodeError as e:
+                logger.error(f"[AI REPLY] JSON decode error: {e}")
+                logger.error(f"[AI REPLY] Raw response was: {reply_accum}")
+                # Return fallback response
+                return {"message": ["I apologize, there was an error processing your request. Please try again."]}
+                
+    except Exception as e:
+        logger.error(f"[AI REPLY] Unexpected error: {e}")
+        return {"message": ["I apologize, there was an error processing your request. Please try again."]}
 
 def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, user=None, session_id=None):
     """
