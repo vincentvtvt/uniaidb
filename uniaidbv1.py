@@ -940,7 +940,7 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
                 msg_lines = [msg_lines]
             for idx, part in enumerate(msg_lines[:4]):  # up to 4 messages
                 if part:
-                    delay = max(1, idx * 5)
+                    delay = max(1, idx * 7)
                     send_wassenger_reply(customer_phone, part, device_id, delay_seconds=delay)
                     if bot_id and user and session_id:
                         save_message(bot_id, customer_phone, session_id, "out", part)
@@ -950,7 +950,7 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
     # --- Stream/send each message line-by-line (normal flow) ---
     if "message" in parsed and isinstance(parsed["message"], list):
         for idx, line in enumerate(parsed["message"]):
-            delay = max(1, idx * 5)
+            delay = max(1, idx * 7)
             send_wassenger_reply(
                 customer_phone,
                 line,
@@ -982,7 +982,7 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
             content_type = part.get("type")
             content_value = part.get("content")
             caption = part.get("caption") or None
-            delay = max(1, idx * 5)
+            delay = max(1, idx * 7)
             if content_type == "text":
                 send_wassenger_reply(customer_phone, content_value, device_id, delay_seconds=delay)
                 if bot_id and user and session_id:
