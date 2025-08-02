@@ -803,17 +803,16 @@ def compose_reply(bot, tool, history, context_input):
         model="claude-sonnet-4-20250514",
         max_tokens=8192,
         temperature=0.3,
-        messages=[{"role": "user", "content": context_input}],
-        stream=True;
-    )
-    reply_accum = ""
-    print("[STREAM] Streaming model reply:")
-    for chunk in stream:
-        if hasattr(chunk.choices[0].delta, 'content') and chunk.choices[0].delta.content:
-            reply_accum += chunk.choices[0].delta.content
-            print(chunk.choices[0].delta.content, end="", flush=True)
-    logger.info(f"\n[AI REPLY STREAMED]: {reply_accum}")
-    return strip_json_markdown_blocks(reply_accum)
+        messages=[{"role": "user", "content": context_input}
+        ]
+    ) as stream:
+        reply_accum = ""
+        print("[STREAM] Streaming model reply:")
+        for text in stream.text_stream:
+            reply_accum += text
+            print(text, end="", flush=True)
+        logger.info(f"\n[AI REPLY STREAMED]: {reply_accum}")
+        return strip_json_markdown_blocks(reply_accum)
 
 def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, user=None, session_id=None):
     """
