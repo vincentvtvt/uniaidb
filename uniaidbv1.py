@@ -755,7 +755,7 @@ def decide_tool_with_manager_prompt(bot, history):
         temperature=0.3,
         messages=[{"role": "user", "content": history_text}]
     )
-    tool_decision = response.content[0].text
+    tool_decision = json.loads(response.content[0].text)
 
     # Extract reasoning (for logging/printout)
     reasoning_match = re.search(r'<Reasoning>(.*?)</Reasoning>', tool_decision, re.DOTALL)
@@ -812,7 +812,10 @@ def compose_reply(bot, tool, history, context_input):
             reply_accum += text
             print(text, end="", flush=True)
         logger.info(f"\n[AI REPLY STREAMED]: {reply_accum}")
-        return strip_json_markdown_blocks(reply_accum)
+        # Clean and parse JSON response
+        cleaned_response = strip_json_markdown_blocks(reply_accum)
+        tool_decision = json.loads(cleaned_response)
+        return tool_decision
 
 def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, user=None, session_id=None):
     """
