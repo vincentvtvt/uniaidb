@@ -597,7 +597,7 @@ def upload_any_file_to_wassenger(file_path_or_bytes, filename=None, msg_type=Non
         return None
 
 
-def send_wassenger_reply(phone, text, device_id, api_key=none, delay_seconds=0, msg_type="text", caption=None):
+def send_wassenger_reply(phone, text, device_id, api_key=None, delay_seconds=0, msg_type="text", caption=None):
     """
     Send a WhatsApp message using Wassenger API (supports text and media) with scheduling.
     """
