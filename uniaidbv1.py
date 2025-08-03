@@ -878,33 +878,32 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
 
     # --- UNIVERSAL BACKEND CLOSING BLOCK ---
     if parsed.get("instruction") in ("close_session_and_notify_sales", "close_session_drop"):
-        logger.info("[AI REPLY] Instruction: Session close detected. Executing closing/notification logic.")
+    logger.info("[AI REPLY] Instruction: Session close detected. Executing closing/notification logic.")
 
-        # 1. Save any extra fields to session context and close session
-        info_to_save = {}
-        for k, v in parsed.items():
-            if k not in ("message", "notification", "instruction") and v is not None:
-                info_to_save[k] = v
+    # 1. Save any extra fields to session context and close session
+    info_to_save = {}
+    for k, v in parsed.items():
+        if k not in ("message", "notification", "instruction") and v is not None:
+            info_to_save[k] = v
 
-        close_reason = parsed.get("close_reason")
-        if not close_reason:
-            close_reason = "won" if parsed["instruction"] == "close_session_and_notify_sales" else "drop"
+    close_reason = parsed.get("close_reason")
+    if not close_reason:
+        close_reason = "won" if parsed["instruction"] == "close_session_and_notify_sales" else "drop"
 
-        # Try to capture specific drop/loss reason
-        lose_reason = (
-            parsed.get("lose_reason")
-            or parsed.get("drop_reason")
-            or info_to_save.get("lose_reason")
-            or info_to_save.get("drop_reason")
-        )
-        
-        if close_reason in ("drop", "lost", "lose"):
-            if lose_reason:
-                close_reason = f"{close_reason}: {lose_reason}"
-            else:
-                # If nothing clear, label as "not specified"
-                close_reason = f"{close_reason}: not specified"
-                logger.warning("[DROP/LOSE] No specific reason found, saved as 'not specified'.")
+    # Try to capture specific drop/loss reason (define only once!)
+    lose_reason = (
+        parsed.get("lose_reason")
+        or parsed.get("drop_reason")
+        or info_to_save.get("lose_reason")
+        or info_to_save.get("drop_reason")
+    )
+
+    if close_reason in ("drop", "lost", "lose"):
+        if lose_reason:
+            close_reason = f"{close_reason}: {lose_reason}"
+        else:
+            close_reason = f"{close_reason}: not specified"
+            logger.warning("[DROP/LOSE] No specific reason found, saved as 'not specified'.")
 
 
         # 2. Find and update the active session for this customer + bot
