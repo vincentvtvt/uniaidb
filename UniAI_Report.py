@@ -123,14 +123,15 @@ def send_weekly_reports():
     cursor.execute("SELECT id, admin_phones FROM businesses;")
     businesses = cursor.fetchall()
 
-    # Master report for 0127998080
+    # ✅ Master report for 0127998080
     master_data, master_lose = get_report(start_date, end_date)
     master_analysis = analyze_lose_reasons(master_lose)
     master_message = format_report(master_data, master_analysis, start_date, end_date)
     send_whatsapp(MASTER_PHONE, master_message)
 
-    # Per-business reports
+    # ✅ Per-business reports
     for business_id, admin_phones_json in businesses:
+        # 🔧 Fix: handle both JSONB (list) and text
         if isinstance(admin_phones_json, list):
             admin_phones = admin_phones_json
         else:
@@ -138,9 +139,11 @@ def send_weekly_reports():
 
         if not admin_phones:
             continue
+
         data, lose_contexts = get_report(start_date, end_date, business_id)
         lose_analysis = analyze_lose_reasons(lose_contexts)
         message = format_report(data, lose_analysis, start_date, end_date)
+
         for phone in admin_phones:
             send_whatsapp(phone, message)
 
