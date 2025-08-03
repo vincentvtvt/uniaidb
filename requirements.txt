@@ -12,4 +12,3 @@ flask_sqlalchemy
 Pillow
 pdf2image
 opencv-python
-psycopg2
