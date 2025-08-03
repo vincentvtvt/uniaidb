@@ -878,119 +878,119 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
 
     # --- UNIVERSAL BACKEND CLOSING BLOCK ---
     if parsed.get("instruction") in ("close_session_and_notify_sales", "close_session_drop"):
-    logger.info("[AI REPLY] Instruction: Session close detected. Executing closing/notification logic.")
-
-    # 1. Save any extra fields to session context and close session
-    info_to_save = {}
-    for k, v in parsed.items():
-        if k not in ("message", "notification", "instruction") and v is not None:
-            info_to_save[k] = v
-
-    close_reason = parsed.get("close_reason")
-    if not close_reason:
-        close_reason = "won" if parsed["instruction"] == "close_session_and_notify_sales" else "drop"
-
-    # Try to capture specific drop/loss reason (define only once!)
-    lose_reason = (
-        parsed.get("lose_reason")
-        or parsed.get("drop_reason")
-        or info_to_save.get("lose_reason")
-        or info_to_save.get("drop_reason")
-    )
-
-    if close_reason in ("drop", "lost", "lose"):
-        if lose_reason:
-            close_reason = f"{close_reason}: {lose_reason}"
-        else:
-            close_reason = f"{close_reason}: not specified"
-            logger.warning("[DROP/LOSE] No specific reason found, saved as 'not specified'.")
-
-
-        # 2. Find and update the active session for this customer + bot
-        bot = db.session.get(Bot, bot_id) if bot_id else None
-        customer = Customer.query.filter_by(phone_number=customer_phone).first()
-
-        if not customer:
-            logger.error(f"[SESSION CLOSE] Customer not found for phone: {customer_phone}")
-        if not bot:
-            logger.error(f"[SESSION CLOSE] Bot not found for bot_id: {bot_id}")
-
-        session_obj = None
-        if bot and customer:
-            session_obj = (
-                db.session.query(Session)
-                .filter_by(bot_id=bot.id, customer_id=customer.id, status="open")
-                .order_by(Session.started_at.desc())
-                .first()
-            )
-            if not session_obj:
-                logger.error(f"[SESSION CLOSE] No open session found for bot_id={bot.id}, customer_id={customer.id}")
-        else:
-            session_obj = None
-            logger.warning("[SESSION CLOSE] Could not look up session (bot or customer missing)")
-
-        # --- Gather critical fields with fallback/defensive extraction ---
-        critical_keys = ["name", "contact"]
-        notification = parsed.get("notification") or info_to_save.get("notification") or ""
-
-        name = parsed.get("name") or info_to_save.get("name") or extract_field_from_notification(notification, "Name")
-        contact = (
-            parsed.get("contact")
-            or info_to_save.get("contact")
-            or extract_field_from_notification(notification, "Contact")
-            or extract_field_from_notification(notification, "Phone")
+        logger.info("[AI REPLY] Instruction: Session close detected. Executing closing/notification logic.")
+    
+        # 1. Save any extra fields to session context and close session
+        info_to_save = {}
+        for k, v in parsed.items():
+            if k not in ("message", "notification", "instruction") and v is not None:
+                info_to_save[k] = v
+    
+        close_reason = parsed.get("close_reason")
+        if not close_reason:
+            close_reason = "won" if parsed["instruction"] == "close_session_and_notify_sales" else "drop"
+    
+        # Try to capture specific drop/loss reason (define only once!)
+        lose_reason = (
+            parsed.get("lose_reason")
+            or parsed.get("drop_reason")
+            or info_to_save.get("lose_reason")
+            or info_to_save.get("drop_reason")
         )
-        if not contact or str(contact).strip().lower() in [
-            "whatsapp number", "[whatsapp number]", "same", "this", "use this", "ok", "yes"
-        ]:
-            contact = customer_phone
-
-        info_fields = {}
-        for k, v in {**parsed, **info_to_save}.items():
-            if k not in critical_keys and v is not None:
-                info_fields[k] = v
-
-        if (
-            parsed.get("instruction") == "close_session_and_notify_sales"
-            and close_reason.startswith("won")
-            and name and contact
-        ):
-            lead = Lead(
-                name=name,
-                contact=contact,
-                info=info_fields,
-                bot_id=bot_id,
-                business_id=getattr(bot, 'business_id', None),
-                session_id=session_obj.id if session_obj else None,
-                status="open"
+    
+        if close_reason in ("drop", "lost", "lose"):
+            if lose_reason:
+                close_reason = f"{close_reason}: {lose_reason}"
+            else:
+                close_reason = f"{close_reason}: not specified"
+                logger.warning("[DROP/LOSE] No specific reason found, saved as 'not specified'.")
+    
+    
+            # 2. Find and update the active session for this customer + bot
+            bot = db.session.get(Bot, bot_id) if bot_id else None
+            customer = Customer.query.filter_by(phone_number=customer_phone).first()
+    
+            if not customer:
+                logger.error(f"[SESSION CLOSE] Customer not found for phone: {customer_phone}")
+            if not bot:
+                logger.error(f"[SESSION CLOSE] Bot not found for bot_id: {bot_id}")
+    
+            session_obj = None
+            if bot and customer:
+                session_obj = (
+                    db.session.query(Session)
+                    .filter_by(bot_id=bot.id, customer_id=customer.id, status="open")
+                    .order_by(Session.started_at.desc())
+                    .first()
+                )
+                if not session_obj:
+                    logger.error(f"[SESSION CLOSE] No open session found for bot_id={bot.id}, customer_id={customer.id}")
+            else:
+                session_obj = None
+                logger.warning("[SESSION CLOSE] Could not look up session (bot or customer missing)")
+    
+            # --- Gather critical fields with fallback/defensive extraction ---
+            critical_keys = ["name", "contact"]
+            notification = parsed.get("notification") or info_to_save.get("notification") or ""
+    
+            name = parsed.get("name") or info_to_save.get("name") or extract_field_from_notification(notification, "Name")
+            contact = (
+                parsed.get("contact")
+                or info_to_save.get("contact")
+                or extract_field_from_notification(notification, "Contact")
+                or extract_field_from_notification(notification, "Phone")
             )
-            db.session.add(lead)
-            db.session.commit()
-            logger.info(f"[LEAD] Lead saved: {lead.id}, {lead.name}, {lead.contact}, {lead.info}")
-
-            # Notify sales group if present
-            if parsed.get("notification"):
-                logger.info(f"[NOTIFY SALES GROUP]: {parsed['notification']}")
-                notify_sales_group(bot, parsed["notification"])
-        else:
-            logger.warning(
-                f"[LEAD] Not saving lead: missing required field(s) or not a win. "
-                f"name={name}, contact={contact}, instruction={parsed.get('instruction')}, close_reason={close_reason}"
-            )
-
-        # --- Always send all customer-facing messages (up to 4) ---
-        if "message" in parsed:
-            msg_lines = parsed["message"]
-            if isinstance(msg_lines, str):
-                msg_lines = [msg_lines]
-            for idx, part in enumerate(msg_lines[:4]):  # up to 4 messages
-                if part:
-                    delay = max(0, idx * 20)
-                    send_wassenger_reply(customer_phone, part, device_id, delay_seconds=delay)
-                    if bot_id and user and session_id:
-                        save_message(bot_id, customer_phone, session_id, "out", part)
-
-        return  # All done, prevents rest of function from running
+            if not contact or str(contact).strip().lower() in [
+                "whatsapp number", "[whatsapp number]", "same", "this", "use this", "ok", "yes"
+            ]:
+                contact = customer_phone
+    
+            info_fields = {}
+            for k, v in {**parsed, **info_to_save}.items():
+                if k not in critical_keys and v is not None:
+                    info_fields[k] = v
+    
+            if (
+                parsed.get("instruction") == "close_session_and_notify_sales"
+                and close_reason.startswith("won")
+                and name and contact
+            ):
+                lead = Lead(
+                    name=name,
+                    contact=contact,
+                    info=info_fields,
+                    bot_id=bot_id,
+                    business_id=getattr(bot, 'business_id', None),
+                    session_id=session_obj.id if session_obj else None,
+                    status="open"
+                )
+                db.session.add(lead)
+                db.session.commit()
+                logger.info(f"[LEAD] Lead saved: {lead.id}, {lead.name}, {lead.contact}, {lead.info}")
+    
+                # Notify sales group if present
+                if parsed.get("notification"):
+                    logger.info(f"[NOTIFY SALES GROUP]: {parsed['notification']}")
+                    notify_sales_group(bot, parsed["notification"])
+            else:
+                logger.warning(
+                    f"[LEAD] Not saving lead: missing required field(s) or not a win. "
+                    f"name={name}, contact={contact}, instruction={parsed.get('instruction')}, close_reason={close_reason}"
+                )
+    
+            # --- Always send all customer-facing messages (up to 4) ---
+            if "message" in parsed:
+                msg_lines = parsed["message"]
+                if isinstance(msg_lines, str):
+                    msg_lines = [msg_lines]
+                for idx, part in enumerate(msg_lines[:4]):  # up to 4 messages
+                    if part:
+                        delay = max(0, idx * 20)
+                        send_wassenger_reply(customer_phone, part, device_id, delay_seconds=delay)
+                        if bot_id and user and session_id:
+                            save_message(bot_id, customer_phone, session_id, "out", part)
+    
+            return  # All done, prevents rest of function from running
 
     # --- Stream/send each message line-by-line (normal flow) ---
     if "message" in parsed and isinstance(parsed["message"], list):
