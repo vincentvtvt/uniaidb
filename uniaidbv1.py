@@ -897,8 +897,15 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
             or info_to_save.get("lose_reason")
             or info_to_save.get("drop_reason")
         )
-        if close_reason in ("drop", "lost", "lose") and lose_reason:
-            close_reason = f"{close_reason}: {lose_reason}"
+        
+        if close_reason in ("drop", "lost", "lose"):
+            if lose_reason:
+                close_reason = f"{close_reason}: {lose_reason}"
+            else:
+                # If nothing clear, label as "not specified"
+                close_reason = f"{close_reason}: not specified"
+                logger.warning("[DROP/LOSE] No specific reason found, saved as 'not specified'.")
+
 
         # 2. Find and update the active session for this customer + bot
         bot = db.session.get(Bot, bot_id) if bot_id else None
