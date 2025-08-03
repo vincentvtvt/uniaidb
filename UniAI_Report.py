@@ -131,7 +131,11 @@ def send_weekly_reports():
 
     # Per-business reports
     for business_id, admin_phones_json in businesses:
-        admin_phones = json.loads(admin_phones_json or '[]')
+        if isinstance(admin_phones_json, list):
+            admin_phones = admin_phones_json
+        else:
+            admin_phones = json.loads(admin_phones_json or '[]')
+
         if not admin_phones:
             continue
         data, lose_contexts = get_report(start_date, end_date, business_id)
