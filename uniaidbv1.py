@@ -200,7 +200,7 @@ def download_to_bytes(url):
     """
     Download a file from a URL and return bytes.
     """
-    resp = requests.get(url, timeout=30)
+    resp = requests.get(url, timeout=60)
     resp.raise_for_status()
     content = resp.content
     logger.info(f"[DOWNLOAD] {len(content)} bytes downloaded from {url}. First 16 bytes: {content[:16]}")
@@ -464,7 +464,7 @@ def download_wassenger_media(url):
     """
     headers = {"Token": os.getenv("WASSENGER_API_KEY")}
     try:
-        r = requests.get(url, headers=headers, timeout=15)
+        r = requests.get(url, headers=headers, timeout=60)
         r.raise_for_status()
         return r.content
     except Exception as e:
@@ -529,7 +529,7 @@ def upload_and_send_media(recipient, file_url_or_path, device_id, caption=None, 
     )
 
 def download_to_bytes(url):
-    resp = requests.get(url, timeout=30)
+    resp = requests.get(url, timeout=60)
     resp.raise_for_status()
     return resp.content
 
@@ -577,7 +577,7 @@ def upload_any_file_to_wassenger(file_path_or_bytes, filename=None, msg_type=Non
 
     # Step 2: Upload to Wassenger
     try:
-        resp = requests.post(url, headers=headers, files=files, timeout=30)
+        resp = requests.post(url, headers=headers, files=files, timeout=60)
         if resp.status_code == 409:
             logger.warning(f"[MEDIA UPLOAD] Duplicate file detected (409 Conflict). {filename} already uploaded recently.")
             return None
@@ -647,7 +647,7 @@ def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text
     logger.debug(f"[WASSENGER PAYLOAD]: {payload}")
 
     try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=15)
+        resp = requests.post(url, json=payload, headers=headers, timeout=60)
         logger.info(f"Wassenger response: {resp.status_code} {resp.text}")
         resp.raise_for_status()
         return resp.json()
