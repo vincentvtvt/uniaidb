@@ -709,7 +709,7 @@ def save_message(bot_id, customer_phone, session_id, direction, content, raw_med
     db.session.commit()
     logger.info(f"[DB] Saved message ({direction}) for {customer_phone}: {content}")
 
-def get_latest_history(bot_id, customer_phone, session_id, n=20):
+def get_latest_history(bot_id, customer_phone, session_id, n=100):
     messages = (Message.query
         .filter_by(bot_id=bot_id, customer_phone=customer_phone, session_id=session_id)
         .order_by(Message.created_at.desc())
