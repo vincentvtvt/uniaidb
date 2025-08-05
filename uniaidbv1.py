@@ -474,11 +474,12 @@ def download_wassenger_media(url):
         return None
 
 def save_lead(
-    name, contact, info_dict, bot_id=None, business_id=None, session_id=None, status="open"
+    name, contact, info_dict, whatsapp_number,  # <-- add whatsapp_number param
+    bot_id=None, business_id=None, session_id=None, status="open"
 ):
     lead = Lead(
         name=name,
-        contact=contact,
+        whatsapp_number=whatsapp_number,  # <-- always save system number here!
         info=info_dict,
         bot_id=bot_id,
         business_id=business_id,
@@ -488,6 +489,7 @@ def save_lead(
     db.session.add(lead)
     db.session.commit()
     return lead
+
 
 
 def upload_and_send_media(recipient, file_url_or_path, device_id, caption=None, msg_type=None, delay_seconds=5):
