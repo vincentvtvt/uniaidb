@@ -92,6 +92,8 @@ class Lead(db.Model):
     status = db.Column(db.String(20), default='open')
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, onupdate=datetime.utcnow)
+    whatsapp_number = db.Column(db.String(50))
+
 
 class Tool(db.Model):
     __tablename__ = 'tools'
