@@ -474,12 +474,13 @@ def download_wassenger_media(url):
         return None
 
 def save_lead(
-    name, contact, info_dict, whatsapp_number,  # <-- add whatsapp_number param
+    name, contact, info_dict, whatsapp_number,
     bot_id=None, business_id=None, session_id=None, status="open"
 ):
     lead = Lead(
         name=name,
-        whatsapp_number=whatsapp_number,  # <-- always save system number here!
+        contact=contact,                # <-- ADD THIS LINE
+        whatsapp_number=whatsapp_number,
         info=info_dict,
         bot_id=bot_id,
         business_id=business_id,
@@ -489,8 +490,6 @@ def save_lead(
     db.session.add(lead)
     db.session.commit()
     return lead
-
-
 
 def upload_and_send_media(recipient, file_url_or_path, device_id, caption=None, msg_type=None, delay_seconds=5):
     # Guess file extension/type for filename and msg_type
@@ -985,6 +984,7 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
             lead = Lead(
                 name=name,
                 contact=contact,
+                whatsapp_number=customer_phone,  # <-- ADD THIS LINE!
                 info=info_fields,
                 bot_id=bot_id,
                 business_id=getattr(bot, 'business_id', None),
