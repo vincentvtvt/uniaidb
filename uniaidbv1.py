@@ -600,13 +600,15 @@ def upload_any_file_to_wassenger(file_path_or_bytes, filename=None, msg_type=Non
         return None
 
 
-def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text", caption=None):
+def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text", caption=None, deliver_at_iso=None):
     """
     Always upload image/pdf/media to Wassenger unless text is already a file_id.
     - For "media" or "image": handles url, file path, or bytes (auto-upload)
     - For "text": sends as text
     """
-    scheduled_time = (datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+    # Use explicit deliver_at_iso if provided; else compute from delay_seconds
+    scheduled_time = deliver_at_iso or (datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+
     url = "https://api.wassenger.com/v1/messages"
     headers = {"Content-Type": "application/json", "Token": WASSENGER_API_KEY}
     payload = {"device": device_id}
@@ -640,6 +642,7 @@ def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text
             payload["media"] = {"file": file_id}
         if caption:
             payload["message"] = caption
+        payload["deliverAt"] = scheduled_time
 
     else:
         logger.error(f"Unsupported msg_type: {msg_type}")
@@ -657,6 +660,44 @@ def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text
     except Exception as e:
         logger.error(f"[SEND WASSENGER ERROR] {e}")
         return None
+def send_messages_with_anchor(phone, lines, device_id, bot_id=None, session_id=None, gap_seconds=3):
+"""Send multi-line messages in stable order by anchoring to the first message's actual hit time."""
+if not lines:
+    return
+
+# Normalize to list of non-empty strings
+lines = [l for l in (lines if isinstance(lines, list) else [str(lines)]) if l]
+
+# 1) First message — send immediately (+1s deliverAt)
+first_text = lines[0]
+first_resp = send_wassenger_reply(phone, first_text, device_id, delay_seconds=1, msg_type="text")
+
+# 2) Use Wassenger createdAt as base time (fallback to now)
+try:
+    created_at = first_resp.get("createdAt") if isinstance(first_resp, dict) else None
+    base_time = datetime.fromisoformat(created_at.replace('Z', '+00:00')) if created_at else datetime.now(timezone.utc)
+except Exception:
+    base_time = datetime.now(timezone.utc)
+
+if bot_id and session_id:
+    try:
+        save_message(bot_id, phone, session_id, "out", first_text)
+    except Exception:
+        pass
+
+# 3) Subsequent messages — schedule relative to base_time
+for idx, part in enumerate(lines[1:], start=1):
+    try:
+        deliver_at = (base_time + timedelta(seconds=idx * gap_seconds)).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+        send_wassenger_reply(phone, part, device_id, msg_type="text", deliver_at_iso=deliver_at)
+        if bot_id and session_id:
+            try:
+                save_message(bot_id, phone, session_id, "out", part)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.error(f"[ANCHOR SEND ERROR] idx={idx} err={e}")
+
         
 def notify_sales_group(bot, message, error=False):
     import json
@@ -1005,33 +1046,17 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
                 f"name={name}, contact={contact}, instruction={parsed.get('instruction')}, close_reason={close_reason}"
             )
     
-        # --- Always send all customer-facing messages (up to 4) ---
+        # --- Always send all customer-facing messages (anchored to first hit) ---
         if "message" in parsed:
             msg_lines = parsed["message"]
-            if isinstance(msg_lines, str):
-                msg_lines = [msg_lines]
-            for idx, part in enumerate(msg_lines[:4]):  # up to 4 messages
-                if part:
-                    delay = max(0, idx * 25)
-                    send_wassenger_reply(customer_phone, part, device_id, delay_seconds=delay)
-                    if bot_id and user and session_id:
-                        save_message(bot_id, customer_phone, session_id, "out", part)
-    
-        return  # All done, prevents rest of function from running
+            send_messages_with_anchor(customer_phone, msg_lines, device_id, bot_id=bot_id, session_id=session_id, gap_seconds=3)
         
+        return  # All done, prevents rest of function from running
+
     # --- Stream/send each message line-by-line (normal flow) ---
     if "message" in parsed and isinstance(parsed["message"], list):
-        for idx, line in enumerate(parsed["message"]):
-            delay = max(0, idx * 25)
-            send_wassenger_reply(
-                customer_phone,
-                line,
-                device_id,
-                delay_seconds=delay,
-                msg_type="text"
-            )
-            if bot_id and user and session_id:
-                save_message(bot_id, customer_phone, session_id, "out", line)
+        send_messages_with_anchor(customer_phone, parsed["message"], device_id, bot_id=bot_id, session_id=session_id, gap_seconds=3)
+
     elif "message" in parsed:
         # fallback: send single message
         send_wassenger_reply(
