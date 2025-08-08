@@ -622,6 +622,8 @@ def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text
     if msg_type == "text":
         payload["message"] = text
         payload["deliverAt"] = scheduled_time
+        payload["order"] = True  # or True if you want strict ordering
+
 
     elif msg_type in ("image", "media"):
         # Always upload unless text is already a file_id
@@ -643,6 +645,8 @@ def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text
         if caption:
             payload["message"] = caption
         payload["deliverAt"] = scheduled_time
+        payload["order"] = True  # or True if you want strict ordering
+
 
     else:
         logger.error(f"Unsupported msg_type: {msg_type}")
