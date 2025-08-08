@@ -661,42 +661,42 @@ def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text
         logger.error(f"[SEND WASSENGER ERROR] {e}")
         return None
 def send_messages_with_anchor(phone, lines, device_id, bot_id=None, session_id=None, gap_seconds=3):
-"""Send multi-line messages in stable order by anchoring to the first message's actual hit time."""
-if not lines:
-    return
-
-# Normalize to list of non-empty strings
-lines = [l for l in (lines if isinstance(lines, list) else [str(lines)]) if l]
-
-# 1) First message — send immediately (+1s deliverAt)
-first_text = lines[0]
-first_resp = send_wassenger_reply(phone, first_text, device_id, delay_seconds=1, msg_type="text")
-
-# 2) Use Wassenger createdAt as base time (fallback to now)
-try:
-    created_at = first_resp.get("createdAt") if isinstance(first_resp, dict) else None
-    base_time = datetime.fromisoformat(created_at.replace('Z', '+00:00')) if created_at else datetime.now(timezone.utc)
-except Exception:
-    base_time = datetime.now(timezone.utc)
-
-if bot_id and session_id:
+    """Send multi-line messages in stable order by anchoring to the first message's actual hit time."""
+    if not lines:
+        return
+    
+    # Normalize to list of non-empty strings
+    lines = [l for l in (lines if isinstance(lines, list) else [str(lines)]) if l]
+    
+    # 1) First message — send immediately (+1s deliverAt)
+    first_text = lines[0]
+    first_resp = send_wassenger_reply(phone, first_text, device_id, delay_seconds=1, msg_type="text")
+    
+    # 2) Use Wassenger createdAt as base time (fallback to now)
     try:
-        save_message(bot_id, phone, session_id, "out", first_text)
+        created_at = first_resp.get("createdAt") if isinstance(first_resp, dict) else None
+        base_time = datetime.fromisoformat(created_at.replace('Z', '+00:00')) if created_at else datetime.now(timezone.utc)
     except Exception:
-        pass
-
-# 3) Subsequent messages — schedule relative to base_time
-for idx, part in enumerate(lines[1:], start=1):
-    try:
-        deliver_at = (base_time + timedelta(seconds=idx * gap_seconds)).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
-        send_wassenger_reply(phone, part, device_id, msg_type="text", deliver_at_iso=deliver_at)
-        if bot_id and session_id:
-            try:
-                save_message(bot_id, phone, session_id, "out", part)
-            except Exception:
-                pass
-    except Exception as e:
-        logger.error(f"[ANCHOR SEND ERROR] idx={idx} err={e}")
+        base_time = datetime.now(timezone.utc)
+    
+    if bot_id and session_id:
+        try:
+            save_message(bot_id, phone, session_id, "out", first_text)
+        except Exception:
+            pass
+    
+    # 3) Subsequent messages — schedule relative to base_time
+    for idx, part in enumerate(lines[1:], start=1):
+        try:
+            deliver_at = (base_time + timedelta(seconds=idx * gap_seconds)).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+            send_wassenger_reply(phone, part, device_id, msg_type="text", deliver_at_iso=deliver_at)
+            if bot_id and session_id:
+                try:
+                    save_message(bot_id, phone, session_id, "out", part)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.error(f"[ANCHOR SEND ERROR] idx={idx} err={e}")
 
         
 def notify_sales_group(bot, message, error=False):
