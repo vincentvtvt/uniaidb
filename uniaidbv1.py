@@ -35,6 +35,11 @@ def build_json_prompt(base_prompt, example_json):
     )
     return base_prompt.strip() + json_instruction
 
+# === Time helper for AI context (UTC+8) ===
+def get_current_datetime_str_utc8():
+    tz = timezone(timedelta(hours=8))
+    return datetime.now(tz).strftime("%a, %d %b %Y, %H:%M:%S %Z")  # e.g., Sun, 16 Aug 2025, 17:05:56 +08
+
 
 def strip_json_markdown_blocks(text):
     """Removes ```json ... ``` or ``` ... ``` wrappers from AI output."""
@@ -776,7 +781,10 @@ def build_tool_menu_for_prompt(bot_id):
 
 def decide_tool_with_manager_prompt(bot, history):
     # Build history text as before
-    history_text = "\n".join([f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}" for m in history])
+    history_text = "Current date/time (UTC+8): " + get_current_datetime_str_utc8() + "\n" + "\n".join(
+        [f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}" for m in history]
+    )
+
 
     # Build the tool menu and append to system prompt
     tool_menu = build_tool_menu_for_prompt(bot.id)
@@ -1041,9 +1049,38 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
             logger.info(f"[LEAD] Lead saved: {lead.id}, {lead.name}, {lead.contact}, {lead.info}")
     
             # Notify sales group if present
-            if parsed.get("notification"):
-                logger.info(f"[NOTIFY SALES GROUP]: {parsed['notification']}")
-                notify_sales_group(bot, parsed["notification"])
+            # --- Sales notification (always include both WhatsApp numbers) ---
+            cfg = bot.config
+            if isinstance(cfg, str):
+                import json as _json
+                cfg = _json.loads(cfg) if cfg else {}
+            notify_whatsapp = (cfg or {}).get("notification_group") or ""
+            
+            header = f"{customer_phone}\n\n{notify_whatsapp}".strip()
+            notification_text = parsed.get("notification") or ""
+            
+            whitelist = [
+                "desired_service", "industry", "area",
+                "facebook_link", "tiktok_link", "current_challenges"
+            ]
+            control_keys = {"message", "notification", "instruction", "template"}
+            
+            summary_lines = [f"{k}: {info_fields[k]}" for k in whitelist if info_fields.get(k)]
+            other_lines = [
+                f"{k}: {v}" for k, v in info_fields.items()
+                if k not in set(whitelist) | control_keys and v not in (None, "", [])
+            ]
+            
+            parts = [header]
+            if notification_text:
+                parts.append(notification_text)
+            if summary_lines or other_lines:
+                parts.append("\n".join(summary_lines + other_lines))
+            final_note = "\n\n".join(parts)
+            
+            logger.info(f"[NOTIFY SALES GROUP]: {final_note}")
+            notify_sales_group(bot, final_note)
+
         else:
             logger.warning(
                 f"[LEAD] Not saving lead: missing required field(s) or not a win. "
@@ -1166,10 +1203,11 @@ def process_buffered_messages(buffer_key):
         
         combined_text = "\n".join(m['msg_text'] for m in messages if m['msg_text'])
         history = get_latest_history(bot_id, user_phone, session_id)
-        context_input = "\n".join([
+        context_input = "Current date/time (UTC+8): " + get_current_datetime_str_utc8() + "\n" + "\n".join([
             f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}"
             for m in history
         ] + [f"User: {combined_text}"])
+
         tool_id = decide_tool_with_manager_prompt(bot, history)
         tool = None
         if tool_id and tool_id.lower() != "default":
@@ -1299,10 +1337,11 @@ def webhook():
                     break
         logger.info(f"[LOGIC] Tool selected: {tool_id}, tool obj: {tool}")
 
-        context_input = "\n".join([
+        context_input = "Current date/time (UTC+8): " + get_current_datetime_str_utc8() + "\n" + "\n".join([
             f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}"
             for m in history
         ])
+
 
         ai_reply = compose_reply(bot, tool, history, context_input)
 
