@@ -23,6 +23,8 @@ import anthropic
 MESSAGE_BUFFER = defaultdict(list)
 TIMER_BUFFER = {}
 SESSION_COOLDOWN_DAYS = int(os.getenv("SESSION_COOLDOWN_DAYS", "14"))
+TZ = timezone(timedelta(hours=8))  # Malaysia/Singapore/Beijing time (UTC+8)
+
 
 
 # --- Universal JSON Prompt Builder ---
@@ -40,6 +42,18 @@ def build_json_prompt(base_prompt, example_json):
 def get_current_datetime_str_utc8():
     tz = timezone(timedelta(hours=8))
     return datetime.now(tz).strftime("%a, %d %b %Y, %H:%M:%S %Z")  # e.g., Sun, 16 Aug 2025, 17:05:56 +08
+    
+
+def now_utc8():
+    """Return current datetime in UTC+8 (aware)."""
+    return datetime.now(TZ)
+
+def to_utc8(dt):
+    """Convert any datetime (naive or with tz) to UTC+8."""
+    if dt is None:
+        return None
+    return dt.replace(tzinfo=TZ) if dt.tzinfo is None else dt.astimezone(TZ)
+
 
 
 def strip_json_markdown_blocks(text):
@@ -537,11 +551,6 @@ def upload_and_send_media(recipient, file_url_or_path, device_id, caption=None, 
         delay_seconds=delay_seconds
     )
 
-def download_to_bytes(url):
-    resp = requests.get(url, timeout=60)
-    resp.raise_for_status()
-    return resp.content
-
 def upload_any_file_to_wassenger(file_path_or_bytes, filename=None, msg_type=None):
     """
     Uploads any file (PDF, image, etc.) to Wassenger via multipart/form-data.
@@ -748,6 +757,22 @@ def get_active_tools_for_bot(bot_id):
     )
     logger.info(f"[DB] Tools for bot_id={bot_id}: {[t.tool_id for t in tools]}")
     return tools
+    
+def now_local():
+    return datetime.now(TZ)
+    
+def naive_local(dt=None):
+    """Return tz-naive datetime in UTC+8 (strip tzinfo), for DB columns without timezone=True."""
+    d = (dt or now_local())
+    return d.replace(tzinfo=None)
+
+
+def to_local(dt):
+    if dt is None:
+        return None
+    # If DB returns naive, assume it's already local
+    return dt.replace(tzinfo=TZ) if dt.tzinfo is None else dt.astimezone(TZ)
+    
 
 def save_message(bot_id, customer_phone, session_id, direction, content, raw_media_url=None):
     msg = Message(
@@ -757,7 +782,7 @@ def save_message(bot_id, customer_phone, session_id, direction, content, raw_med
         direction=direction,
         content=content,
         raw_media_url=raw_media_url,
-        created_at=datetime.now()
+        created_at=naive_local()
     )
     db.session.add(msg)
     db.session.commit()
@@ -992,7 +1017,7 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
         # --- Update session status and context ---
         if session_obj:
             session_obj.status = "closed"
-            session_obj.ended_at = datetime.now()
+            session_obj.ended_at = now_local()
             if not session_obj.context:
                 session_obj.context = {}
             session_obj.context["close_reason"] = close_reason
@@ -1171,21 +1196,12 @@ def find_or_create_customer(phone, name=None):
     return customer
 
 def get_or_create_session(customer_id, bot_id):
-    """
-    Returns (session_obj, cooldown_active: bool)
-
-    - If an OPEN session exists -> return it, cooldown_active=False
-    - Else, if the most recent CLOSED session ended within SESSION_COOLDOWN_DAYS
-      -> return that closed session, cooldown_active=True (do NOT reopen)
-    - Else, create a new OPEN session, cooldown_active=False
-    """
-    # 1) Any open session?
     open_sess = Session.query.filter_by(customer_id=customer_id, bot_id=bot_id, status='open').first()
     if open_sess:
         return open_sess, False
 
-    # 2) Check most recent closed session
-    recent_closed = (Session.query
+    recent_closed = (
+        Session.query
         .filter_by(customer_id=customer_id, bot_id=bot_id, status='closed')
         .filter(Session.ended_at.isnot(None))
         .order_by(Session.ended_at.desc())
@@ -1193,32 +1209,34 @@ def get_or_create_session(customer_id, bot_id):
     )
 
     if recent_closed:
-        cutoff = datetime.now() - timedelta(days=SESSION_COOLDOWN_DAYS)
-        if recent_closed.ended_at and recent_closed.ended_at >= cutoff:
-            # Inside cooldown window: do NOT reopen or create a new one
+        cutoff = now_local() - timedelta(days=SESSION_COOLDOWN_DAYS)  # aware
+        ended_local = to_local(recent_closed.ended_at)                 # aware
+        if ended_local and ended_local >= cutoff:
             return recent_closed, True
 
-    # 3) Otherwise create a brand new open session
     session_obj = Session(
         customer_id=customer_id,
         bot_id=bot_id,
-        started_at=datetime.now(),
+        started_at=naive_local(),  # store naive UTC+8 in DB
         status='open',
         context={},
     )
     db.session.add(session_obj)
     db.session.commit()
     return session_obj, False
+e
+
 
 
 
 def close_session(session, reason, info: dict = None):
-    session.ended_at = datetime.now()
+    session.ended_at = naive_local()
     session.status = 'closed'
     if info:
         session.context.update(info)
     session.context['close_reason'] = reason
     db.session.commit()
+
 
 def process_buffered_messages(buffer_key):
     with app.app_context():
@@ -1307,7 +1325,7 @@ def webhook():
             Message.query.filter_by(bot_id=bot.id, customer_phone=user_phone).delete()
             db.session.commit()
             session.status = "closed"
-            session.ended_at = datetime.now()
+            session.ended_at = naive_local()
             db.session.commit()
             # create a fresh open session (cooldown bypass for manual reset)
             new_session, _ = get_or_create_session(customer.id, bot.id)
@@ -1317,7 +1335,7 @@ def webhook():
         # Force close & do not reply to customer
         if msg_text.strip().lower() == "*off*":
             session.status = "closed"
-            session.ended_at = datetime.now()
+            session.ended_at = naive_local()
             if not session.context:
                 session.context = {}
             session.context['close_reason'] = "force_closed"
@@ -1350,7 +1368,7 @@ def webhook():
         MESSAGE_BUFFER[buffer_key].append({
             "msg_text": msg_text,
             "raw_media_url": raw_media_url,
-            "created_at": datetime.now().isoformat(),
+            "created_at": now_local().isoformat(),
             "device_id": device_id,
         })
 
