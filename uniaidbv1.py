@@ -22,9 +22,6 @@ import anthropic
 # Message buffer: {(bot_id, user_phone, session_id): [msg1, msg2, ...]}
 MESSAGE_BUFFER = defaultdict(list)
 TIMER_BUFFER = {}
-SESSION_COOLDOWN_DAYS = int(os.getenv("SESSION_COOLDOWN_DAYS", "14"))
-TZ = timezone(timedelta(hours=8))  # Malaysia/Singapore/Beijing time (UTC+8)
-
 
 
 # --- Universal JSON Prompt Builder ---
@@ -42,18 +39,6 @@ def build_json_prompt(base_prompt, example_json):
 def get_current_datetime_str_utc8():
     tz = timezone(timedelta(hours=8))
     return datetime.now(tz).strftime("%a, %d %b %Y, %H:%M:%S %Z")  # e.g., Sun, 16 Aug 2025, 17:05:56 +08
-    
-
-def now_utc8():
-    """Return current datetime in UTC+8 (aware)."""
-    return datetime.now(TZ)
-
-def to_utc8(dt):
-    """Convert any datetime (naive or with tz) to UTC+8."""
-    if dt is None:
-        return None
-    return dt.replace(tzinfo=TZ) if dt.tzinfo is None else dt.astimezone(TZ)
-
 
 
 def strip_json_markdown_blocks(text):
@@ -551,6 +536,11 @@ def upload_and_send_media(recipient, file_url_or_path, device_id, caption=None, 
         delay_seconds=delay_seconds
     )
 
+def download_to_bytes(url):
+    resp = requests.get(url, timeout=60)
+    resp.raise_for_status()
+    return resp.content
+
 def upload_any_file_to_wassenger(file_path_or_bytes, filename=None, msg_type=None):
     """
     Uploads any file (PDF, image, etc.) to Wassenger via multipart/form-data.
@@ -757,22 +747,6 @@ def get_active_tools_for_bot(bot_id):
     )
     logger.info(f"[DB] Tools for bot_id={bot_id}: {[t.tool_id for t in tools]}")
     return tools
-    
-def now_local():
-    return datetime.now(TZ)
-    
-def naive_local(dt=None):
-    """Return tz-naive datetime in UTC+8 (strip tzinfo), for DB columns without timezone=True."""
-    d = (dt or now_local())
-    return d.replace(tzinfo=None)
-
-
-def to_local(dt):
-    if dt is None:
-        return None
-    # If DB returns naive, assume it's already local
-    return dt.replace(tzinfo=TZ) if dt.tzinfo is None else dt.astimezone(TZ)
-    
 
 def save_message(bot_id, customer_phone, session_id, direction, content, raw_media_url=None):
     msg = Message(
@@ -782,7 +756,7 @@ def save_message(bot_id, customer_phone, session_id, direction, content, raw_med
         direction=direction,
         content=content,
         raw_media_url=raw_media_url,
-        created_at=naive_local()
+        created_at=datetime.now()
     )
     db.session.add(msg)
     db.session.commit()
@@ -1017,7 +991,7 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
         # --- Update session status and context ---
         if session_obj:
             session_obj.status = "closed"
-            session_obj.ended_at = now_local()
+            session_obj.ended_at = datetime.now()
             if not session_obj.context:
                 session_obj.context = {}
             session_obj.context["close_reason"] = close_reason
@@ -1196,47 +1170,27 @@ def find_or_create_customer(phone, name=None):
     return customer
 
 def get_or_create_session(customer_id, bot_id):
-    open_sess = Session.query.filter_by(customer_id=customer_id, bot_id=bot_id, status='open').first()
-    if open_sess:
-        return open_sess, False
-
-    recent_closed = (
-        Session.query
-        .filter_by(customer_id=customer_id, bot_id=bot_id, status='closed')
-        .filter(Session.ended_at.isnot(None))
-        .order_by(Session.ended_at.desc())
-        .first()
-    )
-
-    if recent_closed:
-        cutoff = now_local() - timedelta(days=SESSION_COOLDOWN_DAYS)  # aware
-        ended_local = to_local(recent_closed.ended_at)                 # aware
-        if ended_local and ended_local >= cutoff:
-            return recent_closed, True
-
-    session_obj = Session(
-        customer_id=customer_id,
-        bot_id=bot_id,
-        started_at=naive_local(),  # store naive UTC+8 in DB
-        status='open',
-        context={},
-    )
-    db.session.add(session_obj)
-    db.session.commit()
-    return session_obj, False
-e
-
-
+    session_obj = Session.query.filter_by(customer_id=customer_id, bot_id=bot_id, status='open').first()
+    if not session_obj:
+        session_obj = Session(
+            customer_id=customer_id,
+            bot_id=bot_id,
+            started_at=datetime.now(),
+            status='open',
+            context={},
+        )
+        db.session.add(session_obj)
+        db.session.commit()
+    return session_obj
 
 
 def close_session(session, reason, info: dict = None):
-    session.ended_at = naive_local()
+    session.ended_at = datetime.now()
     session.status = 'closed'
     if info:
         session.context.update(info)
     session.context['close_reason'] = reason
     db.session.commit()
-
 
 def process_buffered_messages(buffer_key):
     with app.app_context():
@@ -1274,116 +1228,146 @@ def webhook():
 
     try:
         msg = data["data"]
-
-        # Ignore outbound echoes
+        msg_type = msg.get("type")
         if msg.get("flow") == "outbound":
             return jsonify({"status": "ignored"}), 200
-
-        # Ignore all group messages
+        # Ignore all group messages (from group chat)
         if (
-            "@g.us" in msg.get("from", "")
-            or (msg.get("chat", {}).get("type") == "group")
-            or msg.get("meta", {}).get("isGroup") is True
+            "@g.us" in msg.get("from", "")  # sender is a group
+            or (msg.get("chat", {}).get("type") == "group")  # chat type is group
+            or msg.get("meta", {}).get("isGroup") is True    # meta says is group
         ):
             logger.info(f"[WEBHOOK] Ignored group message from: {msg.get('from')}")
             return jsonify({"status": "ignored_group"}), 200
+        
 
         bot_phone = msg.get("toNumber")
         user_phone = msg.get("fromNumber")
         device_id = data["device"]["id"]
 
-        # Bot lookup
+        # 1. Extract bot and message first
         bot = get_bot_by_phone(bot_phone)
         if not bot:
             logger.error(f"[ERROR] No bot found for phone {bot_phone}")
             return jsonify({"error": "Bot not found"}), 404
 
-        # --- Extract content ---
         msg_type = msg.get("type")
         if msg_type == "audio":
             extract_result, raw_media_url = extract_text_from_message(msg)
-            transcript = extract_result.get("transcript") or "[audio]"
-            gpt_reply = extract_result.get("gpt_reply")
-            msg_text = gpt_reply or transcript
+            transcript = extract_result["transcript"]
+            gpt_reply = extract_result["gpt_reply"]
+            # Save the transcript as the 'in' message
+            customer = find_or_create_customer(user_phone)
+            session = get_or_create_session(customer.id, bot.id)
+            session_id = str(session.id)
+            save_message(bot.id, user_phone, session_id, "in", transcript, raw_media_url=raw_media_url)
+            msg_text = gpt_reply or transcript  # For downstream use (AI, etc)
         else:
             msg_text, raw_media_url = extract_text_from_message(msg)
+            customer = find_or_create_customer(user_phone)
+            session = get_or_create_session(customer.id, bot.id)
+            session_id = str(session.id)
+            save_message(bot.id, user_phone, session_id, "in", msg_text, raw_media_url=raw_media_url)
 
-        # --- Customer & session (cooldown-aware) ---
-        customer = find_or_create_customer(user_phone)
-
-        # IMPORTANT: you must have replaced get_or_create_session with the cooldown-aware version:
-        #   returns (session_obj, cooldown_active: bool)
-        session, cooldown_active = get_or_create_session(customer.id, bot.id)
-        session_id = str(session.id)
-
-        # Save inbound message once
-        save_message(bot.id, user_phone, session_id, "in", msg_text, raw_media_url=raw_media_url)
-
-        # --- Triggers (admin overrides) ---
-        # Refresh conversation & start a new session
+                # ✅ ✅ ADD TRIGGER HANDLER HERE ✅ ✅
         if msg_text.strip() == "*.*":
+            # Delete all previous conversation & restart session
             Message.query.filter_by(bot_id=bot.id, customer_phone=user_phone).delete()
             db.session.commit()
+            # Close existing session & start a new one
             session.status = "closed"
-            session.ended_at = naive_local()
+            session.ended_at = datetime.now()
             db.session.commit()
-            # create a fresh open session (cooldown bypass for manual reset)
-            new_session, _ = get_or_create_session(customer.id, bot.id)
+            new_session = get_or_create_session(customer.id, bot.id)
             send_wassenger_reply(user_phone, "Convo Refreshed", device_id, delay_seconds=1)
             return jsonify({"status": "conversation_refreshed"}), 200
 
-        # Force close & do not reply to customer
         if msg_text.strip().lower() == "*off*":
+            # Force close session, do not reply to customer
             session.status = "closed"
-            session.ended_at = naive_local()
-            if not session.context:
-                session.context = {}
+            session.ended_at = datetime.now()
             session.context['close_reason'] = "force_closed"
             db.session.commit()
             logger.info(f"[SESSION] Force closed for {user_phone}")
-            notify_sales_group(bot, f"Session for {user_phone} was force closed by agent/trigger.")
+            # Notify sales group (optional but recommended for audit trail)
+            note = f"Session for {user_phone} was force closed by agent/trigger."
+            notify_sales_group(bot, note)
             return jsonify({"status": "force_closed"}), 200
+        # ✅ ✅ END OF TRIGGER HANDLER ✅ ✅
 
-        # --- Cooldown gate (do not reopen / do not process AI) ---
-        if cooldown_active:
-            try:
-                # One-off polite notice per cooldown window
-                if not (session.context or {}).get("cooldown_notified"):
-                    send_wassenger_reply(
-                        user_phone,
-                        "Thanks for your message. We’re still wrapping up your previous request. Our team will follow up soon.",
-                        device_id,
-                        delay_seconds=1
-                    )
-                    if not session.context:
-                        session.context = {}
-                    session.context["cooldown_notified"] = True
-                    db.session.commit()
-            except Exception:
-                pass
-            return jsonify({"status": "cooldown_active_no_new_session"}), 200
-
-        # --- Buffer the message (unchanged) ---
+            # Add to message buffer
+        # Add to message buffer and start/refresh the timer
         buffer_key = (bot.id, user_phone, session_id)
         MESSAGE_BUFFER[buffer_key].append({
             "msg_text": msg_text,
             "raw_media_url": raw_media_url,
-            "created_at": now_local().isoformat(),
-            "device_id": device_id,
+            "created_at": datetime.now().isoformat(),
+            "device_id": device_id,    # ADD THIS LINE
         })
 
-        # Start/reset 30s buffer timer
+        # --- Start or reset the 30s buffer timer for this key ---
         if buffer_key in TIMER_BUFFER and TIMER_BUFFER[buffer_key]:
             TIMER_BUFFER[buffer_key].cancel()
         TIMER_BUFFER[buffer_key] = Timer(30, process_buffered_messages, args=(buffer_key,))
         TIMER_BUFFER[buffer_key].start()
 
-        return jsonify({"status": "buffered, will process in 30s"}), 200
+        return jsonify({"status": "buffered, will process in 30s"})
+
+    
+
+        
+        # Buffer timer logic
+        if buffer_key in TIMER_BUFFER and TIMER_BUFFER[buffer_key]:
+            TIMER_BUFFER[buffer_key].cancel()  # Reset the timer
+        TIMER_BUFFER[buffer_key] = Timer(30, process_buffered_messages, args=(buffer_key,))
+        TIMER_BUFFER[buffer_key].start()
+
+        return jsonify({"status": "buffered, will process in 30s"})
+
+        # 3. Only save incoming message ONCE, after customer/session created
+        history = get_latest_history(bot.id, user_phone, session_id)
+
+        # 4. Compose tool and context
+        tool_id = decide_tool_with_manager_prompt(bot, history)
+        tool = None
+        if tool_id and tool_id.lower() != "default":
+            for t in get_active_tools_for_bot(bot.id):
+                if t.tool_id == tool_id:
+                    tool = t
+                    break
+        logger.info(f"[LOGIC] Tool selected: {tool_id}, tool obj: {tool}")
+
+        context_input = "Current date/time (UTC+8): " + get_current_datetime_str_utc8() + "\n" + "\n".join([
+            f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}"
+            for m in history
+        ])
+
+
+        ai_reply = compose_reply(bot, tool, history, context_input)
+
+        # 5. Parse AI reply and handle customer info
+        try:
+            ai_reply_stripped = strip_json_markdown_blocks(ai_reply)
+            parsed = ai_reply if isinstance(ai_reply, dict) else json.loads(ai_reply_stripped)
+        except Exception as e:
+            logger.error(f"[WEBHOOK] Could not parse AI reply as JSON: {ai_reply} ({e})")
+            parsed = {}
+
+
+        # 6. Update customer info only after parsed
+        if "name" in parsed:
+            customer.name = parsed["name"]
+            db.session.commit()
+        # (add more: area, language, etc. if in parsed)
+
+
+        # 8. Only send/process reply if session is NOT closed
+        process_ai_reply_and_send(user_phone, ai_reply, device_id, bot_id=bot.id, user=user_phone, session_id=session_id)
+        return jsonify({"status": "ok"})
 
     except Exception as e:
-        logger.exception(f"[WEBHOOK] Unhandled exception: {e}")
-        return jsonify({"error": "internal_error"}), 500
-
+        logger.error(f"[WEBHOOK] Exception: {e}")
+        return jsonify({"error": "Webhook processing error"}), 500
 
 # 9. Main run block at file bottom only!
 if __name__ == "__main__":
