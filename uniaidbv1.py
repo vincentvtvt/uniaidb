@@ -17,6 +17,8 @@ import os
 from threading import Timer
 from collections import defaultdict
 import anthropic
+UTC_PLUS_8 = timezone(timedelta(hours=8))
+
 
 
 # Message buffer: {(bot_id, user_phone, session_id): [msg1, msg2, ...]}
@@ -39,6 +41,30 @@ def build_json_prompt(base_prompt, example_json):
 def get_current_datetime_str_utc8():
     tz = timezone(timedelta(hours=8))
     return datetime.now(tz).strftime("%a, %d %b %Y, %H:%M:%S %Z")  # e.g., Sun, 16 Aug 2025, 17:05:56 +08
+    
+def make_timezone_aware(dt):
+    """
+    Ensure datetime is timezone-aware (UTC+8).
+    If naive, assume it's UTC+8 and make it aware.
+    If already aware, convert to UTC+8.
+    """
+    if dt is None:
+        return None
+    
+    if dt.tzinfo is None:
+        # Naive datetime - assume UTC+8
+        return dt.replace(tzinfo=UTC_PLUS_8)
+    else:
+        # Already aware - convert to UTC+8
+        return dt.astimezone(UTC_PLUS_8)
+
+def get_current_datetime_utc8():
+    """
+    Get current datetime in UTC+8 (timezone-aware).
+    Returns a datetime OBJECT, not a string.
+    Different from get_current_datetime_str_utc8() which returns a STRING.
+    """
+    return datetime.now(UTC_PLUS_8)
 
 
 def strip_json_markdown_blocks(text):
@@ -756,7 +782,7 @@ def save_message(bot_id, customer_phone, session_id, direction, content, raw_med
         direction=direction,
         content=content,
         raw_media_url=raw_media_url,
-        created_at=datetime.now()
+        created_at=get_current_datetime_utc8()
     )
     db.session.add(msg)
     db.session.commit()
@@ -998,7 +1024,7 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
         # --- Update session status and context ---
         if session_obj:
             session_obj.status = "closed"
-            session_obj.ended_at = datetime.now()
+            session_obj.ended_at = get_current_datetime_utc8()
             if not session_obj.context:
                 session_obj.context = {}
             session_obj.context["close_reason"] = close_reason
@@ -1181,15 +1207,24 @@ def check_recent_closed_session(customer_id, bot_id, days_threshold=14):
     Check if there's a recently closed session within the specified days threshold.
     Returns the session if found, None otherwise.
     """
-    cutoff_date = datetime.now() - timedelta(days=days_threshold)
+    # Use timezone-aware current time
+    current_time = get_current_datetime_utc8()  # Uses the new function
+    cutoff_date = current_time - timedelta(days=days_threshold)
+    
     recent_session = (
         Session.query
         .filter_by(customer_id=customer_id, bot_id=bot_id, status='closed')
-        .filter(Session.ended_at >= cutoff_date)
         .order_by(Session.ended_at.desc())
         .first()
     )
-    return recent_session
+    
+    # Check with timezone-aware comparison
+    if recent_session and recent_session.ended_at:
+        ended_at_aware = make_timezone_aware(recent_session.ended_at)
+        if ended_at_aware >= cutoff_date:
+            return recent_session
+    
+    return None
 
 def get_or_create_session(customer_id, bot_id):
     """
@@ -1211,7 +1246,7 @@ def get_or_create_session(customer_id, bot_id):
         session_obj = Session(
             customer_id=customer_id,
             bot_id=bot_id,
-            started_at=datetime.now(),
+            started_at=get_current_datetime_utc8(),
             status='open',
             context={},
         )
@@ -1241,7 +1276,7 @@ def generate_processing_message(customer_language=None):
 
 
 def close_session(session, reason, info: dict = None):
-    session.ended_at = datetime.now()
+    session.ended_at = get_current_datetime_utc8()
     session.status = 'closed'
     if info:
         session.context.update(info)
@@ -1342,11 +1377,17 @@ def webhook():
         
         # CHECK 2: If this is a recently closed session (within 14 days)
         if hasattr(session, 'is_recently_closed') and session.is_recently_closed:
-            # Calculate days since closure
-            days_since_closed = (datetime.now() - session.ended_at).days
+            # Calculate days since closure with timezone handling
+            current_time = get_current_datetime_utc8()  # datetime object
+            ended_at = make_timezone_aware(session.ended_at)
+            
+            if ended_at:
+                days_since_closed = (current_time - ended_at).days
+            else:
+                days_since_closed = 0
             
             logger.info(f"[SESSION] Recently closed session detected for {user_phone}, closed {days_since_closed} days ago")
-            
+                
             # Generate processing message in customer's preferred language
             processing_msg = generate_processing_message(customer.language)
             
@@ -1363,7 +1404,7 @@ def webhook():
             if days_since_closed <= 7:
                 # Check if we already notified about this attempt today
                 last_notification = session.context.get('last_reopen_notification')
-                today = datetime.now().date().isoformat()
+                today = get_current_datetime_utc8().date().isoformat()
                 
                 if last_notification != today:
                     notify_msg = f"Customer {user_phone} attempted to restart conversation.\nSession was closed {days_since_closed} days ago.\nReason: {session.context.get('close_reason', 'Not specified')}"
@@ -1387,12 +1428,12 @@ def webhook():
             db.session.commit()
             # Force close existing session & start a new one
             session.status = "closed"
-            session.ended_at = datetime.now() - timedelta(days=15)  # Bypass 14-day check
+            session.ended_at = get_current_datetime_utc8() - timedelta(days=15)  # Bypass 14-day check
             db.session.commit()
             new_session = Session(
                 customer_id=customer.id,
                 bot_id=bot.id,
-                started_at=datetime.now(),
+                started_at=get_current_datetime_utc8(),
                 status='open',
                 context={},
             )
@@ -1404,7 +1445,7 @@ def webhook():
         if msg_text.strip().lower() == "*off*":
             # Force close session
             session.status = "closed"
-            session.ended_at = datetime.now()
+            session.ended_at = get_current_datetime_utc8()
             session.context['close_reason'] = "force_closed"
             db.session.commit()
             logger.info(f"[SESSION] Force closed for {user_phone}")
@@ -1417,7 +1458,7 @@ def webhook():
         MESSAGE_BUFFER[buffer_key].append({
             "msg_text": msg_text,
             "raw_media_url": raw_media_url,
-            "created_at": datetime.now().isoformat(),
+            "created_at": get_current_datetime_utc8().isoformat(),
             "device_id": device_id,
         })
 
