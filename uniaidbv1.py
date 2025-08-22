@@ -914,6 +914,13 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
     with short delays, and saves each outgoing message to DB.
     Handles special session-closing logic for notification/lead/closing.
     """
+    
+    # CHECK: Verify session is still open before processing
+    if session_id:
+        session = db.session.query(Session).filter_by(id=int(session_id)).first()
+        if session and session.status == 'closed':
+            logger.info(f"[AI REPLY] Session {session_id} is already closed. Skipping message send.")
+            return
 
     def extract_field_from_notification(notification, field):
         if not notification:
@@ -1197,7 +1204,6 @@ def get_or_create_session(customer_id, bot_id):
         
         if recent_closed:
             # Return the closed session with a flag indicating it shouldn't be reopened
-            # Add a flag to indicate this is a recently closed session
             recent_closed.is_recently_closed = True
             return recent_closed
         
@@ -1211,6 +1217,10 @@ def get_or_create_session(customer_id, bot_id):
         )
         db.session.add(session_obj)
         db.session.commit()
+    
+    # Check if the session is already closed (important check!)
+    if session_obj.status == 'closed':
+        session_obj.is_already_closed = True
     
     return session_obj
 
@@ -1245,11 +1255,24 @@ def process_buffered_messages(buffer_key):
         messages = MESSAGE_BUFFER.pop(buffer_key, [])
         if not messages:
             return
-        device_id = messages[-1].get("device_id") 
+        device_id = messages[-1].get("device_id")
+        
+        # CHECK: Get session and verify it's still open
+        session = db.session.query(Session).filter_by(id=int(session_id)).first()
+        if session and session.status == 'closed':
+            logger.info(f"[BUFFER PROCESS] Session {session_id} is already closed. Skipping AI processing.")
+            # Just acknowledge without processing
+            return
         
         combined_text = "\n".join(m['msg_text'] for m in messages if m['msg_text'])
         history = get_latest_history(bot_id, user_phone, session_id)
-        context_input = "Current date/time (UTC+8): " + get_current_datetime_str_utc8() + "\n" + "\n".join([
+        
+        # Add session status to context to prevent AI from closing again
+        session_status_note = ""
+        if session and session.status == 'closed':
+            session_status_note = "\n[SYSTEM NOTE: This session is already closed. Do not generate close_session instructions.]"
+        
+        context_input = "Current date/time (UTC+8): " + get_current_datetime_str_utc8() + session_status_note + "\n" + "\n".join([
             f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}"
             for m in history
         ] + [f"User: {combined_text}"])
@@ -1270,91 +1293,101 @@ def webhook():
     logger.info("[WEBHOOK] Received POST /webhook")
     data = request.json
     logger.info(f"[WEBHOOK] Full incoming message: {json.dumps(data)}")
-    logger.info(f"[WEBHOOK] Incoming data: {data}")
 
     try:
         msg = data["data"]
         msg_type = msg.get("type")
         if msg.get("flow") == "outbound":
             return jsonify({"status": "ignored"}), 200
-        # Ignore all group messages (from group chat)
+            
+        # Ignore all group messages
         if (
-            "@g.us" in msg.get("from", "")  # sender is a group
-            or (msg.get("chat", {}).get("type") == "group")  # chat type is group
-            or msg.get("meta", {}).get("isGroup") is True    # meta says is group
+            "@g.us" in msg.get("from", "")
+            or (msg.get("chat", {}).get("type") == "group")
+            or msg.get("meta", {}).get("isGroup") is True
         ):
             logger.info(f"[WEBHOOK] Ignored group message from: {msg.get('from')}")
             return jsonify({"status": "ignored_group"}), 200
-        
 
         bot_phone = msg.get("toNumber")
         user_phone = msg.get("fromNumber")
         device_id = data["device"]["id"]
 
-        # 1. Extract bot and message first
+        # Extract bot and message first
         bot = get_bot_by_phone(bot_phone)
         if not bot:
             logger.error(f"[ERROR] No bot found for phone {bot_phone}")
             return jsonify({"error": "Bot not found"}), 404
 
-        msg_type = msg.get("type")
+        # Extract message content
         if msg_type == "audio":
             extract_result, raw_media_url = extract_text_from_message(msg)
             transcript = extract_result["transcript"]
             gpt_reply = extract_result["gpt_reply"]
-            # Save the transcript as the 'in' message
-            # Get or create customer
-            customer = find_or_create_customer(user_phone)
-            
-            # Get or create session with 14-day check
-            session = get_or_create_session(customer.id, bot.id)
-            
-            # Check if this is a recently closed session (within 14 days)
-            if hasattr(session, 'is_recently_closed') and session.is_recently_closed:
-                # Calculate days since closure
-                days_since_closed = (datetime.now() - session.ended_at).days
-                
-                logger.info(f"[SESSION] Recently closed session detected for {user_phone}, closed {days_since_closed} days ago")
-                
-                # Generate processing message in customer's preferred language
-                processing_msg = generate_processing_message(customer.language)
-                
-                # Send the processing message with proper formatting
-                send_wassenger_reply(
-                    user_phone,
-                    processing_msg,
-                    device_id,
-                    delay_seconds=1,
-                    msg_type="text"
-                )
-                
-                # Optionally notify sales team about the attempt
-                if days_since_closed <= 7:
-                    notify_msg = f"Customer {user_phone} attempted to restart conversation.\nSession was closed {days_since_closed} days ago.\nReason: {session.context.get('close_reason', 'Not specified')}"
-                    notify_sales_group(bot, notify_msg)
-                
-                return jsonify({"status": "recently_closed_session", "days_since_closed": days_since_closed}), 200
-            
-            session_id = str(session.id)
-            
-            # Save the incoming message
-            save_message(bot.id, user_phone, session_id, "in", msg_text, raw_media_url=raw_media_url)
-            msg_text = gpt_reply or transcript  # For downstream use (AI, etc)
+            msg_text = gpt_reply or transcript
         else:
             msg_text, raw_media_url = extract_text_from_message(msg)
-            customer = find_or_create_customer(user_phone)
-            session = get_or_create_session(customer.id, bot.id)
-            session_id = str(session.id)
-            save_message(bot.id, user_phone, session_id, "in", msg_text, raw_media_url=raw_media_url)
 
-                # ✅ ✅ ADD TRIGGER HANDLER HERE ✅ ✅
+        # Get or create customer
+        customer = find_or_create_customer(user_phone)
+        
+        # Get or create session with checks
+        session = get_or_create_session(customer.id, bot.id)
+        
+        # CHECK 1: If session is already closed (not recently, but currently)
+        if hasattr(session, 'is_already_closed') and session.is_already_closed:
+            logger.info(f"[SESSION] Message received for already closed session from {user_phone}")
+            # Don't process anything for closed sessions
+            return jsonify({"status": "session_already_closed"}), 200
+        
+        # CHECK 2: If this is a recently closed session (within 14 days)
+        if hasattr(session, 'is_recently_closed') and session.is_recently_closed:
+            # Calculate days since closure
+            days_since_closed = (datetime.now() - session.ended_at).days
+            
+            logger.info(f"[SESSION] Recently closed session detected for {user_phone}, closed {days_since_closed} days ago")
+            
+            # Generate processing message in customer's preferred language
+            processing_msg = generate_processing_message(customer.language)
+            
+            # Send ONE processing message only
+            send_wassenger_reply(
+                user_phone,
+                processing_msg,
+                device_id,
+                delay_seconds=1,
+                msg_type="text"
+            )
+            
+            # Notify sales team ONCE about the attempt (only for very recent attempts)
+            if days_since_closed <= 7:
+                # Check if we already notified about this attempt today
+                last_notification = session.context.get('last_reopen_notification')
+                today = datetime.now().date().isoformat()
+                
+                if last_notification != today:
+                    notify_msg = f"Customer {user_phone} attempted to restart conversation.\nSession was closed {days_since_closed} days ago.\nReason: {session.context.get('close_reason', 'Not specified')}"
+                    notify_sales_group(bot, notify_msg)
+                    
+                    # Update session context to track notification
+                    session.context['last_reopen_notification'] = today
+                    db.session.commit()
+            
+            return jsonify({"status": "recently_closed_session", "days_since_closed": days_since_closed}), 200
+        
+        session_id = str(session.id)
+        
+        # Save the incoming message
+        save_message(bot.id, user_phone, session_id, "in", msg_text, raw_media_url=raw_media_url)
+
+        # Handle special triggers
         if msg_text.strip() == "*.*":
             # Delete all previous conversation & restart session
             Message.query.filter_by(bot_id=bot.id, customer_phone=user_phone).delete()
             db.session.commit()
-            # Force close existing session & start a new one (bypassing 14-day check)
+            # Force close existing session & start a new one
             session.status = "closed"
-            session.ended_at = datetime.now() - timedelta(days=15)  # Set to 15 days ago to bypass check
+            session.ended_at = datetime.now() - timedelta(days=15)  # Bypass 14-day check
             db.session.commit()
             new_session = Session(
                 customer_id=customer.id,
@@ -1369,87 +1402,32 @@ def webhook():
             return jsonify({"status": "conversation_refreshed"}), 200
 
         if msg_text.strip().lower() == "*off*":
-            # Force close session, do not reply to customer
+            # Force close session
             session.status = "closed"
             session.ended_at = datetime.now()
             session.context['close_reason'] = "force_closed"
             db.session.commit()
             logger.info(f"[SESSION] Force closed for {user_phone}")
-            # Notify sales group (optional but recommended for audit trail)
             note = f"Session for {user_phone} was force closed by agent/trigger."
             notify_sales_group(bot, note)
             return jsonify({"status": "force_closed"}), 200
-        # ✅ ✅ END OF TRIGGER HANDLER ✅ ✅
 
-            # Add to message buffer
-        # Add to message buffer and start/refresh the timer
+        # Continue with buffer processing for OPEN sessions only
         buffer_key = (bot.id, user_phone, session_id)
         MESSAGE_BUFFER[buffer_key].append({
             "msg_text": msg_text,
             "raw_media_url": raw_media_url,
             "created_at": datetime.now().isoformat(),
-            "device_id": device_id,    # ADD THIS LINE
+            "device_id": device_id,
         })
 
-        # --- Start or reset the 30s buffer timer for this key ---
+        # Start or reset the 30s buffer timer
         if buffer_key in TIMER_BUFFER and TIMER_BUFFER[buffer_key]:
             TIMER_BUFFER[buffer_key].cancel()
         TIMER_BUFFER[buffer_key] = Timer(30, process_buffered_messages, args=(buffer_key,))
         TIMER_BUFFER[buffer_key].start()
 
         return jsonify({"status": "buffered, will process in 30s"})
-
-    
-
-        
-        # Buffer timer logic
-        if buffer_key in TIMER_BUFFER and TIMER_BUFFER[buffer_key]:
-            TIMER_BUFFER[buffer_key].cancel()  # Reset the timer
-        TIMER_BUFFER[buffer_key] = Timer(30, process_buffered_messages, args=(buffer_key,))
-        TIMER_BUFFER[buffer_key].start()
-
-        return jsonify({"status": "buffered, will process in 30s"})
-
-        # 3. Only save incoming message ONCE, after customer/session created
-        history = get_latest_history(bot.id, user_phone, session_id)
-
-        # 4. Compose tool and context
-        tool_id = decide_tool_with_manager_prompt(bot, history)
-        tool = None
-        if tool_id and tool_id.lower() != "default":
-            for t in get_active_tools_for_bot(bot.id):
-                if t.tool_id == tool_id:
-                    tool = t
-                    break
-        logger.info(f"[LOGIC] Tool selected: {tool_id}, tool obj: {tool}")
-
-        context_input = "Current date/time (UTC+8): " + get_current_datetime_str_utc8() + "\n" + "\n".join([
-            f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}"
-            for m in history
-        ])
-
-
-        ai_reply = compose_reply(bot, tool, history, context_input)
-
-        # 5. Parse AI reply and handle customer info
-        try:
-            ai_reply_stripped = strip_json_markdown_blocks(ai_reply)
-            parsed = ai_reply if isinstance(ai_reply, dict) else json.loads(ai_reply_stripped)
-        except Exception as e:
-            logger.error(f"[WEBHOOK] Could not parse AI reply as JSON: {ai_reply} ({e})")
-            parsed = {}
-
-
-        # 6. Update customer info only after parsed
-        if "name" in parsed:
-            customer.name = parsed["name"]
-            db.session.commit()
-        # (add more: area, language, etc. if in parsed)
-
-
-        # 8. Only send/process reply if session is NOT closed
-        process_ai_reply_and_send(user_phone, ai_reply, device_id, bot_id=bot.id, user=user_phone, session_id=session_id)
-        return jsonify({"status": "ok"})
 
     except Exception as e:
         logger.error(f"[WEBHOOK] Exception: {e}")
