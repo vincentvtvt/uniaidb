@@ -1169,9 +1169,39 @@ def find_or_create_customer(phone, name=None):
         db.session.commit()
     return customer
 
+def check_recent_closed_session(customer_id, bot_id, days_threshold=14):
+    """
+    Check if there's a recently closed session within the specified days threshold.
+    Returns the session if found, None otherwise.
+    """
+    cutoff_date = datetime.now() - timedelta(days=days_threshold)
+    recent_session = (
+        Session.query
+        .filter_by(customer_id=customer_id, bot_id=bot_id, status='closed')
+        .filter(Session.ended_at >= cutoff_date)
+        .order_by(Session.ended_at.desc())
+        .first()
+    )
+    return recent_session
+
 def get_or_create_session(customer_id, bot_id):
+    """
+    Modified version with 14-day check for recently closed sessions
+    """
+    # First check for an open session
     session_obj = Session.query.filter_by(customer_id=customer_id, bot_id=bot_id, status='open').first()
+    
     if not session_obj:
+        # Check if there's a recently closed session (within 14 days)
+        recent_closed = check_recent_closed_session(customer_id, bot_id, days_threshold=14)
+        
+        if recent_closed:
+            # Return the closed session with a flag indicating it shouldn't be reopened
+            # Add a flag to indicate this is a recently closed session
+            recent_closed.is_recently_closed = True
+            return recent_closed
+        
+        # No recent closed session, create a new one
         session_obj = Session(
             customer_id=customer_id,
             bot_id=bot_id,
@@ -1181,7 +1211,23 @@ def get_or_create_session(customer_id, bot_id):
         )
         db.session.add(session_obj)
         db.session.commit()
+    
     return session_obj
+
+def generate_processing_message(customer_language=None):
+    """
+    Generate a "we're processing your request" message in the customer's preferred language
+    """
+    messages = {
+        'en': "Thank you for reaching out. We are currently processing your previous request. Our team will contact you soon with an update.",
+        'ms': "Terima kasih kerana menghubungi kami. Kami sedang memproses permintaan anda yang sebelumnya. Pasukan kami akan menghubungi anda tidak lama lagi dengan kemaskini.",
+        'zh': "感谢您的联系。我们目前正在处理您之前的请求。我们的团队将很快与您联系并提供更新。",
+        'ta': "தொடர்பு கொண்டதற்கு நன்றி. உங்கள் முந்தைய கோரிக்கையை நாங்கள் தற்போது செயலாக்கி வருகிறோம். எங்கள் குழு விரைவில் புதுப்பிப்புடன் உங்களை தொடர்பு கொள்ளும்.",
+        'default': "Thank you for reaching out. We are currently processing your previous request. Our team will contact you soon with an update."
+    }
+    
+    language = customer_language or 'default'
+    return messages.get(language, messages['default'])
 
 
 def close_session(session, reason, info: dict = None):
@@ -1257,10 +1303,42 @@ def webhook():
             transcript = extract_result["transcript"]
             gpt_reply = extract_result["gpt_reply"]
             # Save the transcript as the 'in' message
+            # Get or create customer
             customer = find_or_create_customer(user_phone)
+            
+            # Get or create session with 14-day check
             session = get_or_create_session(customer.id, bot.id)
+            
+            # Check if this is a recently closed session (within 14 days)
+            if hasattr(session, 'is_recently_closed') and session.is_recently_closed:
+                # Calculate days since closure
+                days_since_closed = (datetime.now() - session.ended_at).days
+                
+                logger.info(f"[SESSION] Recently closed session detected for {user_phone}, closed {days_since_closed} days ago")
+                
+                # Generate processing message in customer's preferred language
+                processing_msg = generate_processing_message(customer.language)
+                
+                # Send the processing message with proper formatting
+                send_wassenger_reply(
+                    user_phone,
+                    processing_msg,
+                    device_id,
+                    delay_seconds=1,
+                    msg_type="text"
+                )
+                
+                # Optionally notify sales team about the attempt
+                if days_since_closed <= 7:
+                    notify_msg = f"Customer {user_phone} attempted to restart conversation.\nSession was closed {days_since_closed} days ago.\nReason: {session.context.get('close_reason', 'Not specified')}"
+                    notify_sales_group(bot, notify_msg)
+                
+                return jsonify({"status": "recently_closed_session", "days_since_closed": days_since_closed}), 200
+            
             session_id = str(session.id)
-            save_message(bot.id, user_phone, session_id, "in", transcript, raw_media_url=raw_media_url)
+            
+            # Save the incoming message
+            save_message(bot.id, user_phone, session_id, "in", msg_text, raw_media_url=raw_media_url)
             msg_text = gpt_reply or transcript  # For downstream use (AI, etc)
         else:
             msg_text, raw_media_url = extract_text_from_message(msg)
@@ -1274,11 +1352,19 @@ def webhook():
             # Delete all previous conversation & restart session
             Message.query.filter_by(bot_id=bot.id, customer_phone=user_phone).delete()
             db.session.commit()
-            # Close existing session & start a new one
+            # Force close existing session & start a new one (bypassing 14-day check)
             session.status = "closed"
-            session.ended_at = datetime.now()
+            session.ended_at = datetime.now() - timedelta(days=15)  # Set to 15 days ago to bypass check
             db.session.commit()
-            new_session = get_or_create_session(customer.id, bot.id)
+            new_session = Session(
+                customer_id=customer.id,
+                bot_id=bot.id,
+                started_at=datetime.now(),
+                status='open',
+                context={},
+            )
+            db.session.add(new_session)
+            db.session.commit()
             send_wassenger_reply(user_phone, "Convo Refreshed", device_id, delay_seconds=1)
             return jsonify({"status": "conversation_refreshed"}), 200
 
