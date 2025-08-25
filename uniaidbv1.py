@@ -21,8 +21,12 @@ import anthropic
 
 UTC_PLUS_8 = timezone(timedelta(hours=8))
 
+# === CONFIGURATION ===
+# Environment variable to bypass session checks when needed
+BYPASS_SESSION_CHECKS = os.getenv("BYPASS_SESSION_CHECKS", "false").lower() == "true"
+ENABLE_FOLLOW_UP_RESPONSES = os.getenv("ENABLE_FOLLOW_UP_RESPONSES", "true").lower() == "true"
+
 # === ENHANCED BUFFER MANAGEMENT ===
-# Message buffer: {(bot_id, user_phone, session_id): [msg1, msg2, ...]}
 MESSAGE_BUFFER = defaultdict(list)
 TIMER_BUFFER = {}
 PROCESSING_FLAGS = {}  # Prevent concurrent processing
@@ -663,20 +667,24 @@ def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text
 
 # === ENHANCED MESSAGE SENDING WITH SESSION CHECK ===
 def send_messages_with_anchor(phone, lines, device_id, bot_id=None, session_id=None, gap_seconds=3):
-    """Enhanced version with session status checking"""
+    """Enhanced version with configurable session status checking"""
     if not lines:
         return
     
     lines = [l for l in (lines if isinstance(lines, list) else [str(lines)]) if l]
     
-    # Check session status before sending
-    if session_id:
+    # Check session status before sending (can be bypassed)
+    if session_id and not BYPASS_SESSION_CHECKS:
         session = db.session.query(Session).filter_by(id=int(session_id)).first()
         if session:
             db.session.refresh(session)  # Force reload from DB
             if session.status == 'closed':
                 logger.info(f"[ANCHOR SEND] Session {session_id} is closed. Skipping messages.")
-                return
+                # If bypassed, log but continue
+                if BYPASS_SESSION_CHECKS:
+                    logger.info(f"[ANCHOR SEND] BYPASS_SESSION_CHECKS is enabled, sending anyway")
+                else:
+                    return
     
     # Send first message
     first_text = lines[0]
@@ -693,14 +701,17 @@ def send_messages_with_anchor(phone, lines, device_id, bot_id=None, session_id=N
     
     # Send subsequent messages with session check
     for idx, part in enumerate(lines[1:], start=1):
-        # Re-check session status before each message
-        if session_id:
+        # Re-check session status before each message (can be bypassed)
+        if session_id and not BYPASS_SESSION_CHECKS:
             session = db.session.query(Session).filter_by(id=int(session_id)).first()
             if session:
                 db.session.refresh(session)
                 if session.status == 'closed':
                     logger.info(f"[ANCHOR SEND] Session closed during sending. Stopping at message {idx+1}")
-                    break
+                    if BYPASS_SESSION_CHECKS:
+                        logger.info(f"[ANCHOR SEND] BYPASS_SESSION_CHECKS is enabled, continuing")
+                    else:
+                        break
         
         try:
             deliver_at = (base_time + timedelta(seconds=idx * gap_seconds)).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
@@ -911,6 +922,8 @@ def is_session_still_open(session_id):
     """Helper to check if session is still open"""
     if not session_id:
         return True
+    if BYPASS_SESSION_CHECKS:
+        return True  # Always return True if bypass is enabled
     session = db.session.query(Session).filter_by(id=int(session_id)).first()
     if session:
         db.session.refresh(session)  # Force reload from DB
@@ -1203,7 +1216,7 @@ def close_session(session, reason, info: dict = None):
 
 def detect_customer_intent(message_text, session_context, bot):
     """
-    Detect if customer wants NEW service/sale vs following up on existing request
+    Enhanced intent detection with better follow-up handling
     Returns: 'new_request', 'follow_up', or 'unclear'
     """
     
@@ -1313,7 +1326,7 @@ def process_buffered_messages(buffer_key):
             session = db.session.query(Session).filter_by(id=int(session_id)).first()
             if session:
                 db.session.refresh(session)
-                if session.status == 'closed':
+                if session.status == 'closed' and not BYPASS_SESSION_CHECKS:
                     logger.info(f"[BUFFER PROCESS] Session {session_id} is closed. Skipping AI.")
                     return
             
@@ -1357,7 +1370,7 @@ def process_buffered_messages(buffer_key):
 
 # === ASYNC WEBHOOK PROCESSING ===
 def process_webhook_async(data):
-    """Enhanced webhook processing with intent detection"""
+    """Enhanced webhook processing with better intent detection and session management"""
     with app.app_context():
         try:
             msg = data["data"]
@@ -1425,6 +1438,36 @@ def process_webhook_async(data):
                 send_wassenger_reply(user_phone, "Conversation cleared. Starting fresh!", device_id, delay_seconds=1)
                 return
             
+            # NEW: Force open trigger
+            if msg_text and msg_text.strip().lower() == "*open*":
+                logger.info(f"[TRIGGER] Force open triggered for {user_phone}")
+                customer = find_or_create_customer(user_phone)
+                
+                # Close any existing session
+                existing = Session.query.filter_by(
+                    customer_id=customer.id,
+                    bot_id=bot.id,
+                    status='open'
+                ).first()
+                if existing:
+                    existing.status = "closed"
+                    existing.ended_at = get_current_datetime_utc8()
+                    db.session.commit()
+                
+                # Create new open session
+                new_session = Session(
+                    customer_id=customer.id,
+                    bot_id=bot.id,
+                    started_at=get_current_datetime_utc8(),
+                    status='open',
+                    context={'manually_reopened': True},
+                )
+                db.session.add(new_session)
+                db.session.commit()
+                
+                send_wassenger_reply(user_phone, "Session reopened. Ready to assist!", device_id, delay_seconds=1)
+                return
+            
             if msg_text and msg_text.strip().lower() == "*off*":
                 logger.info(f"[TRIGGER] Force close triggered for {user_phone}")
                 customer = find_or_create_customer(user_phone)
@@ -1471,7 +1514,7 @@ def process_webhook_async(data):
                 logger.info(f"[SESSION] Already closed for {user_phone}")
                 return
             
-            # === ENHANCED: Handle recently closed sessions with INTENT DETECTION ===
+            # === ENHANCED: Handle recently closed sessions with BETTER INTENT DETECTION ===
             if hasattr(session, 'is_recently_closed') and session.is_recently_closed:
                 current_time_dt = get_current_datetime_utc8()
                 ended_at = make_timezone_aware(session.ended_at)
@@ -1483,7 +1526,7 @@ def process_webhook_async(data):
                 
                 logger.info(f"[SESSION] Recently closed session ({days_since_closed} days ago)")
                 
-                # === NEW: Detect customer intent ===
+                # === ENHANCED: Detect customer intent ===
                 intent = detect_customer_intent(msg_text, session.context or {}, bot)
                 logger.info(f"[INTENT] Customer intent detected: {intent}")
                 
@@ -1537,32 +1580,45 @@ def process_webhook_async(data):
                     return
                 
                 elif intent == 'follow_up':
-                    # Customer following up on EXISTING request - DO NOTHING
-                    logger.info(f"[SESSION] Customer following up on existing request - leaving for sales team")
+                    # Customer following up on EXISTING request
+                    logger.info(f"[SESSION] Customer following up on existing request")
                     
-                    # Just log it for tracking, but don't send any message or notification
-                    if not session.context:
-                        session.context = {}
+                    if ENABLE_FOLLOW_UP_RESPONSES:
+                        # Send acknowledgment if enabled
+                        acknowledgment = (
+                            "Thank you for following up. "
+                            "Our team has been notified and will contact you soon."
+                        )
+                        send_wassenger_reply(user_phone, acknowledgment, device_id, delay_seconds=1)
+                        
+                        # Notify sales team
+                        notify_msg = (
+                            f"📌 Follow-up from {user_phone}\n"
+                            f"Message: {msg_text[:100]}...\n"
+                            f"Previous service: {session.context.get('desired_service', 'unknown')}\n"
+                            f"Closed {days_since_closed} days ago"
+                        )
+                        notify_sales_group(bot, notify_msg)
+                    else:
+                        # Silent tracking only
+                        if not session.context:
+                            session.context = {}
+                        
+                        follow_ups = session.context.get('silent_follow_ups', [])
+                        follow_ups.append({
+                            'timestamp': get_current_datetime_utc8().isoformat(),
+                            'message': msg_text[:100]
+                        })
+                        session.context['silent_follow_ups'] = follow_ups[-5:]  # Keep last 5
+                        db.session.commit()
                     
-                    # Track follow-up attempts silently
-                    follow_ups = session.context.get('silent_follow_ups', [])
-                    follow_ups.append({
-                        'timestamp': get_current_datetime_utc8().isoformat(),
-                        'message': msg_text[:100]  # Store first 100 chars
-                    })
-                    session.context['silent_follow_ups'] = follow_ups[-5:]  # Keep last 5 follow-ups
-                    db.session.commit()
-                    
-                    # DO NOT send any auto-reply
-                    # DO NOT notify sales group
-                    # Let sales team handle it manually
                     return
                 
                 else:  # intent == 'unclear'
-                    # Can't determine intent - use safe approach (no auto-reply)
-                    logger.info(f"[SESSION] Unclear intent - leaving for sales team review")
+                    # Can't determine intent - use safe approach
+                    logger.info(f"[SESSION] Unclear intent - notifying sales team")
                     
-                    # Track it but don't respond
+                    # Track it
                     if not session.context:
                         session.context = {}
                     session.context['last_unclear_attempt'] = {
@@ -1571,14 +1627,14 @@ def process_webhook_async(data):
                     }
                     db.session.commit()
                     
-                    # For unclear cases, we can optionally notify sales ONCE per day
+                    # Notify sales ONCE per day
                     notification_key = f"unclear:{user_phone}:{current_time_dt.date().isoformat()}"
                     notification_hash = hashlib.md5(notification_key.encode()).hexdigest()
                     
                     with BUFFER_LOCK:
                         if f"notif_{notification_hash}" not in MESSAGE_HASH_CACHE:
                             MESSAGE_HASH_CACHE[f"notif_{notification_hash}"] = time.time()
-                            # Optional: Notify sales about unclear intent
+                            # Notify sales about unclear intent
                             notify_msg = (
                                 f"⚠️ Customer {user_phone} sent message to closed session.\n"
                                 f"Intent unclear - please review:\n"
@@ -1586,6 +1642,14 @@ def process_webhook_async(data):
                                 f"Closed {days_since_closed} days ago"
                             )
                             notify_sales_group(bot, notify_msg)
+                    
+                    if ENABLE_FOLLOW_UP_RESPONSES:
+                        # Send a generic response
+                        response = (
+                            "Thank you for your message. "
+                            "Our team will review and contact you if needed."
+                        )
+                        send_wassenger_reply(user_phone, response, device_id, delay_seconds=1)
                     
                     return
             
@@ -1626,7 +1690,6 @@ def process_webhook_async(data):
         except Exception as e:
             logger.error(f"[WEBHOOK ASYNC ERROR] {e}", exc_info=True)
 
-
 # === MAIN WEBHOOK ENDPOINT ===
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -1665,10 +1728,89 @@ def health_check():
         "active_timers": len(TIMER_BUFFER),
         "processing_flags": sum(1 for v in PROCESSING_FLAGS.values() if v),
         "db_status": db_status,
+        "bypass_session_checks": BYPASS_SESSION_CHECKS,
+        "enable_follow_up_responses": ENABLE_FOLLOW_UP_RESPONSES,
         "timestamp": get_current_datetime_utc8().isoformat()
     })
 
-# === CLEANUP FUNCTIONS (Add before main block) ===
+# === NEW: ADMIN ENDPOINT TO MANAGE SESSIONS ===
+@app.route('/admin/session/<action>', methods=['POST'])
+def admin_session(action):
+    """Admin endpoint to manage sessions"""
+    data = request.json
+    user_phone = data.get("phone")
+    bot_phone = data.get("bot_phone")
+    
+    if not user_phone or not bot_phone:
+        return jsonify({"error": "Missing phone or bot_phone"}), 400
+    
+    bot = get_bot_by_phone(bot_phone)
+    if not bot:
+        return jsonify({"error": "Bot not found"}), 404
+    
+    customer = Customer.query.filter_by(phone_number=user_phone).first()
+    if not customer:
+        return jsonify({"error": "Customer not found"}), 404
+    
+    if action == "open":
+        # Close existing and open new
+        existing = Session.query.filter_by(
+            customer_id=customer.id,
+            bot_id=bot.id,
+            status='open'
+        ).first()
+        if existing:
+            existing.status = "closed"
+            existing.ended_at = get_current_datetime_utc8()
+        
+        new_session = Session(
+            customer_id=customer.id,
+            bot_id=bot.id,
+            started_at=get_current_datetime_utc8(),
+            status='open',
+            context={'admin_opened': True},
+        )
+        db.session.add(new_session)
+        db.session.commit()
+        
+        return jsonify({"status": "opened", "session_id": new_session.id})
+    
+    elif action == "close":
+        session = Session.query.filter_by(
+            customer_id=customer.id,
+            bot_id=bot.id,
+            status='open'
+        ).first()
+        if session:
+            session.status = "closed"
+            session.ended_at = get_current_datetime_utc8()
+            session.context['close_reason'] = "admin_closed"
+            db.session.commit()
+            return jsonify({"status": "closed", "session_id": session.id})
+        else:
+            return jsonify({"error": "No open session found"}), 404
+    
+    elif action == "status":
+        session = Session.query.filter_by(
+            customer_id=customer.id,
+            bot_id=bot.id
+        ).order_by(Session.started_at.desc()).first()
+        
+        if session:
+            return jsonify({
+                "session_id": session.id,
+                "status": session.status,
+                "started_at": session.started_at.isoformat() if session.started_at else None,
+                "ended_at": session.ended_at.isoformat() if session.ended_at else None,
+                "context": session.context
+            })
+        else:
+            return jsonify({"error": "No session found"}), 404
+    
+    else:
+        return jsonify({"error": "Invalid action"}), 400
+
+# === CLEANUP FUNCTIONS ===
 def cleanup_caches():
     """Clean up old cache entries to prevent memory leaks"""
     with BUFFER_LOCK:
@@ -1718,5 +1860,9 @@ if __name__ == "__main__":
     
     # Start periodic cleanup
     schedule_cleanup()
+    
+    # Log configuration status
+    logger.info(f"[CONFIG] BYPASS_SESSION_CHECKS: {BYPASS_SESSION_CHECKS}")
+    logger.info(f"[CONFIG] ENABLE_FOLLOW_UP_RESPONSES: {ENABLE_FOLLOW_UP_RESPONSES}")
     
     app.run(host="0.0.0.0", port=5000, debug=True)
