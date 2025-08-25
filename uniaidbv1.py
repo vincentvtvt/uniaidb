@@ -1201,6 +1201,91 @@ def close_session(session, reason, info: dict = None):
     session.context['close_reason'] = reason
     db.session.commit()
 
+def detect_customer_intent(message_text, session_context, bot):
+    """
+    Detect if customer wants NEW service/sale vs following up on existing request
+    Returns: 'new_request', 'follow_up', or 'unclear'
+    """
+    
+    # Keywords that indicate NEW request
+    new_request_keywords = [
+        'another', 'different', 'new', 'other', 'else', 'lagi', 'baru', 'lain',
+        'change', 'switch', 'upgrade', 'downgrade', 'cancel and', 'instead',
+        'also want', 'additionally', 'one more', 'extra', 'tambah', 'tukar'
+    ]
+    
+    # Keywords that indicate FOLLOW-UP
+    follow_up_keywords = [
+        'status', 'update', 'how about', 'already', 'when', 'bila', 'follow',
+        'check', 'confirm', 'still waiting', 'pending', 'progress', 'any news',
+        'heard back', 'reply', 'response', 'answered', 'contacted', 'called'
+    ]
+    
+    # Use AI for more sophisticated detection
+    try:
+        # Get previous service/product from session context
+        previous_service = session_context.get('desired_service', 'unknown service')
+        close_reason = session_context.get('close_reason', 'unknown')
+        
+        # Build prompt for AI intent detection
+        intent_prompt = f"""
+        Analyze this customer message to determine their intent.
+        
+        Previous context:
+        - Service discussed: {previous_service}
+        - Session close reason: {close_reason}
+        - Days since closed: Within 14 days
+        
+        Customer's new message: "{message_text}"
+        
+        Determine if this is:
+        1. "new_request" - Customer wants a DIFFERENT or ADDITIONAL service/product
+        2. "follow_up" - Customer is asking about their EXISTING request/application
+        3. "unclear" - Cannot determine intent clearly
+        
+        Look for:
+        - New request indicators: asking about different products, new requirements, additional services
+        - Follow-up indicators: asking for status, updates, when they'll be contacted, checking on progress
+        
+        Respond with ONLY one word: new_request, follow_up, or unclear
+        """
+        
+        response = openai.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "You are an intent classifier. Reply with only: new_request, follow_up, or unclear"},
+                {"role": "user", "content": intent_prompt}
+            ],
+            max_tokens=10,
+            temperature=0.1
+        )
+        
+        ai_intent = response.choices[0].message.content.strip().lower()
+        logger.info(f"[INTENT DETECTION] AI detected: {ai_intent} for message: {message_text[:50]}...")
+        
+        # Validate AI response
+        if ai_intent in ['new_request', 'follow_up', 'unclear']:
+            return ai_intent
+        
+    except Exception as e:
+        logger.error(f"[INTENT DETECTION] AI error: {e}")
+    
+    # Fallback to keyword detection if AI fails
+    message_lower = message_text.lower()
+    
+    # Check for explicit new request keywords
+    new_score = sum(1 for keyword in new_request_keywords if keyword in message_lower)
+    follow_score = sum(1 for keyword in follow_up_keywords if keyword in message_lower)
+    
+    logger.info(f"[INTENT DETECTION] Keyword scores - New: {new_score}, Follow-up: {follow_score}")
+    
+    if new_score > follow_score:
+        return 'new_request'
+    elif follow_score > new_score:
+        return 'follow_up'
+    else:
+        return 'unclear'
+
 # === ENHANCED BUFFER PROCESSING WITH CONCURRENCY CONTROL ===
 def process_buffered_messages(buffer_key):
     """Enhanced with processing flags and better error handling"""
@@ -1272,7 +1357,7 @@ def process_buffered_messages(buffer_key):
 
 # === ASYNC WEBHOOK PROCESSING ===
 def process_webhook_async(data):
-    """Process webhook in background thread"""
+    """Enhanced webhook processing with intent detection"""
     with app.app_context():
         try:
             msg = data["data"]
@@ -1294,13 +1379,6 @@ def process_webhook_async(data):
             user_phone = msg.get("fromNumber")
             device_id = data["device"]["id"]
             
-            # Check for duplicate message
-            if msg_type == "text":
-                msg_body = msg.get("body", "")
-                if is_duplicate_message(user_phone, msg_body):
-                    logger.info(f"[WEBHOOK] Duplicate message ignored from {user_phone}")
-                    return
-            
             # Get bot
             bot = get_bot_by_phone(bot_phone)
             if not bot:
@@ -1316,71 +1394,24 @@ def process_webhook_async(data):
             else:
                 msg_text, raw_media_url = extract_text_from_message(msg)
             
-            # Get customer and session
-            customer = find_or_create_customer(user_phone)
-            session = get_or_create_session(customer.id, bot.id)
-            
-            # Handle closed sessions
-            if hasattr(session, 'is_already_closed') and session.is_already_closed:
-                logger.info(f"[SESSION] Already closed for {user_phone}")
-                return
-            
-            # Handle recently closed sessions
-            if hasattr(session, 'is_recently_closed') and session.is_recently_closed:
-                current_time = get_current_datetime_utc8()
-                ended_at = make_timezone_aware(session.ended_at)
+            # === Handle special triggers FIRST ===
+            if msg_text and msg_text.strip() == "*.*":
+                logger.info(f"[TRIGGER] Clear conversation triggered for {user_phone}")
+                Message.query.filter_by(bot_id=bot.id, customer_phone=user_phone).delete()
                 
-                if ended_at:
-                    days_since_closed = (current_time - ended_at).days
-                else:
-                    days_since_closed = 0
-                
-                logger.info(f"[SESSION] Recently closed ({days_since_closed} days)")
-                
-                # Check if already responded recently
-                last_response = session.context.get('last_auto_response')
-                now = current_time
-                
-                if last_response:
-                    last_response_time = datetime.fromisoformat(last_response)
-                    last_response_time = make_timezone_aware(last_response_time)
-                    if (now - last_response_time).total_seconds() < 3600:
-                        logger.info(f"[SESSION] Already sent auto-response recently")
-                        return
-                
-                # Send processing message
-                processing_msg = generate_processing_message(customer.language)
-                send_wassenger_reply(user_phone, processing_msg, device_id, delay_seconds=1, msg_type="text")
-                
-                # Update response time
-                session.context['last_auto_response'] = now.isoformat()
-                db.session.commit()
-                
-                # Notify sales if very recent
-                if days_since_closed <= 7:
-                    last_notification = session.context.get('last_reopen_notification')
-                    today = now.date().isoformat()
-                    
-                    if last_notification != today:
-                        notify_msg = f"Customer {user_phone} attempted to restart conversation.\nClosed {days_since_closed} days ago.\nReason: {session.context.get('close_reason', 'Not specified')}"
-                        notify_sales_group(bot, notify_msg)
-                        session.context['last_reopen_notification'] = today
+                customer = Customer.query.filter_by(phone_number=user_phone).first()
+                if customer:
+                    existing_session = Session.query.filter_by(
+                        customer_id=customer.id, 
+                        bot_id=bot.id, 
+                        status='open'
+                    ).first()
+                    if existing_session:
+                        existing_session.status = "closed"
+                        existing_session.ended_at = get_current_datetime_utc8() - timedelta(days=15)
                         db.session.commit()
                 
-                return
-            
-            session_id = str(session.id)
-            
-            # Save incoming message
-            save_message_safe(bot.id, user_phone, session_id, "in", msg_text, raw_media_url)
-            
-            # Handle special triggers
-            if msg_text.strip() == "*.*":
-                Message.query.filter_by(bot_id=bot.id, customer_phone=user_phone).delete()
-                db.session.commit()
-                session.status = "closed"
-                session.ended_at = get_current_datetime_utc8() - timedelta(days=15)
-                db.session.commit()
+                customer = find_or_create_customer(user_phone)
                 new_session = Session(
                     customer_id=customer.id,
                     bot_id=bot.id,
@@ -1390,29 +1421,188 @@ def process_webhook_async(data):
                 )
                 db.session.add(new_session)
                 db.session.commit()
-                send_wassenger_reply(user_phone, "Convo Refreshed", device_id, delay_seconds=1)
+                
+                send_wassenger_reply(user_phone, "Conversation cleared. Starting fresh!", device_id, delay_seconds=1)
                 return
             
-            if msg_text.strip().lower() == "*off*":
-                session.status = "closed"
-                session.ended_at = get_current_datetime_utc8()
-                session.context['close_reason'] = "force_closed"
-                db.session.commit()
-                logger.info(f"[SESSION] Force closed for {user_phone}")
-                note = f"Session for {user_phone} was force closed by agent/trigger."
-                notify_sales_group(bot, note)
+            if msg_text and msg_text.strip().lower() == "*off*":
+                logger.info(f"[TRIGGER] Force close triggered for {user_phone}")
+                customer = find_or_create_customer(user_phone)
+                session = Session.query.filter_by(
+                    customer_id=customer.id,
+                    bot_id=bot.id,
+                    status='open'
+                ).first()
+                if session:
+                    session.status = "closed"
+                    session.ended_at = get_current_datetime_utc8()
+                    session.context['close_reason'] = "force_closed"
+                    db.session.commit()
+                    note = f"Session for {user_phone} was force closed by agent/trigger."
+                    notify_sales_group(bot, note)
+                send_wassenger_reply(user_phone, "Session closed by agent.", device_id, delay_seconds=1)
                 return
+            
+            # === Check for duplicates ===
+            msg_unique_key = f"{user_phone}:{msg_text}:{msg.get('id', '')}:{msg.get('timestamp', '')}"
+            msg_hash = hashlib.md5(msg_unique_key.encode()).hexdigest()
+            
+            current_time = time.time()
+            with BUFFER_LOCK:
+                if msg_hash in MESSAGE_HASH_CACHE:
+                    last_processed = MESSAGE_HASH_CACHE[msg_hash]
+                    if current_time - last_processed < 10:
+                        logger.info(f"[WEBHOOK] Duplicate message ignored")
+                        return
+                MESSAGE_HASH_CACHE[msg_hash] = current_time
+                
+                # Clean old entries
+                keys_to_remove = [k for k, v in MESSAGE_HASH_CACHE.items() 
+                                 if current_time - v > 60]
+                for k in keys_to_remove:
+                    MESSAGE_HASH_CACHE.pop(k, None)
+            
+            # Get customer and session
+            customer = find_or_create_customer(user_phone)
+            session = get_or_create_session(customer.id, bot.id)
+            
+            # Handle already closed sessions
+            if hasattr(session, 'is_already_closed') and session.is_already_closed:
+                logger.info(f"[SESSION] Already closed for {user_phone}")
+                return
+            
+            # === ENHANCED: Handle recently closed sessions with INTENT DETECTION ===
+            if hasattr(session, 'is_recently_closed') and session.is_recently_closed:
+                current_time_dt = get_current_datetime_utc8()
+                ended_at = make_timezone_aware(session.ended_at)
+                
+                if ended_at:
+                    days_since_closed = (current_time_dt - ended_at).days
+                else:
+                    days_since_closed = 0
+                
+                logger.info(f"[SESSION] Recently closed session ({days_since_closed} days ago)")
+                
+                # === NEW: Detect customer intent ===
+                intent = detect_customer_intent(msg_text, session.context or {}, bot)
+                logger.info(f"[INTENT] Customer intent detected: {intent}")
+                
+                if intent == 'new_request':
+                    # Customer wants NEW service - open fresh session
+                    logger.info(f"[SESSION] Customer wants NEW service, opening fresh session")
+                    
+                    # Close the old session properly (mark it as superseded)
+                    session.status = "closed"
+                    session.ended_at = get_current_datetime_utc8() - timedelta(days=15)  # Bypass 14-day check
+                    if not session.context:
+                        session.context = {}
+                    session.context['superseded_by_new_request'] = True
+                    db.session.commit()
+                    
+                    # Create new session
+                    new_session = Session(
+                        customer_id=customer.id,
+                        bot_id=bot.id,
+                        started_at=get_current_datetime_utc8(),
+                        status='open',
+                        context={'previous_session_id': session.id},
+                    )
+                    db.session.add(new_session)
+                    db.session.commit()
+                    
+                    session_id = str(new_session.id)
+                    
+                    # Save the message and process normally
+                    save_message_safe(bot.id, user_phone, session_id, "in", msg_text, raw_media_url)
+                    
+                    # Add to buffer for AI processing
+                    buffer_key = (bot.id, user_phone, session_id)
+                    current_timestamp = time.time()
+                    
+                    with BUFFER_LOCK:
+                        BUFFER_START_TIME[buffer_key] = current_timestamp
+                        MESSAGE_BUFFER[buffer_key] = [{
+                            "msg_text": msg_text,
+                            "raw_media_url": raw_media_url,
+                            "created_at": get_current_datetime_utc8().isoformat(),
+                            "device_id": device_id,
+                        }]
+                        
+                        # Process after buffer time
+                        if buffer_key in TIMER_BUFFER and TIMER_BUFFER[buffer_key]:
+                            TIMER_BUFFER[buffer_key].cancel()
+                        TIMER_BUFFER[buffer_key] = Timer(30, process_buffered_messages, args=(buffer_key,))
+                        TIMER_BUFFER[buffer_key].start()
+                    
+                    return
+                
+                elif intent == 'follow_up':
+                    # Customer following up on EXISTING request - DO NOTHING
+                    logger.info(f"[SESSION] Customer following up on existing request - leaving for sales team")
+                    
+                    # Just log it for tracking, but don't send any message or notification
+                    if not session.context:
+                        session.context = {}
+                    
+                    # Track follow-up attempts silently
+                    follow_ups = session.context.get('silent_follow_ups', [])
+                    follow_ups.append({
+                        'timestamp': get_current_datetime_utc8().isoformat(),
+                        'message': msg_text[:100]  # Store first 100 chars
+                    })
+                    session.context['silent_follow_ups'] = follow_ups[-5:]  # Keep last 5 follow-ups
+                    db.session.commit()
+                    
+                    # DO NOT send any auto-reply
+                    # DO NOT notify sales group
+                    # Let sales team handle it manually
+                    return
+                
+                else:  # intent == 'unclear'
+                    # Can't determine intent - use safe approach (no auto-reply)
+                    logger.info(f"[SESSION] Unclear intent - leaving for sales team review")
+                    
+                    # Track it but don't respond
+                    if not session.context:
+                        session.context = {}
+                    session.context['last_unclear_attempt'] = {
+                        'timestamp': get_current_datetime_utc8().isoformat(),
+                        'message': msg_text[:100]
+                    }
+                    db.session.commit()
+                    
+                    # For unclear cases, we can optionally notify sales ONCE per day
+                    notification_key = f"unclear:{user_phone}:{current_time_dt.date().isoformat()}"
+                    notification_hash = hashlib.md5(notification_key.encode()).hexdigest()
+                    
+                    with BUFFER_LOCK:
+                        if f"notif_{notification_hash}" not in MESSAGE_HASH_CACHE:
+                            MESSAGE_HASH_CACHE[f"notif_{notification_hash}"] = time.time()
+                            # Optional: Notify sales about unclear intent
+                            notify_msg = (
+                                f"⚠️ Customer {user_phone} sent message to closed session.\n"
+                                f"Intent unclear - please review:\n"
+                                f"Message: {msg_text[:100]}...\n"
+                                f"Closed {days_since_closed} days ago"
+                            )
+                            notify_sales_group(bot, notify_msg)
+                    
+                    return
+            
+            # === Normal flow for open sessions ===
+            session_id = str(session.id)
+            
+            # Save incoming message
+            save_message_safe(bot.id, user_phone, session_id, "in", msg_text, raw_media_url)
             
             # Add to buffer with limits
             buffer_key = (bot.id, user_phone, session_id)
-            current_time = time.time()
+            current_timestamp = time.time()
             
             with BUFFER_LOCK:
-                # Initialize buffer start time
                 if buffer_key not in BUFFER_START_TIME:
-                    BUFFER_START_TIME[buffer_key] = current_time
+                    BUFFER_START_TIME[buffer_key] = current_timestamp
                 
-                # Add message to buffer
                 MESSAGE_BUFFER[buffer_key].append({
                     "msg_text": msg_text,
                     "raw_media_url": raw_media_url,
@@ -1420,17 +1610,14 @@ def process_webhook_async(data):
                     "device_id": device_id,
                 })
                 
-                # Check buffer limits
-                buffer_age = current_time - BUFFER_START_TIME[buffer_key]
+                buffer_age = current_timestamp - BUFFER_START_TIME[buffer_key]
                 buffer_size = len(MESSAGE_BUFFER[buffer_key])
                 
-                if buffer_age > 60 or buffer_size >= 5:  # Max 60s or 5 messages
-                    # Process immediately
+                if buffer_age > 60 or buffer_size >= 5:
                     if buffer_key in TIMER_BUFFER and TIMER_BUFFER[buffer_key]:
                         TIMER_BUFFER[buffer_key].cancel()
                     process_buffered_messages(buffer_key)
                 else:
-                    # Set/reset timer
                     if buffer_key in TIMER_BUFFER and TIMER_BUFFER[buffer_key]:
                         TIMER_BUFFER[buffer_key].cancel()
                     TIMER_BUFFER[buffer_key] = Timer(30, process_buffered_messages, args=(buffer_key,))
@@ -1438,6 +1625,7 @@ def process_webhook_async(data):
                     
         except Exception as e:
             logger.error(f"[WEBHOOK ASYNC ERROR] {e}", exc_info=True)
+
 
 # === MAIN WEBHOOK ENDPOINT ===
 @app.route('/webhook', methods=['POST'])
@@ -1480,8 +1668,55 @@ def health_check():
         "timestamp": get_current_datetime_utc8().isoformat()
     })
 
+# === CLEANUP FUNCTIONS (Add before main block) ===
+def cleanup_caches():
+    """Clean up old cache entries to prevent memory leaks"""
+    with BUFFER_LOCK:
+        current_time = time.time()
+        
+        # Clean MESSAGE_HASH_CACHE
+        keys_to_remove = []
+        for key, timestamp in MESSAGE_HASH_CACHE.items():
+            if current_time - timestamp > 3600:  # Remove entries older than 1 hour
+                keys_to_remove.append(key)
+        
+        for key in keys_to_remove:
+            MESSAGE_HASH_CACHE.pop(key, None)
+        
+        logger.info(f"[CLEANUP] Removed {len(keys_to_remove)} old cache entries")
+        
+        # Clean stuck buffers
+        stuck_buffers = []
+        for buffer_key, start_time in BUFFER_START_TIME.items():
+            if current_time - start_time > 300:  # 5 minutes
+                stuck_buffers.append(buffer_key)
+        
+        for buffer_key in stuck_buffers:
+            logger.warning(f"[CLEANUP] Removing stuck buffer: {buffer_key}")
+            MESSAGE_BUFFER.pop(buffer_key, None)
+            BUFFER_START_TIME.pop(buffer_key, None)
+            PROCESSING_FLAGS.pop(buffer_key, None)
+            if buffer_key in TIMER_BUFFER:
+                timer = TIMER_BUFFER.pop(buffer_key)
+                if timer:
+                    timer.cancel()
+        
+        logger.info(f"[CLEANUP] Removed {len(stuck_buffers)} stuck buffers")
+
+def schedule_cleanup():
+    """Schedule periodic cleanup"""
+    cleanup_caches()
+    # Schedule next cleanup in 1 hour
+    cleanup_timer = Timer(3600, schedule_cleanup)
+    cleanup_timer.daemon = True
+    cleanup_timer.start()
+
 # === MAIN RUN BLOCK ===
 if __name__ == "__main__":
     with app.app_context():
         db.create_all()  # Ensure all tables exist
+    
+    # Start periodic cleanup
+    schedule_cleanup()
+    
     app.run(host="0.0.0.0", port=5000, debug=True)
