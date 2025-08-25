@@ -2,6 +2,7 @@ import re
 import logging
 import time
 import json
+import hashlib
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
@@ -14,17 +15,23 @@ from pdf2image import convert_from_bytes
 import cv2
 import uuid
 import os
-from threading import Timer
+from threading import Timer, Thread, Lock
 from collections import defaultdict
 import anthropic
+
 UTC_PLUS_8 = timezone(timedelta(hours=8))
 
-
-
+# === ENHANCED BUFFER MANAGEMENT ===
 # Message buffer: {(bot_id, user_phone, session_id): [msg1, msg2, ...]}
 MESSAGE_BUFFER = defaultdict(list)
 TIMER_BUFFER = {}
+PROCESSING_FLAGS = {}  # Prevent concurrent processing
+BUFFER_START_TIME = {}  # Track buffer age
+MESSAGE_HASH_CACHE = {}  # Deduplication
+BUFFER_LOCK = Lock()  # Thread safety
 
+# === ERROR TRACKING ===
+EXTRACTION_ERRORS = []  # Track extraction failures
 
 # --- Universal JSON Prompt Builder ---
 def build_json_prompt(base_prompt, example_json):
@@ -40,7 +47,7 @@ def build_json_prompt(base_prompt, example_json):
 # === Time helper for AI context (UTC+8) ===
 def get_current_datetime_str_utc8():
     tz = timezone(timedelta(hours=8))
-    return datetime.now(tz).strftime("%a, %d %b %Y, %H:%M:%S %Z")  # e.g., Sun, 16 Aug 2025, 17:05:56 +08
+    return datetime.now(tz).strftime("%a, %d %b %Y, %H:%M:%S %Z")
     
 def make_timezone_aware(dt):
     """
@@ -62,10 +69,8 @@ def get_current_datetime_utc8():
     """
     Get current datetime in UTC+8 (timezone-aware).
     Returns a datetime OBJECT, not a string.
-    Different from get_current_datetime_str_utc8() which returns a STRING.
     """
     return datetime.now(UTC_PLUS_8)
-
 
 def strip_json_markdown_blocks(text):
     """Removes ```json ... ``` or ``` ... ``` wrappers from AI output."""
@@ -83,6 +88,25 @@ def build_json_prompt_with_reasoning(base_prompt, example_json):
     )
     return base_prompt.strip() + "\n\n" + json_instruction
 
+# === MESSAGE DEDUPLICATION ===
+def is_duplicate_message(user_phone, msg_text, window_seconds=5):
+    """Check if message is duplicate within time window"""
+    msg_hash = hashlib.md5(f"{user_phone}:{msg_text}".encode()).hexdigest()
+    current_time = time.time()
+    
+    with BUFFER_LOCK:
+        if msg_hash in MESSAGE_HASH_CACHE:
+            if current_time - MESSAGE_HASH_CACHE[msg_hash] < window_seconds:
+                return True
+        
+        MESSAGE_HASH_CACHE[msg_hash] = current_time
+        # Clean old entries
+        keys_to_remove = [k for k, v in MESSAGE_HASH_CACHE.items() 
+                         if current_time - v > 60]
+        for k in keys_to_remove:
+            MESSAGE_HASH_CACHE.pop(k, None)
+    
+    return False
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -100,7 +124,7 @@ app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv("DATABASE_URL")
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
-# --- Models ---
+# --- Models (keeping existing) ---
 class Bot(db.Model):
     __tablename__ = 'bots'
     id = db.Column(db.Integer, primary_key=True)
@@ -119,12 +143,11 @@ class Lead(db.Model):
     session_id = db.Column(db.String(50))
     name = db.Column(db.String(100), nullable=False)
     contact = db.Column(db.String(50), nullable=False)
-    info = db.Column(db.JSON, default={})      # Flexible field for all extra info (dict)
+    info = db.Column(db.JSON, default={})
     status = db.Column(db.String(20), default='open')
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, onupdate=datetime.utcnow)
     whatsapp_number = db.Column(db.String(50))
-
 
 class Tool(db.Model):
     __tablename__ = 'tools'
@@ -187,7 +210,28 @@ class Template(db.Model):
     created_at = db.Column(db.DateTime)
     updated_at = db.Column(db.DateTime)
 
-# --- Helpers ---
+# === ERROR TRACKING TABLE ===
+class ExtractionError(db.Model):
+    __tablename__ = 'extraction_errors'
+    id = db.Column(db.Integer, primary_key=True)
+    message_data = db.Column(db.JSON)
+    error = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+# === ENHANCED HELPERS ===
+def save_extraction_error(msg_data, error_str):
+    """Save extraction errors for manual review"""
+    try:
+        error_record = ExtractionError(
+            message_data=msg_data,
+            error=error_str,
+            created_at=get_current_datetime_utc8()
+        )
+        db.session.add(error_record)
+        db.session.commit()
+    except Exception as e:
+        logger.error(f"[ERROR TRACKING] Failed to save error: {e}")
+
 def download_file(url):
     r = requests.get(url)
     r.raise_for_status()
@@ -197,52 +241,51 @@ def encode_image_b64(img_bytes):
     return base64.b64encode(img_bytes).decode()
 
 def extract_text_from_image(img_url, prompt=None):
-    image_bytes = download_wassenger_media(img_url)
-    img_b64 = encode_image_b64(image_bytes)
-    logger.info("[VISION] Sending image to OpenAI Vision...")
-    messages = [
-        {"role": "system", "content": prompt or "Extract all visible text from this image. If no text, describe what you see. Example output is 'user is sending a image with chicken eating chicken'"},
-        {"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}]}
-    ]
-    result = openai.chat.completions.create(
-        model="gpt-4o",
-        messages=messages,
-        max_tokens=8192
-    )
-    return result.choices[0].message.content.strip()
+    try:
+        image_bytes = download_wassenger_media(img_url)
+        img_b64 = encode_image_b64(image_bytes)
+        logger.info("[VISION] Sending image to OpenAI Vision...")
+        messages = [
+            {"role": "system", "content": prompt or "Extract all visible text from this image. If no text, describe what you see."},
+            {"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}]}
+        ]
+        result = openai.chat.completions.create(
+            model="gpt-4o",
+            messages=messages,
+            max_tokens=8192
+        )
+        return result.choices[0].message.content.strip()
+    except Exception as e:
+        logger.error(f"[VISION ERROR] {e}", exc_info=True)
+        save_extraction_error({"url": img_url}, str(e))
+        return "[Image extraction failed]"
 
 def transcribe_audio_from_url(audio_url):
-    # Use Wassenger media download for correct auth
-    audio_bytes = download_wassenger_media(audio_url)
-    if not audio_bytes or len(audio_bytes) < 1024:
-        logger.error("[AUDIO DOWNLOAD] Failed or too small")
-        return "[audio received, transcription failed]"
-    temp_path = "/tmp/temp_audio.ogg"
-    with open(temp_path, "wb") as f:
-        f.write(audio_bytes)
     try:
+        audio_bytes = download_wassenger_media(audio_url)
+        if not audio_bytes or len(audio_bytes) < 1024:
+            logger.error("[AUDIO DOWNLOAD] Failed or too small")
+            return "[audio received, transcription failed]"
+        temp_path = "/tmp/temp_audio.ogg"
+        with open(temp_path, "wb") as f:
+            f.write(audio_bytes)
         with open(temp_path, "rb") as audio_file:
             transcript = openai.audio.transcriptions.create(model="whisper-1", file=audio_file)
         logger.info(f"[WHISPER] Transcript: {transcript.text.strip()}")
         return transcript.text.strip()
     except Exception as e:
-        logger.error(f"[WHISPER ERROR] {e}")
+        logger.error(f"[WHISPER ERROR] {e}", exc_info=True)
+        save_extraction_error({"url": audio_url}, str(e))
         return "[audio received, transcription failed]"
 
 def download_to_bytes(url):
-    """
-    Download a file from a URL and return bytes.
-    """
     resp = requests.get(url, timeout=60)
     resp.raise_for_status()
     content = resp.content
-    logger.info(f"[DOWNLOAD] {len(content)} bytes downloaded from {url}. First 16 bytes: {content[:16]}")
+    logger.info(f"[DOWNLOAD] {len(content)} bytes downloaded from {url}")
     return content
 
 def get_filename_from_url_or_path(input_value, default_ext=".pdf"):
-    """
-    Extracts filename from a URL or file path, or generates a random one.
-    """
     if isinstance(input_value, str):
         base = os.path.basename(input_value.split("?")[0])
         if "." in base:
@@ -250,29 +293,26 @@ def get_filename_from_url_or_path(input_value, default_ext=".pdf"):
         else:
             return base + default_ext
     else:
-        # If bytes or other, generate a random one
         return f"file-{uuid.uuid4().hex}{default_ext}"
 
-
-logger = logging.getLogger("UniAI")
-
+# === ENHANCED MESSAGE EXTRACTION WITH ERROR HANDLING ===
 def extract_text_from_message(msg):
+    """Enhanced extraction with better error handling"""
     import cv2
     import numpy as np
     from pdf2image import convert_from_bytes
-
+    
+    extraction_errors = []
     msg_type = msg.get("type")
     media = msg.get("media", {})
     msg_text, media_url = None, None
 
-    # Helper: get downloadable media URL (Wassenger)
     def get_media_url(media):
         url = media.get("url")
         if not url and "links" in media and "download" in media["links"]:
             url = "https://api.wassenger.com" + media["links"]["download"]
         return url
 
-    # Helper: extract first frame from video (OpenCV)
     def extract_first_frame_from_video(video_bytes):
         try:
             np_arr = np.frombuffer(video_bytes, np.uint8)
@@ -290,93 +330,24 @@ def extract_text_from_message(msg):
                 return buf.tobytes()
         except Exception as e:
             logger.error(f"[VIDEO FRAME] Failed: {e}")
+            extraction_errors.append(str(e))
         return None
 
-    # --- Sticker ---
-    if msg_type == "sticker":
-        img_url = get_media_url(media)
-        logger.info(f"[STICKER DEBUG] img_url for Vision: {img_url}")
-        if img_url:
-            try:
-                image_bytes = download_wassenger_media(img_url)
-                # Convert .webp to .png
-                if media.get("extension", "").lower() == "webp":
-                    im = Image.open(BytesIO(image_bytes)).convert("RGBA")
-                    buf = BytesIO()
-                    im.save(buf, format="PNG")
-                    image_bytes = buf.getvalue()
-                img_b64 = encode_image_b64(image_bytes)
-                vision_msg = [
-                    {"role": "system", "content": (
-                        "This is a WhatsApp sticker. "
-                        "Briefly describe what is shown in the sticker, focusing on the main character, action, and emotion. "
-                        "Example output is 'user is sending a sticker with chicken eating chicken'"
-                        "If there is text in the sticker, include it. "
-                        "Reply in a short, natural phrase, no code formatting."
-                    )},
-                    {"role": "user", "content": [
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
-                    ]}
-                ]
-                result = openai.chat.completions.create(
-                    model="gpt-4o",
-                    messages=vision_msg,
-                    max_tokens=8192
-                )
-                msg_text = result.choices[0].message.content.strip()
-                return msg_text or "[Sticker received]", img_url
-            except Exception as e:
-                logger.error(f"[STICKER MEANING] {e}")
-                return "[Sticker received]", img_url
-        return "[Sticker received]", None
-
-    # --- Image ---
-    elif msg_type == "image":
-        img_url = get_media_url(media)
-        logger.info(f"[IMAGE DEBUG] img_url for Vision: {img_url}")
-        if img_url:
-            try:
-                image_bytes = download_wassenger_media(img_url)
-                img_b64 = encode_image_b64(image_bytes)
-                vision_msg = [
-                    {"role": "system", "content": (
-                        "This is a photo/image received on WhatsApp. "
-                        "Summarize briefly what you see, focusing on main objects, scene, or text. "
-                        "Example output is 'user is sending a image with chicken eating chicken'"
-                        "Reply in a short phrase. If there is text, mention it."
-                    )},
-                    {"role": "user", "content": [
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
-                    ]}
-                ]
-                result = openai.chat.completions.create(
-                    model="gpt-4o",
-                    messages=vision_msg,
-                    max_tokens=8192
-                )
-                msg_text = result.choices[0].message.content.strip()
-                return msg_text or "[Image received]", img_url
-            except Exception as e:
-                logger.error(f"[IMAGE MEANING] {e}")
-                return "[Image received]", img_url
-        return "[Image received, no url]", None
-
-    # --- Video (first frame to Vision) ---
-    elif msg_type == "video":
-        vid_url = get_media_url(media)
-        file_name = media.get("filename") or ""
-        if vid_url:
-            try:
-                video_bytes = download_wassenger_media(vid_url)
-                frame_bytes = extract_first_frame_from_video(video_bytes)
-                if frame_bytes:
-                    img_b64 = encode_image_b64(frame_bytes)
+    try:
+        # Process different message types...
+        if msg_type == "sticker":
+            img_url = get_media_url(media)
+            if img_url:
+                try:
+                    image_bytes = download_wassenger_media(img_url)
+                    if media.get("extension", "").lower() == "webp":
+                        im = Image.open(BytesIO(image_bytes)).convert("RGBA")
+                        buf = BytesIO()
+                        im.save(buf, format="PNG")
+                        image_bytes = buf.getvalue()
+                    img_b64 = encode_image_b64(image_bytes)
                     vision_msg = [
-                        {"role": "system", "content": (
-                            "This is the first frame of a WhatsApp video. "
-                            "Summarize the scene—main subject, action, or text. Short phrase."
-                            "Example output is 'user is sending a video with chicken eating chicken'"
-                        )},
+                        {"role": "system", "content": "This is a WhatsApp sticker. Briefly describe what is shown."},
                         {"role": "user", "content": [
                             {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
                         ]}
@@ -384,63 +355,123 @@ def extract_text_from_message(msg):
                     result = openai.chat.completions.create(
                         model="gpt-4o",
                         messages=vision_msg,
-                        max_tokens=128
+                        max_tokens=8192
                     )
                     msg_text = result.choices[0].message.content.strip()
-                    return msg_text or f"[Video received: {file_name}]", vid_url
-                else:
-                    return f"[Video received: {file_name}]", vid_url
-            except Exception as e:
-                logger.error(f"[VIDEO MEANING] {e}")
-                return f"[Video received: {file_name}]", vid_url
-        return "[Video received, no url]", None
+                    return msg_text or "[Sticker received]", img_url
+                except Exception as e:
+                    logger.error(f"[STICKER MEANING] {e}")
+                    save_extraction_error(msg, str(e))
+                    return "[Sticker received - extraction failed]", img_url
+            return "[Sticker received]", None
 
-    # --- Audio (Whisper + GPT summary) ---
-    elif msg_type == "audio":
-        audio_url = get_media_url(media)
-        if audio_url:
-            try:
-                transcript = transcribe_audio_from_url(audio_url)
-                if transcript and transcript.lower() not in ("[audio received, no url]", "[audio received, transcription failed]"):
-                    gpt_prompt = (
-                        "This is a WhatsApp audio message transcribed as: "
-                        f"'{transcript}'. Reply in a short, natural phrase, as if you're the user."
-                    )
+        elif msg_type == "image":
+            img_url = get_media_url(media)
+            if img_url:
+                try:
+                    image_bytes = download_wassenger_media(img_url)
+                    img_b64 = encode_image_b64(image_bytes)
+                    vision_msg = [
+                        {"role": "system", "content": "This is a photo/image received on WhatsApp. Summarize what you see."},
+                        {"role": "user", "content": [
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
+                        ]}
+                    ]
                     result = openai.chat.completions.create(
                         model="gpt-4o",
-                        messages=[{"role": "system", "content": gpt_prompt}],
-                        max_tokens=64
+                        messages=vision_msg,
+                        max_tokens=8192
                     )
                     msg_text = result.choices[0].message.content.strip()
-                    return {"transcript": transcript, "gpt_reply": msg_text}, audio_url
-                else:
-                    return {"transcript": transcript or "[Audio received, no speech detected]", "gpt_reply": None}, audio_url
-            except Exception as e:
-                logger.error(f"[AUDIO MEANING] {e}")
-                return {"transcript": "[Audio received, error]", "gpt_reply": None}, audio_url
-        return {"transcript": "[Audio received, no url]", "gpt_reply": None}, None
+                    return msg_text or "[Image received]", img_url
+                except Exception as e:
+                    logger.error(f"[IMAGE MEANING] {e}")
+                    save_extraction_error(msg, str(e))
+                    return "[Image received - extraction failed]", img_url
+            return "[Image received, no url]", None
 
-
-    # --- Document (PDF/image: Vision, else filename) ---
-    elif msg_type == "document":
-        doc_url = get_media_url(media)
-        file_name = media.get("filename") or ""
-        ext = (file_name.split(".")[-1] if file_name else "").lower()
-        if doc_url:
-            try:
-                doc_bytes = download_wassenger_media(doc_url)
-                if ext == "pdf":
-                    images = convert_from_bytes(doc_bytes, first_page=1, last_page=1)
-                    if images:
-                        buf = BytesIO()
-                        images[0].save(buf, format="PNG")
-                        img_b64 = encode_image_b64(buf.getvalue())
+        elif msg_type == "video":
+            vid_url = get_media_url(media)
+            file_name = media.get("filename") or ""
+            if vid_url:
+                try:
+                    video_bytes = download_wassenger_media(vid_url)
+                    frame_bytes = extract_first_frame_from_video(video_bytes)
+                    if frame_bytes:
+                        img_b64 = encode_image_b64(frame_bytes)
                         vision_msg = [
-                            {"role": "system", "content": (
-                                "This is the first page of a PDF document sent via WhatsApp. "
-                                "Example output is 'user is sending a document with details of abc'"
-                                "Summarize what you see—any headings, tables, or visible text. Short natural phrase."
-                            )},
+                            {"role": "system", "content": "This is the first frame of a WhatsApp video. Summarize the scene."},
+                            {"role": "user", "content": [
+                                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
+                            ]}
+                        ]
+                        result = openai.chat.completions.create(
+                            model="gpt-4o",
+                            messages=vision_msg,
+                            max_tokens=128
+                        )
+                        msg_text = result.choices[0].message.content.strip()
+                        return msg_text or f"[Video received: {file_name}]", vid_url
+                    else:
+                        return f"[Video received: {file_name}]", vid_url
+                except Exception as e:
+                    logger.error(f"[VIDEO MEANING] {e}")
+                    save_extraction_error(msg, str(e))
+                    return f"[Video received: {file_name} - extraction failed]", vid_url
+            return "[Video received, no url]", None
+
+        elif msg_type == "audio":
+            audio_url = get_media_url(media)
+            if audio_url:
+                try:
+                    transcript = transcribe_audio_from_url(audio_url)
+                    if transcript and transcript.lower() not in ("[audio received, no url]", "[audio received, transcription failed]"):
+                        gpt_prompt = f"This is a WhatsApp audio message transcribed as: '{transcript}'. Reply in a short, natural phrase."
+                        result = openai.chat.completions.create(
+                            model="gpt-4o",
+                            messages=[{"role": "system", "content": gpt_prompt}],
+                            max_tokens=64
+                        )
+                        msg_text = result.choices[0].message.content.strip()
+                        return {"transcript": transcript, "gpt_reply": msg_text}, audio_url
+                    else:
+                        return {"transcript": transcript or "[Audio received, no speech detected]", "gpt_reply": None}, audio_url
+                except Exception as e:
+                    logger.error(f"[AUDIO MEANING] {e}")
+                    save_extraction_error(msg, str(e))
+                    return {"transcript": "[Audio received - extraction failed]", "gpt_reply": None}, audio_url
+            return {"transcript": "[Audio received, no url]", "gpt_reply": None}, None
+
+        elif msg_type == "document":
+            doc_url = get_media_url(media)
+            file_name = media.get("filename") or ""
+            ext = (file_name.split(".")[-1] if file_name else "").lower()
+            if doc_url:
+                try:
+                    doc_bytes = download_wassenger_media(doc_url)
+                    if ext == "pdf":
+                        images = convert_from_bytes(doc_bytes, first_page=1, last_page=1)
+                        if images:
+                            buf = BytesIO()
+                            images[0].save(buf, format="PNG")
+                            img_b64 = encode_image_b64(buf.getvalue())
+                            vision_msg = [
+                                {"role": "system", "content": "This is the first page of a PDF document. Summarize what you see."},
+                                {"role": "user", "content": [
+                                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
+                                ]}
+                            ]
+                            result = openai.chat.completions.create(
+                                model="gpt-4o",
+                                messages=vision_msg,
+                                max_tokens=128
+                            )
+                            msg_text = result.choices[0].message.content.strip()
+                            return msg_text or f"[Document received: {file_name}]", doc_url
+                    elif ext in ("jpg", "jpeg", "png"):
+                        img_b64 = encode_image_b64(doc_bytes)
+                        vision_msg = [
+                            {"role": "system", "content": "This is an image document. Summarize what you see."},
                             {"role": "user", "content": [
                                 {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
                             ]}
@@ -452,37 +483,22 @@ def extract_text_from_message(msg):
                         )
                         msg_text = result.choices[0].message.content.strip()
                         return msg_text or f"[Document received: {file_name}]", doc_url
-                elif ext in ("jpg", "jpeg", "png"):
-                    img_b64 = encode_image_b64(doc_bytes)
-                    vision_msg = [
-                        {"role": "system", "content": (
-                            "This is an image document received on WhatsApp. "
-                            "Example output is 'user is sending a image with chicken eating chicken'"
-                            "Summarize what you see—main subject, visible text. Short phrase."
-                        )},
-                        {"role": "user", "content": [
-                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
-                        ]}
-                    ]
-                    result = openai.chat.completions.create(
-                        model="gpt-4o",
-                        messages=vision_msg,
-                        max_tokens=128
-                    )
-                    msg_text = result.choices[0].message.content.strip()
-                    return msg_text or f"[Document received: {file_name}]", doc_url
-                else:
-                    return f"[Document received: {file_name}]", doc_url
-            except Exception as e:
-                logger.error(f"[DOC MEANING] {e}")
-                return f"[Document received: {file_name}]", doc_url
-        return "[Document received, no url]", None
+                    else:
+                        return f"[Document received: {file_name}]", doc_url
+                except Exception as e:
+                    logger.error(f"[DOC MEANING] {e}")
+                    save_extraction_error(msg, str(e))
+                    return f"[Document received: {file_name} - extraction failed]", doc_url
+            return "[Document received, no url]", None
 
-    # --- Fallback ---
-    else:
-        msg_text = msg.get("body") or msg.get("caption") or f"[{msg_type} received]" if msg_type else "[Message received]"
-        return msg_text, None
-
+        else:
+            msg_text = msg.get("body") or msg.get("caption") or f"[{msg_type} received]" if msg_type else "[Message received]"
+            return msg_text, None
+    
+    except Exception as e:
+        logger.error(f"[EXTRACTION CRITICAL ERROR] {e}", exc_info=True)
+        save_extraction_error(msg, str(e))
+        return f"[Message extraction failed: {msg_type}]", None
 
 def get_template_content(template_id):
     template = db.session.query(Template).filter_by(template_id=template_id, active=True).first()
@@ -491,10 +507,6 @@ def get_template_content(template_id):
     return template.content if isinstance(template.content, list) else json.loads(template.content)
 
 def download_wassenger_media(url):
-    """
-    Downloads a media file from Wassenger using API Key authentication.
-    Returns bytes if successful, else None.
-    """
     headers = {"Token": os.getenv("WASSENGER_API_KEY")}
     try:
         r = requests.get(url, headers=headers, timeout=60)
@@ -504,13 +516,10 @@ def download_wassenger_media(url):
         logger.error(f"[WASSENGER MEDIA DOWNLOAD ERROR] {e}")
         return None
 
-def save_lead(
-    name, contact, info_dict, whatsapp_number,
-    bot_id=None, business_id=None, session_id=None, status="open"
-):
+def save_lead(name, contact, info_dict, whatsapp_number, bot_id=None, business_id=None, session_id=None, status="open"):
     lead = Lead(
         name=name,
-        contact=contact,                # <-- ADD THIS LINE
+        contact=contact,
         whatsapp_number=whatsapp_number,
         info=info_dict,
         bot_id=bot_id,
@@ -523,7 +532,6 @@ def save_lead(
     return lead
 
 def upload_and_send_media(recipient, file_url_or_path, device_id, caption=None, msg_type=None, delay_seconds=5):
-    # Guess file extension/type for filename and msg_type
     filename = None
     if not msg_type:
         if isinstance(file_url_or_path, str):
@@ -539,11 +547,9 @@ def upload_and_send_media(recipient, file_url_or_path, device_id, caption=None, 
             msg_type = "media"
             filename = "file"
     else:
-        # Optionally guess filename if missing
         if isinstance(file_url_or_path, str) and not filename:
             filename = os.path.basename(file_url_or_path.split("?")[0])
 
-    # Upload if not a file_id
     if isinstance(file_url_or_path, str) and len(file_url_or_path) == 24 and file_url_or_path.isalnum():
         file_id = file_url_or_path
     else:
@@ -562,58 +568,33 @@ def upload_and_send_media(recipient, file_url_or_path, device_id, caption=None, 
         delay_seconds=delay_seconds
     )
 
-def download_to_bytes(url):
-    resp = requests.get(url, timeout=60)
-    resp.raise_for_status()
-    return resp.content
-
 def upload_any_file_to_wassenger(file_path_or_bytes, filename=None, msg_type=None):
-    """
-    Uploads any file (PDF, image, etc.) to Wassenger via multipart/form-data.
-    Accepts local file path, URL, or raw bytes. Returns file_id.
-    Always sets a user-friendly or random filename.
-    Logs and checks file signature before upload.
-    """
     url = "https://api.wassenger.com/v1/files"
     headers = {"Token": WASSENGER_API_KEY}
 
-    # Step 1: Get file content and filename
     if isinstance(file_path_or_bytes, str) and not file_path_or_bytes.startswith("http"):
         if not filename:
             filename = os.path.basename(file_path_or_bytes)
         with open(file_path_or_bytes, "rb") as f:
             file_bytes = f.read()
     elif isinstance(file_path_or_bytes, str) and file_path_or_bytes.startswith("http"):
-        # Download file from URL
         file_bytes = download_to_bytes(file_path_or_bytes)
         if not filename:
             filename = get_filename_from_url_or_path(file_path_or_bytes, default_ext=".pdf" if msg_type == "media" else ".jpg")
     else:
-        # Assume raw bytes (from memory), generate random filename if not provided
         file_bytes = file_path_or_bytes
         if not filename:
             ext = ".pdf" if msg_type == "media" else ".jpg"
             filename = f"file-{uuid.uuid4().hex}{ext}"
 
-    # Debug: log file signature
-    logger.debug(f"[UPLOAD DEBUG] filename: {filename}, size: {len(file_bytes)}, first 16 bytes: {file_bytes[:16]}")
-    # Signature check (PDF, JPG, PNG)
-    if filename.lower().endswith('.pdf') and not file_bytes.startswith(b'%PDF'):
-        logger.error(f"[UPLOAD DEBUG] This is NOT a valid PDF file! (wrong header)")
-
-    if filename.lower().endswith(('.jpg', '.jpeg')) and not file_bytes.startswith(b'\xff\xd8'):
-        logger.warning(f"[UPLOAD DEBUG] This is NOT a valid JPG file! (wrong header)")
-
-    if filename.lower().endswith('.png') and not file_bytes.startswith(b'\x89PNG'):
-        logger.warning(f"[UPLOAD DEBUG] This is NOT a valid PNG file! (wrong header)")
-
+    logger.debug(f"[UPLOAD DEBUG] filename: {filename}, size: {len(file_bytes)}")
+    
     files = {"file": (filename, file_bytes)}
 
-    # Step 2: Upload to Wassenger
     try:
         resp = requests.post(url, headers=headers, files=files, timeout=60)
         if resp.status_code == 409:
-            logger.warning(f"[MEDIA UPLOAD] Duplicate file detected (409 Conflict). {filename} already uploaded recently.")
+            logger.warning(f"[MEDIA UPLOAD] Duplicate file detected (409 Conflict).")
             return None
         resp.raise_for_status()
         resp_json = resp.json()
@@ -622,29 +603,21 @@ def upload_any_file_to_wassenger(file_path_or_bytes, filename=None, msg_type=Non
         elif isinstance(resp_json, dict) and resp_json.get('id'):
             file_id = resp_json['id']
         else:
-            logger.error(f"[MEDIA UPLOAD FAIL] Wassenger /files bad response: {resp.text}")
+            logger.error(f"[MEDIA UPLOAD FAIL] Bad response: {resp.text}")
             return None
-        logger.info(f"[MEDIA UPLOAD SUCCESS] file_id: {file_id} for {filename}")
+        logger.info(f"[MEDIA UPLOAD SUCCESS] file_id: {file_id}")
         return file_id
     except Exception as e:
-        logger.error(f"[MEDIA UPLOAD FAIL] Wassenger /files error: {e}")
+        logger.error(f"[MEDIA UPLOAD FAIL] Error: {e}")
         return None
 
-
 def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text", caption=None, deliver_at_iso=None):
-    """
-    Always upload image/pdf/media to Wassenger unless text is already a file_id.
-    - For "media" or "image": handles url, file path, or bytes (auto-upload)
-    - For "text": sends as text
-    """
-    # Use explicit deliver_at_iso if provided; else compute from delay_seconds
     scheduled_time = deliver_at_iso or (datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
-
+    
     url = "https://api.wassenger.com/v1/messages"
     headers = {"Content-Type": "application/json", "Token": WASSENGER_API_KEY}
     payload = {"device": device_id}
 
-    # Recipient: phone or group
     if isinstance(phone, str) and phone.endswith("@g.us"):
         payload["group"] = phone
     else:
@@ -653,16 +626,11 @@ def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text
     if msg_type == "text":
         payload["message"] = text
         payload["deliverAt"] = scheduled_time
-        payload["order"] = True  # or True if you want strict ordering
-
-
+        payload["order"] = True
     elif msg_type in ("image", "media"):
-        # Always upload unless text is already a file_id
         if isinstance(text, str) and len(text) == 24 and text.isalnum():
-            # Wassenger file id, use directly
             payload["media"] = {"file": text}
         else:
-            # Upload any URL, file path, or bytes and get file_id
             if isinstance(text, str) and text.startswith("http"):
                 file_bytes = download_to_bytes(text)
                 filename = "image.jpg" if msg_type == "image" else "document.pdf"
@@ -670,20 +638,17 @@ def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text
             else:
                 file_id = upload_any_file_to_wassenger(text)
             if not file_id:
-                logger.error(f"[SEND {msg_type.upper()}] Failed to upload to Wassenger")
+                logger.error(f"[SEND {msg_type.upper()}] Failed to upload")
                 return None
             payload["media"] = {"file": file_id}
         if caption:
             payload["message"] = caption
         payload["deliverAt"] = scheduled_time
-        payload["order"] = True  # or True if you want strict ordering
-
-
+        payload["order"] = True
     else:
         logger.error(f"Unsupported msg_type: {msg_type}")
         return None
 
-    # Remove None values from payload
     payload = {k: v for k, v in payload.items() if v is not None}
     logger.debug(f"[WASSENGER PAYLOAD]: {payload}")
 
@@ -695,19 +660,28 @@ def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text
     except Exception as e:
         logger.error(f"[SEND WASSENGER ERROR] {e}")
         return None
+
+# === ENHANCED MESSAGE SENDING WITH SESSION CHECK ===
 def send_messages_with_anchor(phone, lines, device_id, bot_id=None, session_id=None, gap_seconds=3):
-    """Send multi-line messages in stable order by anchoring to the first message's actual hit time."""
+    """Enhanced version with session status checking"""
     if not lines:
         return
     
-    # Normalize to list of non-empty strings
     lines = [l for l in (lines if isinstance(lines, list) else [str(lines)]) if l]
     
-    # 1) First message — send immediately (+1s deliverAt)
+    # Check session status before sending
+    if session_id:
+        session = db.session.query(Session).filter_by(id=int(session_id)).first()
+        if session:
+            db.session.refresh(session)  # Force reload from DB
+            if session.status == 'closed':
+                logger.info(f"[ANCHOR SEND] Session {session_id} is closed. Skipping messages.")
+                return
+    
+    # Send first message
     first_text = lines[0]
     first_resp = send_wassenger_reply(phone, first_text, device_id, delay_seconds=1, msg_type="text")
     
-    # 2) Use Wassenger createdAt as base time (fallback to now)
     try:
         created_at = first_resp.get("createdAt") if isinstance(first_resp, dict) else None
         base_time = datetime.fromisoformat(created_at.replace('Z', '+00:00')) if created_at else datetime.now(timezone.utc)
@@ -715,25 +689,27 @@ def send_messages_with_anchor(phone, lines, device_id, bot_id=None, session_id=N
         base_time = datetime.now(timezone.utc)
     
     if bot_id and session_id:
-        try:
-            save_message(bot_id, phone, session_id, "out", first_text)
-        except Exception:
-            pass
+        save_message_safe(bot_id, phone, session_id, "out", first_text)
     
-    # 3) Subsequent messages — schedule relative to base_time
+    # Send subsequent messages with session check
     for idx, part in enumerate(lines[1:], start=1):
+        # Re-check session status before each message
+        if session_id:
+            session = db.session.query(Session).filter_by(id=int(session_id)).first()
+            if session:
+                db.session.refresh(session)
+                if session.status == 'closed':
+                    logger.info(f"[ANCHOR SEND] Session closed during sending. Stopping at message {idx+1}")
+                    break
+        
         try:
             deliver_at = (base_time + timedelta(seconds=idx * gap_seconds)).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
             send_wassenger_reply(phone, part, device_id, msg_type="text", deliver_at_iso=deliver_at)
             if bot_id and session_id:
-                try:
-                    save_message(bot_id, phone, session_id, "out", part)
-                except Exception:
-                    pass
+                save_message_safe(bot_id, phone, session_id, "out", part)
         except Exception as e:
             logger.error(f"[ANCHOR SEND ERROR] idx={idx} err={e}")
 
-        
 def notify_sales_group(bot, message, error=False):
     import json
     config = bot.config
@@ -745,8 +721,7 @@ def notify_sales_group(bot, message, error=False):
         note = f"[ALERT] {message}" if error else message
         send_wassenger_reply(group_id, note, device_id)
     else:
-        logger.warning("[NOTIFY] Notification group or device_id missing in bot.config")
-
+        logger.warning("[NOTIFY] Notification group or device_id missing")
 
 def get_bot_by_phone(phone_number):
     num_variants = [
@@ -756,13 +731,13 @@ def get_bot_by_phone(phone_number):
         '+' + phone_number.replace('@c.us', '').lstrip('+'),
         phone_number.replace('@c.us', ''),
     ]
-    logger.debug(f"[DB] Bot lookup attempt for: {phone_number} (variants: {num_variants})")
+    logger.debug(f"[DB] Bot lookup for: {phone_number}")
     for variant in num_variants:
         bot = Bot.query.filter_by(phone_number=variant).first()
         if bot:
-            logger.debug(f"[DB] Bot found! Input: {phone_number}, Matched: {variant} (DB: {bot.phone_number})")
+            logger.debug(f"[DB] Bot found! Matched: {variant}")
             return bot
-    logger.error(f"[DB] Bot NOT FOUND for: {phone_number} (tried: {num_variants})")
+    logger.error(f"[DB] Bot NOT FOUND for: {phone_number}")
     return None
 
 def get_active_tools_for_bot(bot_id):
@@ -774,19 +749,39 @@ def get_active_tools_for_bot(bot_id):
     logger.info(f"[DB] Tools for bot_id={bot_id}: {[t.tool_id for t in tools]}")
     return tools
 
+# === SAFE MESSAGE SAVING WITH RETRY ===
+def save_message_safe(bot_id, customer_phone, session_id, direction, content, raw_media_url=None):
+    """Save message with retry logic"""
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            msg = Message(
+                bot_id=bot_id,
+                customer_phone=customer_phone,
+                session_id=session_id,
+                direction=direction,
+                content=content,
+                raw_media_url=raw_media_url,
+                created_at=get_current_datetime_utc8()
+            )
+            db.session.add(msg)
+            db.session.commit()
+            logger.info(f"[DB] Saved message ({direction})")
+            return True
+        except Exception as e:
+            logger.error(f"[DB] Save message attempt {attempt+1} failed: {e}")
+            if attempt < max_retries - 1:
+                db.session.rollback()
+                time.sleep(0.5)
+            else:
+                # Save to backup file
+                with open('failed_messages.log', 'a') as f:
+                    f.write(f"{datetime.now()},{bot_id},{customer_phone},{direction},{content}\n")
+                return False
+
 def save_message(bot_id, customer_phone, session_id, direction, content, raw_media_url=None):
-    msg = Message(
-        bot_id=bot_id,
-        customer_phone=customer_phone,
-        session_id=session_id,
-        direction=direction,
-        content=content,
-        raw_media_url=raw_media_url,
-        created_at=get_current_datetime_utc8()
-    )
-    db.session.add(msg)
-    db.session.commit()
-    logger.info(f"[DB] Saved message ({direction}) for {customer_phone}: {content}")
+    """Original save_message for compatibility"""
+    return save_message_safe(bot_id, customer_phone, session_id, direction, content, raw_media_url)
 
 def get_latest_history(bot_id, customer_phone, session_id, n=100):
     messages = (Message.query
@@ -806,13 +801,10 @@ def build_tool_menu_for_prompt(bot_id):
     return "\n".join(menu)
 
 def decide_tool_with_manager_prompt(bot, history):
-    # Build history text as before
     history_text = "Current date/time (UTC+8): " + get_current_datetime_str_utc8() + "\n" + "\n".join(
         [f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}" for m in history]
     )
 
-
-    # Build the tool menu and append to system prompt
     tool_menu = build_tool_menu_for_prompt(bot.id)
     tool_menu_text = (
         "Here are the available tools you can select (ID, name, and description):\n"
@@ -820,65 +812,50 @@ def decide_tool_with_manager_prompt(bot, history):
         "Choose the single most appropriate tool for this conversation."
     )
 
-    # Merge with your manager prompt
     manager_prompt = build_json_prompt_with_reasoning(
         (bot.manager_system_prompt or "") + "\n" + tool_menu_text,
         '{\n  "TOOLS": "Default"\n}',
     )
     
-    logger.info(f"[AI DECISION] manager_system_prompt: {manager_prompt}")
-    logger.info(f"[AI DECISION] history: {history_text}")
+    logger.info(f"[AI DECISION] Starting tool selection")
     
     try:
-        # FIX 1: Use the manager_prompt as system message
         response = anthropic.Anthropic().messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=8192,
             temperature=0.3,
-            system=manager_prompt,  # Add this line!
+            system=manager_prompt,
             messages=[{"role": "user", "content": history_text}]
         )
         
         raw_response = response.content[0].text
         logger.info(f"[AI DECISION] Raw response: {raw_response}")
         
-        # FIX 2: Extract reasoning first, then clean JSON
         reasoning_match = re.search(r'(.*?)(?=\{)', raw_response, re.DOTALL)
         if reasoning_match:
             reasoning = reasoning_match.group(1).strip()
             logger.info(f"[AI TOOL DECISION REASONING]: {reasoning}")
-            print("\n[AI TOOL DECISION REASONING]:", reasoning)
-        else:
-            logger.info("[AI TOOL DECISION REASONING]: None found")
-
-        # FIX 3: Clean and parse JSON more robustly
-        json_block = strip_json_markdown_blocks(raw_response)
         
-        # Try to extract JSON object from the response
+        json_block = strip_json_markdown_blocks(raw_response)
         json_match = re.search(r'\{[^}]*"TOOLS"[^}]*\}', json_block)
         if json_match:
             json_str = json_match.group(0)
             tool_decision = json.loads(json_str)
-            
-            # Extract the TOOLS value
             tools_value = tool_decision.get("TOOLS")
             logger.info(f"[AI DECISION] Selected tool: {tools_value}")
             return tools_value
         else:
-            logger.error(f"[AI DECISION] No valid JSON found in response: {json_block}")
+            logger.error(f"[AI DECISION] No valid JSON found")
             return "Default"
             
     except json.JSONDecodeError as e:
         logger.error(f"[AI DECISION] JSON decode error: {e}")
-        logger.error(f"[AI DECISION] Raw response was: {raw_response}")
         return "Default"
     except Exception as e:
         logger.error(f"[AI DECISION] Unexpected error: {e}")
         return "Default"
 
-
 def compose_reply(bot, tool, history, context_input):
-    # Compose reply using strict JSON format prompt
     if tool:
         prompt = (bot.system_prompt or "") + "\n" + (tool.prompt or "")
         example_json = '''{
@@ -899,15 +876,14 @@ def compose_reply(bot, tool, history, context_input):
 }'''
     
     reply_prompt = build_json_prompt(prompt, example_json)
-    logger.info(f"[AI REPLY] Prompt: {reply_prompt}")
+    logger.info(f"[AI REPLY] Starting composition")
     
     try:
-        # FIX: Use system parameter correctly
         with client.messages.stream(
             model="claude-sonnet-4-20250514",
             max_tokens=8192,
             temperature=0.3,
-            system=reply_prompt,  # Add this line!
+            system=reply_prompt,
             messages=[{"role": "user", "content": context_input}]
         ) as stream:
             reply_accum = ""
@@ -917,8 +893,6 @@ def compose_reply(bot, tool, history, context_input):
                 print(text, end="", flush=True)
             
             logger.info(f"\n[AI REPLY STREAMED]: {reply_accum}")
-            
-            # Clean and parse JSON response
             cleaned_response = strip_json_markdown_blocks(reply_accum)
             
             try:
@@ -926,27 +900,30 @@ def compose_reply(bot, tool, history, context_input):
                 return tool_decision
             except json.JSONDecodeError as e:
                 logger.error(f"[AI REPLY] JSON decode error: {e}")
-                logger.error(f"[AI REPLY] Raw response was: {reply_accum}")
-                # Return fallback response
                 return {"message": ["I apologize, there was an error processing your request. Please try again."]}
                 
     except Exception as e:
         logger.error(f"[AI REPLY] Unexpected error: {e}")
         return {"message": ["I apologize, there was an error processing your request. Please try again."]}
 
+# === ENHANCED AI REPLY PROCESSING WITH SESSION CHECKS ===
+def is_session_still_open(session_id):
+    """Helper to check if session is still open"""
+    if not session_id:
+        return True
+    session = db.session.query(Session).filter_by(id=int(session_id)).first()
+    if session:
+        db.session.refresh(session)  # Force reload from DB
+        return session.status == 'open'
+    return False
+
 def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, user=None, session_id=None):
-    """
-    Streams each message in ai_reply['message'] (if array) as separate WhatsApp messages,
-    with short delays, and saves each outgoing message to DB.
-    Handles special session-closing logic for notification/lead/closing.
-    """
+    """Enhanced with multiple session status checks"""
     
-    # CHECK: Verify session is still open before processing
-    if session_id:
-        session = db.session.query(Session).filter_by(id=int(session_id)).first()
-        if session and session.status == 'closed':
-            logger.info(f"[AI REPLY] Session {session_id} is already closed. Skipping message send.")
-            return
+    # Initial session check
+    if not is_session_still_open(session_id):
+        logger.info(f"[AI REPLY] Session {session_id} is already closed. Skipping.")
+        return
 
     def extract_field_from_notification(notification, field):
         if not notification:
@@ -958,55 +935,50 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
     try:
         parsed = ai_reply if isinstance(ai_reply, dict) else json.loads(ai_reply)
     except Exception as e:
-        logger.error(f"[WEBHOOK] Could not parse AI reply as JSON: {ai_reply} ({e})")
+        logger.error(f"[WEBHOOK] Could not parse AI reply: {e}")
         parsed = {}
 
     if not isinstance(parsed, dict):
-        logger.error(f"[WEBHOOK] AI reply did not return a dict. Raw reply: {parsed}")
+        logger.error(f"[WEBHOOK] AI reply not a dict")
         parsed = {}
 
-    # --- UNIVERSAL BACKEND CLOSING BLOCK ---
+    # Handle session closing instructions
     if parsed.get("instruction") in ("close_session_and_notify_sales", "close_session_drop"):
-        logger.info("[AI REPLY] Instruction: Session close detected. Executing closing/notification logic.")
-    
-        # 1. Save any extra fields to session context and close session
+        logger.info("[AI REPLY] Session close detected")
+        
+        # Re-check session status before processing close
+        if not is_session_still_open(session_id):
+            logger.info(f"[AI REPLY] Session already closed, skipping close logic")
+            return
+        
         info_to_save = {}
         for k, v in parsed.items():
             if k not in ("message", "notification", "instruction") and v is not None:
                 info_to_save[k] = v
-    
+        
         close_reason = parsed.get("close_reason")
         if not close_reason:
             close_reason = "won" if parsed["instruction"] == "close_session_and_notify_sales" else "drop"
-    
-        # Try to capture specific drop/loss reason (define only once!)
+        
         lose_reason = (
-            parsed.get("lose_reason")
-            or parsed.get("drop_reason")
-            or info_to_save.get("lose_reason")
-            or info_to_save.get("drop_reason")
+            parsed.get("lose_reason") or 
+            parsed.get("drop_reason") or 
+            info_to_save.get("lose_reason") or 
+            info_to_save.get("drop_reason")
         )
-    
+        
         if close_reason in ("drop", "lost", "lose"):
             if lose_reason:
-                # Store the full analytical reason
                 close_reason = f"{close_reason}: {lose_reason}"
-                # Also store it separately for analytics
                 info_to_save["loss_analysis"] = lose_reason
-                logger.info(f"[LOSS ANALYSIS] Intelligent reason: {lose_reason}")
+                logger.info(f"[LOSS ANALYSIS] Reason: {lose_reason}")
             else:
                 close_reason = f"{close_reason}: not specified"
-                logger.warning("[DROP/LOSE] No specific reason found, saved as 'not specified'.")
-    
-        # 2. Find and update the active session for this customer + bot
+        
+        # Find and update session
         bot = db.session.get(Bot, bot_id) if bot_id else None
         customer = Customer.query.filter_by(phone_number=customer_phone).first()
-    
-        if not customer:
-            logger.error(f"[SESSION CLOSE] Customer not found for phone: {customer_phone}")
-        if not bot:
-            logger.error(f"[SESSION CLOSE] Bot not found for bot_id: {bot_id}")
-    
+        
         session_obj = None
         if bot and customer:
             session_obj = (
@@ -1015,62 +987,58 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
                 .order_by(Session.started_at.desc())
                 .first()
             )
-            if not session_obj:
-                logger.error(f"[SESSION CLOSE] No open session found for bot_id={bot.id}, customer_id={customer.id}")
-        else:
-            session_obj = None
-            logger.warning("[SESSION CLOSE] Could not look up session (bot or customer missing)")
-    
-        # --- Update session status and context ---
+        
+        # Update session with lock to prevent race conditions
         if session_obj:
-            session_obj.status = "closed"
-            session_obj.ended_at = get_current_datetime_utc8()
-            if not session_obj.context:
-                session_obj.context = {}
-            session_obj.context["close_reason"] = close_reason
-            session_obj.context.update(info_to_save)
-            db.session.commit()
-            logger.info(f"[SESSION CLOSE] Session {session_obj.id} closed with reason: {close_reason}")
-    
-        # --- Gather critical fields with fallback/defensive extraction ---
-        critical_keys = ["name", "contact"]
+            with BUFFER_LOCK:
+                # Final check before closing
+                db.session.refresh(session_obj)
+                if session_obj.status == "closed":
+                    logger.info(f"[SESSION CLOSE] Session already closed by another process")
+                    return
+                
+                session_obj.status = "closed"
+                session_obj.ended_at = get_current_datetime_utc8()
+                if not session_obj.context:
+                    session_obj.context = {}
+                session_obj.context["close_reason"] = close_reason
+                session_obj.context.update(info_to_save)
+                db.session.commit()
+                logger.info(f"[SESSION CLOSE] Session {session_obj.id} closed")
+        
+        # Handle lead creation and notification
         notification = parsed.get("notification") or info_to_save.get("notification") or ""
-    
-        # Extract name from parsed fields or notification
         name = parsed.get("name") or info_to_save.get("name")
         if not name:
-            # Try to extract from notification (looking for "Customer name: XXX")
             name_match = re.search(r'Customer name[:：]\s*([^\n]+)', notification)
             if name_match:
                 name = name_match.group(1).strip()
-    
+        
         contact = (
-            parsed.get("contact")
-            or info_to_save.get("contact")
-            or extract_field_from_notification(notification, "Contact")
-            or extract_field_from_notification(notification, "Phone")
+            parsed.get("contact") or 
+            info_to_save.get("contact") or 
+            extract_field_from_notification(notification, "Contact") or 
+            extract_field_from_notification(notification, "Phone")
         )
         if not contact or str(contact).strip().lower() in [
             "whatsapp number", "[whatsapp number]", "same", "this", "use this", "ok", "yes"
         ]:
             contact = customer_phone
-    
+        
         info_fields = {}
         for k, v in {**parsed, **info_to_save}.items():
-            if k not in critical_keys and v is not None:
+            if k not in ["name", "contact"] and v is not None:
                 info_fields[k] = v
-    
-        logger.info(f"[LEAD CHECK] instruction={parsed.get('instruction')}, close_reason={close_reason}, name={name}, contact={contact}")
-    
+        
         if (
-            parsed.get("instruction") == "close_session_and_notify_sales"
-            and close_reason.startswith("won")
-            and name and contact
+            parsed.get("instruction") == "close_session_and_notify_sales" and 
+            close_reason.startswith("won") and 
+            name and contact
         ):
             lead = Lead(
                 name=name,
                 contact=contact,
-                whatsapp_number=customer_phone,  # <-- ADD THIS LINE!
+                whatsapp_number=customer_phone,
                 info=info_fields,
                 bot_id=bot_id,
                 business_id=getattr(bot, 'business_id', None),
@@ -1079,10 +1047,9 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
             )
             db.session.add(lead)
             db.session.commit()
-            logger.info(f"[LEAD] Lead saved: {lead.id}, {lead.name}, {lead.contact}, {lead.info}")
-    
-            # Notify sales group if present
-            # --- Sales notification (always include both WhatsApp numbers) ---
+            logger.info(f"[LEAD] Lead saved: {lead.id}")
+            
+            # Notify sales
             cfg = bot.config
             if isinstance(cfg, str):
                 import json as _json
@@ -1092,10 +1059,7 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
             header = f"{customer_phone}\n\n{notify_whatsapp}".strip()
             notification_text = parsed.get("notification") or ""
             
-            whitelist = [
-                "desired_service", "industry", "area",
-                "facebook_link", "tiktok_link", "current_challenges"
-            ]
+            whitelist = ["desired_service", "industry", "area", "facebook_link", "tiktok_link", "current_challenges"]
             control_keys = {"message", "notification", "instruction", "template"}
             
             summary_lines = [f"{k}: {info_fields[k]}" for k in whitelist if info_fields.get(k)]
@@ -1111,88 +1075,60 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
                 parts.append("\n".join(summary_lines + other_lines))
             final_note = "\n\n".join(parts)
             
-            logger.info(f"[NOTIFY SALES GROUP]: {final_note}")
+            logger.info(f"[NOTIFY SALES]: {final_note}")
             notify_sales_group(bot, final_note)
-
-        else:
-            logger.warning(
-                f"[LEAD] Not saving lead: missing required field(s) or not a win. "
-                f"name={name}, contact={contact}, instruction={parsed.get('instruction')}, close_reason={close_reason}"
-            )
-    
-        # --- Always send all customer-facing messages (anchored to first hit) ---
-        if "message" in parsed:
-            msg_lines = parsed["message"]
-            send_messages_with_anchor(customer_phone, msg_lines, device_id, bot_id=bot_id, session_id=session_id, gap_seconds=3)
         
-        return  # All done, prevents rest of function from running
-
-    # --- Stream/send each message line-by-line (normal flow) ---
+        # Send customer messages
+        if "message" in parsed:
+            send_messages_with_anchor(customer_phone, parsed["message"], device_id, bot_id=bot_id, session_id=session_id, gap_seconds=3)
+        
+        return
+    
+    # Normal message sending
     if "message" in parsed and isinstance(parsed["message"], list):
         send_messages_with_anchor(customer_phone, parsed["message"], device_id, bot_id=bot_id, session_id=session_id, gap_seconds=3)
-
     elif "message" in parsed:
-        # fallback: send single message
-        send_wassenger_reply(
-            customer_phone,
-            str(ai_reply),
-            device_id,
-            delay_seconds=5,
-            msg_type="text"
-        )
+        send_wassenger_reply(customer_phone, str(ai_reply), device_id, delay_seconds=5, msg_type="text")
         if bot_id and user and session_id:
-            save_message(bot_id, customer_phone, session_id, "out", str(ai_reply))
-
-    # --- TEMPLATE PROCESSING ---
+            save_message_safe(bot_id, customer_phone, session_id, "out", str(ai_reply))
+    
+    # Template processing
     if "template" in parsed:
         template_id = parsed["template"]
         template_content = get_template_content(template_id)
         doc_counter = 1
         img_counter = 1
         for idx, part in enumerate(template_content):
+            # Check session before each template part
+            if not is_session_still_open(session_id):
+                logger.info(f"[TEMPLATE] Session closed during template sending")
+                break
+                
             content_type = part.get("type")
             content_value = part.get("content")
             caption = part.get("caption") or None
             delay = max(0, idx * 25)
+            
             if content_type == "text":
                 send_wassenger_reply(customer_phone, content_value, device_id, delay_seconds=delay)
                 if bot_id and user and session_id:
-                    save_message(bot_id, user, session_id, "out", content_value)
+                    save_message_safe(bot_id, user, session_id, "out", content_value)
             elif content_type == "image":
                 filename = f"image{img_counter}.jpg"
                 img_counter += 1
-                file_id = upload_media_file(content_value, db.session, filename=filename)
+                file_id = upload_any_file_to_wassenger(content_value, filename=filename)
                 if file_id:
-                    send_wassenger_reply(
-                        customer_phone,
-                        file_id,
-                        device_id,
-                        msg_type="image",
-                        caption=caption,
-                        delay_seconds=delay
-                    )
+                    send_wassenger_reply(customer_phone, file_id, device_id, msg_type="image", caption=caption, delay_seconds=delay)
                     if bot_id and user and session_id:
-                        save_message(bot_id, user, session_id, "out", "[Image sent]")
-                else:
-                    logger.warning(f"[MEDIA SEND] Failed to upload/send image: {filename}")
+                        save_message_safe(bot_id, user, session_id, "out", "[Image sent]")
             elif content_type == "document":
                 filename = f"document{doc_counter}.pdf"
                 doc_counter += 1
-                file_id = upload_media_file(content_value, db.session, filename=filename)
+                file_id = upload_any_file_to_wassenger(content_value, filename=filename)
                 if file_id:
-                    send_wassenger_reply(
-                        customer_phone,
-                        file_id,
-                        device_id,
-                        msg_type="media",
-                        caption=caption,
-                        delay_seconds=delay
-                    )
+                    send_wassenger_reply(customer_phone, file_id, device_id, msg_type="media", caption=caption, delay_seconds=delay)
                     if bot_id and user and session_id:
-                        save_message(bot_id, user, session_id, "out", "[PDF sent]")
-                else:
-                    logger.warning(f"[MEDIA SEND] Failed to upload/send document: {filename}")
-        return  # All done, prevents rest of function from running
+                        save_message_safe(bot_id, user, session_id, "out", "[PDF sent]")
 
 def find_or_create_customer(phone, name=None):
     customer = Customer.query.filter_by(phone_number=phone).first()
@@ -1203,12 +1139,7 @@ def find_or_create_customer(phone, name=None):
     return customer
 
 def check_recent_closed_session(customer_id, bot_id, days_threshold=14):
-    """
-    Check if there's a recently closed session within the specified days threshold.
-    Returns the session if found, None otherwise.
-    """
-    # Use timezone-aware current time
-    current_time = get_current_datetime_utc8()  # Uses the new function
+    current_time = get_current_datetime_utc8()
     cutoff_date = current_time - timedelta(days=days_threshold)
     
     recent_session = (
@@ -1218,7 +1149,6 @@ def check_recent_closed_session(customer_id, bot_id, days_threshold=14):
         .first()
     )
     
-    # Check with timezone-aware comparison
     if recent_session and recent_session.ended_at:
         ended_at_aware = make_timezone_aware(recent_session.ended_at)
         if ended_at_aware >= cutoff_date:
@@ -1227,22 +1157,15 @@ def check_recent_closed_session(customer_id, bot_id, days_threshold=14):
     return None
 
 def get_or_create_session(customer_id, bot_id):
-    """
-    Modified version with 14-day check for recently closed sessions
-    """
-    # First check for an open session
     session_obj = Session.query.filter_by(customer_id=customer_id, bot_id=bot_id, status='open').first()
     
     if not session_obj:
-        # Check if there's a recently closed session (within 14 days)
         recent_closed = check_recent_closed_session(customer_id, bot_id, days_threshold=14)
         
         if recent_closed:
-            # Return the closed session with a flag indicating it shouldn't be reopened
             recent_closed.is_recently_closed = True
             return recent_closed
         
-        # No recent closed session, create a new one
         session_obj = Session(
             customer_id=customer_id,
             bot_id=bot_id,
@@ -1253,27 +1176,22 @@ def get_or_create_session(customer_id, bot_id):
         db.session.add(session_obj)
         db.session.commit()
     
-    # Check if the session is already closed (important check!)
     if session_obj.status == 'closed':
         session_obj.is_already_closed = True
     
     return session_obj
 
 def generate_processing_message(customer_language=None):
-    """
-    Generate a "we're processing your request" message in the customer's preferred language
-    """
     messages = {
         'en': "Thank you for reaching out. We are currently processing your previous request. Our team will contact you soon with an update.",
         'ms': "Terima kasih kerana menghubungi kami. Kami sedang memproses permintaan anda yang sebelumnya. Pasukan kami akan menghubungi anda tidak lama lagi dengan kemaskini.",
         'zh': "感谢您的联系。我们目前正在处理您之前的请求。我们的团队将很快与您联系并提供更新。",
-        'ta': "தொடர்பு கொண்டதற்கு நன்றி. உங்கள் முந்தைய கோரிக்கையை நாங்கள் தற்போது செயலாக்கி வருகிறோம். எங்கள் குழு விரைவில் புதுப்பிப்புடன் உங்களை தொடர்பு கொள்ளும்.",
+        'ta': "தொடர்பு கொண்டதற்கு நன்றி. உங்கள் முந்தைய கோரிக்கையை நாங்கள் தற்போது செயலாக்கி வருகிறோம்.",
         'default': "Thank you for reaching out. We are currently processing your previous request. Our team will contact you soon with an update."
     }
     
     language = customer_language or 'default'
     return messages.get(language, messages['default'])
-
 
 def close_session(session, reason, info: dict = None):
     session.ended_at = get_current_datetime_utc8()
@@ -1283,197 +1201,287 @@ def close_session(session, reason, info: dict = None):
     session.context['close_reason'] = reason
     db.session.commit()
 
+# === ENHANCED BUFFER PROCESSING WITH CONCURRENCY CONTROL ===
 def process_buffered_messages(buffer_key):
+    """Enhanced with processing flags and better error handling"""
     with app.app_context():
-        bot_id, user_phone, session_id = buffer_key
-        bot = db.session.get(Bot, bot_id)
-        messages = MESSAGE_BUFFER.pop(buffer_key, [])
-        if not messages:
-            return
-        device_id = messages[-1].get("device_id")
+        # Check if already processing
+        with BUFFER_LOCK:
+            if PROCESSING_FLAGS.get(buffer_key, False):
+                logger.info(f"[BUFFER] Already processing {buffer_key}, skipping")
+                return
+            PROCESSING_FLAGS[buffer_key] = True
         
-        # CHECK: Get session and verify it's still open
-        session = db.session.query(Session).filter_by(id=int(session_id)).first()
-        if session and session.status == 'closed':
-            logger.info(f"[BUFFER PROCESS] Session {session_id} is already closed. Skipping AI processing.")
-            # Just acknowledge without processing
-            return
-        
-        combined_text = "\n".join(m['msg_text'] for m in messages if m['msg_text'])
-        history = get_latest_history(bot_id, user_phone, session_id)
-        
-        # Add session status to context to prevent AI from closing again
-        session_status_note = ""
-        if session and session.status == 'closed':
-            session_status_note = "\n[SYSTEM NOTE: This session is already closed. Do not generate close_session instructions.]"
-        
-        context_input = "Current date/time (UTC+8): " + get_current_datetime_str_utc8() + session_status_note + "\n" + "\n".join([
-            f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}"
-            for m in history
-        ] + [f"User: {combined_text}"])
+        try:
+            bot_id, user_phone, session_id = buffer_key
+            bot = db.session.get(Bot, bot_id)
+            
+            # Get messages from buffer
+            messages = MESSAGE_BUFFER.pop(buffer_key, [])
+            if not messages:
+                logger.info(f"[BUFFER] No messages for {buffer_key}")
+                return
+            
+            device_id = messages[-1].get("device_id")
+            
+            # Check session status
+            session = db.session.query(Session).filter_by(id=int(session_id)).first()
+            if session:
+                db.session.refresh(session)
+                if session.status == 'closed':
+                    logger.info(f"[BUFFER PROCESS] Session {session_id} is closed. Skipping AI.")
+                    return
+            
+            # Combine messages
+            combined_text = "\n".join(m['msg_text'] for m in messages if m['msg_text'])
+            history = get_latest_history(bot_id, user_phone, session_id)
+            
+            session_status_note = ""
+            if session and session.status == 'closed':
+                session_status_note = "\n[SYSTEM NOTE: This session is already closed. Do not generate close_session instructions.]"
+            
+            context_input = (
+                "Current date/time (UTC+8): " + get_current_datetime_str_utc8() + 
+                session_status_note + "\n" + 
+                "\n".join([
+                    f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}"
+                    for m in history
+                ] + [f"User: {combined_text}"])
+            )
+            
+            # Get tool and compose reply
+            tool_id = decide_tool_with_manager_prompt(bot, history)
+            tool = None
+            if tool_id and tool_id.lower() != "default":
+                for t in get_active_tools_for_bot(bot.id):
+                    if t.tool_id == tool_id:
+                        tool = t
+                        break
+            
+            ai_reply = compose_reply(bot, tool, history, context_input)
+            process_ai_reply_and_send(user_phone, ai_reply, device_id, bot_id=bot.id, user=user_phone, session_id=session_id)
+            
+        except Exception as e:
+            logger.error(f"[BUFFER PROCESS ERROR] {e}", exc_info=True)
+        finally:
+            # Clean up
+            with BUFFER_LOCK:
+                PROCESSING_FLAGS[buffer_key] = False
+                TIMER_BUFFER.pop(buffer_key, None)
+                BUFFER_START_TIME.pop(buffer_key, None)
 
-        tool_id = decide_tool_with_manager_prompt(bot, history)
-        tool = None
-        if tool_id and tool_id.lower() != "default":
-            for t in get_active_tools_for_bot(bot.id):
-                if t.tool_id == tool_id:
-                    tool = t
-                    break
-        ai_reply = compose_reply(bot, tool, history, context_input)
-        process_ai_reply_and_send(user_phone, ai_reply, device_id, bot_id=bot.id, user=user_phone, session_id=session_id)
+# === ASYNC WEBHOOK PROCESSING ===
+def process_webhook_async(data):
+    """Process webhook in background thread"""
+    with app.app_context():
+        try:
+            msg = data["data"]
+            msg_type = msg.get("type")
+            
+            if msg.get("flow") == "outbound":
+                return
+                
+            # Ignore group messages
+            if (
+                "@g.us" in msg.get("from", "") or 
+                (msg.get("chat", {}).get("type") == "group") or 
+                msg.get("meta", {}).get("isGroup") is True
+            ):
+                logger.info(f"[WEBHOOK] Ignored group message")
+                return
+            
+            bot_phone = msg.get("toNumber")
+            user_phone = msg.get("fromNumber")
+            device_id = data["device"]["id"]
+            
+            # Check for duplicate message
+            if msg_type == "text":
+                msg_body = msg.get("body", "")
+                if is_duplicate_message(user_phone, msg_body):
+                    logger.info(f"[WEBHOOK] Duplicate message ignored from {user_phone}")
+                    return
+            
+            # Get bot
+            bot = get_bot_by_phone(bot_phone)
+            if not bot:
+                logger.error(f"[ERROR] No bot found for {bot_phone}")
+                return
+            
+            # Extract message content
+            if msg_type == "audio":
+                extract_result, raw_media_url = extract_text_from_message(msg)
+                transcript = extract_result["transcript"]
+                gpt_reply = extract_result["gpt_reply"]
+                msg_text = gpt_reply or transcript
+            else:
+                msg_text, raw_media_url = extract_text_from_message(msg)
+            
+            # Get customer and session
+            customer = find_or_create_customer(user_phone)
+            session = get_or_create_session(customer.id, bot.id)
+            
+            # Handle closed sessions
+            if hasattr(session, 'is_already_closed') and session.is_already_closed:
+                logger.info(f"[SESSION] Already closed for {user_phone}")
+                return
+            
+            # Handle recently closed sessions
+            if hasattr(session, 'is_recently_closed') and session.is_recently_closed:
+                current_time = get_current_datetime_utc8()
+                ended_at = make_timezone_aware(session.ended_at)
+                
+                if ended_at:
+                    days_since_closed = (current_time - ended_at).days
+                else:
+                    days_since_closed = 0
+                
+                logger.info(f"[SESSION] Recently closed ({days_since_closed} days)")
+                
+                # Check if already responded recently
+                last_response = session.context.get('last_auto_response')
+                now = current_time
+                
+                if last_response:
+                    last_response_time = datetime.fromisoformat(last_response)
+                    last_response_time = make_timezone_aware(last_response_time)
+                    if (now - last_response_time).total_seconds() < 3600:
+                        logger.info(f"[SESSION] Already sent auto-response recently")
+                        return
+                
+                # Send processing message
+                processing_msg = generate_processing_message(customer.language)
+                send_wassenger_reply(user_phone, processing_msg, device_id, delay_seconds=1, msg_type="text")
+                
+                # Update response time
+                session.context['last_auto_response'] = now.isoformat()
+                db.session.commit()
+                
+                # Notify sales if very recent
+                if days_since_closed <= 7:
+                    last_notification = session.context.get('last_reopen_notification')
+                    today = now.date().isoformat()
+                    
+                    if last_notification != today:
+                        notify_msg = f"Customer {user_phone} attempted to restart conversation.\nClosed {days_since_closed} days ago.\nReason: {session.context.get('close_reason', 'Not specified')}"
+                        notify_sales_group(bot, notify_msg)
+                        session.context['last_reopen_notification'] = today
+                        db.session.commit()
+                
+                return
+            
+            session_id = str(session.id)
+            
+            # Save incoming message
+            save_message_safe(bot.id, user_phone, session_id, "in", msg_text, raw_media_url)
+            
+            # Handle special triggers
+            if msg_text.strip() == "*.*":
+                Message.query.filter_by(bot_id=bot.id, customer_phone=user_phone).delete()
+                db.session.commit()
+                session.status = "closed"
+                session.ended_at = get_current_datetime_utc8() - timedelta(days=15)
+                db.session.commit()
+                new_session = Session(
+                    customer_id=customer.id,
+                    bot_id=bot.id,
+                    started_at=get_current_datetime_utc8(),
+                    status='open',
+                    context={},
+                )
+                db.session.add(new_session)
+                db.session.commit()
+                send_wassenger_reply(user_phone, "Convo Refreshed", device_id, delay_seconds=1)
+                return
+            
+            if msg_text.strip().lower() == "*off*":
+                session.status = "closed"
+                session.ended_at = get_current_datetime_utc8()
+                session.context['close_reason'] = "force_closed"
+                db.session.commit()
+                logger.info(f"[SESSION] Force closed for {user_phone}")
+                note = f"Session for {user_phone} was force closed by agent/trigger."
+                notify_sales_group(bot, note)
+                return
+            
+            # Add to buffer with limits
+            buffer_key = (bot.id, user_phone, session_id)
+            current_time = time.time()
+            
+            with BUFFER_LOCK:
+                # Initialize buffer start time
+                if buffer_key not in BUFFER_START_TIME:
+                    BUFFER_START_TIME[buffer_key] = current_time
+                
+                # Add message to buffer
+                MESSAGE_BUFFER[buffer_key].append({
+                    "msg_text": msg_text,
+                    "raw_media_url": raw_media_url,
+                    "created_at": get_current_datetime_utc8().isoformat(),
+                    "device_id": device_id,
+                })
+                
+                # Check buffer limits
+                buffer_age = current_time - BUFFER_START_TIME[buffer_key]
+                buffer_size = len(MESSAGE_BUFFER[buffer_key])
+                
+                if buffer_age > 60 or buffer_size >= 5:  # Max 60s or 5 messages
+                    # Process immediately
+                    if buffer_key in TIMER_BUFFER and TIMER_BUFFER[buffer_key]:
+                        TIMER_BUFFER[buffer_key].cancel()
+                    process_buffered_messages(buffer_key)
+                else:
+                    # Set/reset timer
+                    if buffer_key in TIMER_BUFFER and TIMER_BUFFER[buffer_key]:
+                        TIMER_BUFFER[buffer_key].cancel()
+                    TIMER_BUFFER[buffer_key] = Timer(30, process_buffered_messages, args=(buffer_key,))
+                    TIMER_BUFFER[buffer_key].start()
+                    
+        except Exception as e:
+            logger.error(f"[WEBHOOK ASYNC ERROR] {e}", exc_info=True)
 
-
+# === MAIN WEBHOOK ENDPOINT ===
 @app.route('/webhook', methods=['POST'])
 def webhook():
+    """Quick webhook response with async processing"""
     logger.info("[WEBHOOK] Received POST /webhook")
     data = request.json
-    logger.info(f"[WEBHOOK] Full incoming message: {json.dumps(data)}")
+    logger.info(f"[WEBHOOK] Incoming: {json.dumps(data)}")
+    
+    # Quick validation
+    msg = data.get("data", {})
+    if msg.get("flow") == "outbound":
+        return jsonify({"status": "ignored"}), 200
+    
+    # Process in background
+    thread = Thread(target=process_webhook_async, args=(data,))
+    thread.daemon = True
+    thread.start()
+    
+    # Return immediately
+    return jsonify({"status": "queued"}), 200
 
+# === HEALTH CHECK ENDPOINT ===
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint for monitoring"""
     try:
-        msg = data["data"]
-        msg_type = msg.get("type")
-        if msg.get("flow") == "outbound":
-            return jsonify({"status": "ignored"}), 200
-            
-        # Ignore all group messages
-        if (
-            "@g.us" in msg.get("from", "")
-            or (msg.get("chat", {}).get("type") == "group")
-            or msg.get("meta", {}).get("isGroup") is True
-        ):
-            logger.info(f"[WEBHOOK] Ignored group message from: {msg.get('from')}")
-            return jsonify({"status": "ignored_group"}), 200
+        # Test DB connection
+        db.session.execute('SELECT 1')
+        db_status = "connected"
+    except:
+        db_status = "disconnected"
+    
+    return jsonify({
+        "status": "healthy",
+        "buffered_messages": sum(len(msgs) for msgs in MESSAGE_BUFFER.values()),
+        "active_timers": len(TIMER_BUFFER),
+        "processing_flags": sum(1 for v in PROCESSING_FLAGS.values() if v),
+        "db_status": db_status,
+        "timestamp": get_current_datetime_utc8().isoformat()
+    })
 
-        bot_phone = msg.get("toNumber")
-        user_phone = msg.get("fromNumber")
-        device_id = data["device"]["id"]
-
-        # Extract bot and message first
-        bot = get_bot_by_phone(bot_phone)
-        if not bot:
-            logger.error(f"[ERROR] No bot found for phone {bot_phone}")
-            return jsonify({"error": "Bot not found"}), 404
-
-        # Extract message content
-        if msg_type == "audio":
-            extract_result, raw_media_url = extract_text_from_message(msg)
-            transcript = extract_result["transcript"]
-            gpt_reply = extract_result["gpt_reply"]
-            msg_text = gpt_reply or transcript
-        else:
-            msg_text, raw_media_url = extract_text_from_message(msg)
-
-        # Get or create customer
-        customer = find_or_create_customer(user_phone)
-        
-        # Get or create session with checks
-        session = get_or_create_session(customer.id, bot.id)
-        
-        # CHECK 1: If session is already closed (not recently, but currently)
-        if hasattr(session, 'is_already_closed') and session.is_already_closed:
-            logger.info(f"[SESSION] Message received for already closed session from {user_phone}")
-            # Don't process anything for closed sessions
-            return jsonify({"status": "session_already_closed"}), 200
-        
-        # CHECK 2: If this is a recently closed session (within 14 days)
-        if hasattr(session, 'is_recently_closed') and session.is_recently_closed:
-            # Calculate days since closure with timezone handling
-            current_time = get_current_datetime_utc8()  # datetime object
-            ended_at = make_timezone_aware(session.ended_at)
-            
-            if ended_at:
-                days_since_closed = (current_time - ended_at).days
-            else:
-                days_since_closed = 0
-            
-            logger.info(f"[SESSION] Recently closed session detected for {user_phone}, closed {days_since_closed} days ago")
-                
-            # Generate processing message in customer's preferred language
-            processing_msg = generate_processing_message(customer.language)
-            
-            # Send ONE processing message only
-            send_wassenger_reply(
-                user_phone,
-                processing_msg,
-                device_id,
-                delay_seconds=1,
-                msg_type="text"
-            )
-            
-            # Notify sales team ONCE about the attempt (only for very recent attempts)
-            if days_since_closed <= 7:
-                # Check if we already notified about this attempt today
-                last_notification = session.context.get('last_reopen_notification')
-                today = get_current_datetime_utc8().date().isoformat()
-                
-                if last_notification != today:
-                    notify_msg = f"Customer {user_phone} attempted to restart conversation.\nSession was closed {days_since_closed} days ago.\nReason: {session.context.get('close_reason', 'Not specified')}"
-                    notify_sales_group(bot, notify_msg)
-                    
-                    # Update session context to track notification
-                    session.context['last_reopen_notification'] = today
-                    db.session.commit()
-            
-            return jsonify({"status": "recently_closed_session", "days_since_closed": days_since_closed}), 200
-        
-        session_id = str(session.id)
-        
-        # Save the incoming message
-        save_message(bot.id, user_phone, session_id, "in", msg_text, raw_media_url=raw_media_url)
-
-        # Handle special triggers
-        if msg_text.strip() == "*.*":
-            # Delete all previous conversation & restart session
-            Message.query.filter_by(bot_id=bot.id, customer_phone=user_phone).delete()
-            db.session.commit()
-            # Force close existing session & start a new one
-            session.status = "closed"
-            session.ended_at = get_current_datetime_utc8() - timedelta(days=15)  # Bypass 14-day check
-            db.session.commit()
-            new_session = Session(
-                customer_id=customer.id,
-                bot_id=bot.id,
-                started_at=get_current_datetime_utc8(),
-                status='open',
-                context={},
-            )
-            db.session.add(new_session)
-            db.session.commit()
-            send_wassenger_reply(user_phone, "Convo Refreshed", device_id, delay_seconds=1)
-            return jsonify({"status": "conversation_refreshed"}), 200
-
-        if msg_text.strip().lower() == "*off*":
-            # Force close session
-            session.status = "closed"
-            session.ended_at = get_current_datetime_utc8()
-            session.context['close_reason'] = "force_closed"
-            db.session.commit()
-            logger.info(f"[SESSION] Force closed for {user_phone}")
-            note = f"Session for {user_phone} was force closed by agent/trigger."
-            notify_sales_group(bot, note)
-            return jsonify({"status": "force_closed"}), 200
-
-        # Continue with buffer processing for OPEN sessions only
-        buffer_key = (bot.id, user_phone, session_id)
-        MESSAGE_BUFFER[buffer_key].append({
-            "msg_text": msg_text,
-            "raw_media_url": raw_media_url,
-            "created_at": get_current_datetime_utc8().isoformat(),
-            "device_id": device_id,
-        })
-
-        # Start or reset the 30s buffer timer
-        if buffer_key in TIMER_BUFFER and TIMER_BUFFER[buffer_key]:
-            TIMER_BUFFER[buffer_key].cancel()
-        TIMER_BUFFER[buffer_key] = Timer(30, process_buffered_messages, args=(buffer_key,))
-        TIMER_BUFFER[buffer_key].start()
-
-        return jsonify({"status": "buffered, will process in 30s"})
-
-    except Exception as e:
-        logger.error(f"[WEBHOOK] Exception: {e}")
-        return jsonify({"error": "Webhook processing error"}), 500
-
-# 9. Main run block at file bottom only!
+# === MAIN RUN BLOCK ===
 if __name__ == "__main__":
+    with app.app_context():
+        db.create_all()  # Ensure all tables exist
     app.run(host="0.0.0.0", port=5000, debug=True)
