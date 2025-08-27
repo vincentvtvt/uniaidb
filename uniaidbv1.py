@@ -1,7 +1,4 @@
 
-@lru_cache(maxsize=256)
-def _bot_lookup_cached(variant: str):
-    return Bot.query.filter_by(phone_number=variant).first()
 
 import re
 import logging
@@ -56,6 +53,10 @@ def build_json_prompt(base_prompt, example_json):
         f"{example_json.strip()}"
     )
     return base_prompt.strip() + json_instruction
+
+@lru_cache(maxsize=256)
+def _bot_lookup_cached(variant: str):
+    return Bot.query.filter_by(phone_number=variant).first()
 
 # === Time helper for AI context (UTC+8) ===
 def get_current_datetime_str_utc8():
