@@ -1757,8 +1757,8 @@ def process_webhook_async(data):
         except Exception as e:
             logger.error(f"[WEBHOOK ASYNC ERROR] {e}", exc_info=True)
 
-    finally:
-        db.session.remove()
+        finally:
+            db.session.remove()
 # === MAIN WEBHOOK ENDPOINT ===
 @app.route('/webhook', methods=['POST'])
 def webhook():
