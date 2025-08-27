@@ -1428,7 +1428,7 @@ def process_buffered_messages(buffer_key):
         except Exception as e:
             logger.error(f"[BUFFER PROCESS ERROR] {e}", exc_info=True)
         finally:
-        db.session.remove()
+            db.session.remove()
             # Clean up
             with BUFFER_LOCK:
                 PROCESSING_FLAGS[buffer_key] = False
