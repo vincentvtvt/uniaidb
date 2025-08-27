@@ -1,3 +1,8 @@
+
+@lru_cache(maxsize=256)
+def _bot_lookup_cached(variant: str):
+    return Bot.query.filter_by(phone_number=variant).first()
+
 import re
 import logging
 import time
@@ -18,6 +23,10 @@ import os
 from threading import Timer, Thread, Lock
 from collections import defaultdict
 import anthropic
+from concurrent.futures import ThreadPoolExecutor
+from threading import RLock
+from functools import lru_cache
+from sqlalchemy.pool import NullPool
 
 UTC_PLUS_8 = timezone(timedelta(hours=8))
 
@@ -112,7 +121,7 @@ def is_duplicate_message(user_phone, msg_text, window_seconds=5):
     
     return False
 
-logging.basic(
+logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s %(levelname)s:%(name)s:%(message)s'
 )
@@ -126,14 +135,49 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv("DATABASE_URL")
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
-    'pool_size': 20,        # Base connections
-    'max_overflow': 40,     # Extra when needed (total: 60)
-    'pool_timeout': 30,     # Wait time before timeout
-    'pool_recycle': 3600,   # Refresh connections hourly
-    'pool_pre_ping': True   # Test connections before use
-}
+
+
+
+# === Engine Pool Tuning ===
+USE_NULLPOOL = os.getenv("USE_NULLPOOL", "false").lower() in ("1","true","yes")
+if USE_NULLPOOL:
+    app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
+        "poolclass": NullPool,
+        "pool_pre_ping": True,
+    }
+    try:
+        logger.info("[DB] Using NullPool")
+    except Exception:
+        pass
+else:
+    app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
+        "pool_pre_ping": True,
+        "pool_size": int(os.getenv("POOL_SIZE", "10")),
+        "max_overflow": int(os.getenv("MAX_OVERFLOW", "20")),
+        "pool_timeout": int(os.getenv("POOL_TIMEOUT", "10")),
+        "pool_recycle": int(os.getenv("POOL_RECYCLE", "1800")),
+    }
+    try:
+        logger.info("[DB] Using QueuePool with options: %s", app.config["SQLALCHEMY_ENGINE_OPTIONS"])
+    except Exception:
+        pass
 db = SQLAlchemy(app)
+
+
+# === Bounded worker pool ===
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))
+EXECUTOR = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+try:
+    logger.info("[EXECUTOR] ThreadPoolExecutor max_workers=%s", MAX_WORKERS)
+except Exception:
+    pass
+
+# === Debounce buffers ===
+BUFFER_LOCK = RLock()
+TIMER_BUFFER = {}
+PROCESSING_FLAGS = {}
+BUFFER_START_TIME = {}
+
 
 # --- Models (keeping existing) ---
 class Bot(db.Model):
@@ -1384,6 +1428,7 @@ def process_buffered_messages(buffer_key):
         except Exception as e:
             logger.error(f"[BUFFER PROCESS ERROR] {e}", exc_info=True)
         finally:
+        db.session.remove()
             # Clean up
             with BUFFER_LOCK:
                 PROCESSING_FLAGS[buffer_key] = False
@@ -1712,6 +1757,8 @@ def process_webhook_async(data):
         except Exception as e:
             logger.error(f"[WEBHOOK ASYNC ERROR] {e}", exc_info=True)
 
+    finally:
+        db.session.remove()
 # === MAIN WEBHOOK ENDPOINT ===
 @app.route('/webhook', methods=['POST'])
 def webhook():
