@@ -872,17 +872,18 @@ def compose_reply(bot, tool, history, context_input):
         example_json = '''{
   "template": "bf_UGnkL24bhtCQBIJr7hbT",
   "message": [
-    "salam cik atas pakej astro fibre 2025",
-    "cik ada astro tv yang aktif bulanan ke?"
+    "example template 1",
+    "example template 2",
+    "example template 3"
   ]
 }'''
     else:
         prompt = bot.system_prompt or ""
         example_json = '''{
   "message": [
-    "astro fibre boleh sambung 10-20+ device",
-    "astro go boleh stream 4 device",
-    "nak proceed sila isi borang ye cik"
+    "example message 1",
+    "example message 2",
+    "example message 3"
   ]
 }'''
     
@@ -893,7 +894,7 @@ def compose_reply(bot, tool, history, context_input):
         with client.messages.stream(
             model="claude-sonnet-4-20250514",
             max_tokens=8192,
-            temperature=0.3,
+            temperature=0.7,
             system=reply_prompt,
             messages=[{"role": "user", "content": context_input}]
         ) as stream:
