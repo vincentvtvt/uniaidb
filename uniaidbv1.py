@@ -1141,8 +1141,22 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
                     if bot_id and user and session_id:
                         save_message_safe(bot_id, user, session_id, "out", "[PDF sent]")
 
-                session_obj.status = "closed"
-                session_obj.ended_at = get_current_datetime_utc8()
+        # === NOW close the session cleanly (post-send) ===
+        try:
+            if session_obj:
+                with BUFFER_LOCK:
+                    db.session.refresh(session_obj)
+                    if session_obj.status != "closed":
+                        session_obj.status = "closed"
+                        session_obj.ended_at = get_current_datetime_utc8()
+                        if not session_obj.context:
+                            session_obj.context = {}
+                        session_obj.context["close_reason"] = close_reason
+                        session_obj.context.update(info_to_save)
+                        db.session.commit()
+                        logger.info(f"[SESSION CLOSE] Session {session_obj.id} closed (post-send)")
+        except Exception as _e_close_post:
+            logger.exception(f"[SESSION CLOSE][POST-SEND] Failed to close session: {_e_close_post}")
 
 def find_or_create_customer(phone, name=None):
     customer = Customer.query.filter_by(phone_number=phone).first()
