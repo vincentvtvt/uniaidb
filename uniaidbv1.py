@@ -112,7 +112,7 @@ def is_duplicate_message(user_phone, msg_text, window_seconds=5):
     
     return False
 
-logging.basicConfig(
+logging.basic(
     level=logging.DEBUG,
     format='%(asctime)s %(levelname)s:%(name)s:%(message)s'
 )
@@ -126,6 +126,13 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv("DATABASE_URL")
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
+    'pool_size': 20,        # Base connections
+    'max_overflow': 40,     # Extra when needed (total: 60)
+    'pool_timeout': 30,     # Wait time before timeout
+    'pool_recycle': 3600,   # Refresh connections hourly
+    'pool_pre_ping': True   # Test connections before use
+}
 db = SQLAlchemy(app)
 
 # --- Models (keeping existing) ---
