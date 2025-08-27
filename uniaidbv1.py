@@ -1010,9 +1010,6 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
                 if session_obj.status == "closed":
                     logger.info(f"[SESSION CLOSE] Session already closed by another process")
                     return
-                
-                session_obj.status = "closed"
-                session_obj.ended_at = get_current_datetime_utc8()
                 if not session_obj.context:
                     session_obj.context = {}
                 session_obj.context["close_reason"] = close_reason
@@ -1143,6 +1140,9 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
                     send_wassenger_reply(customer_phone, file_id, device_id, msg_type="media", caption=caption, delay_seconds=delay)
                     if bot_id and user and session_id:
                         save_message_safe(bot_id, user, session_id, "out", "[PDF sent]")
+
+                session_obj.status = "closed"
+                session_obj.ended_at = get_current_datetime_utc8()
 
 def find_or_create_customer(phone, name=None):
     customer = Customer.query.filter_by(phone_number=phone).first()
