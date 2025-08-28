@@ -73,6 +73,8 @@ def build_json_prompt(base_prompt, example_json):
     )
     return base_prompt.strip() + json_instruction
 
+
+
 @lru_cache(maxsize=256)
 def _bot_lookup_cached(variant: str):
     return Bot.query.filter_by(phone_number=variant).first()
@@ -108,6 +110,87 @@ def get_current_datetime_utc8():
 def strip_json_markdown_blocks(text):
     """Removes ```json ... ``` or ``` ... ``` wrappers from AI output."""
     return re.sub(r'```[a-z]*\s*([\s\S]*?)```', r'\1', text, flags=re.MULTILINE).strip()
+
+# Add this helper function after the existing helper functions (around line 400-500)
+def generate_follow_up_response(bot, customer_phone, msg_text, session_context, intent_type, days_since_closed):
+    """
+    Generate AI response for follow-up messages to closed sessions
+    Returns: dict with 'message' list or None if no response needed
+    """
+    try:
+        # Build context for AI
+        previous_service = session_context.get('desired_service', 'unknown service')
+        follow_up_count = len(session_context.get('follow_ups', []))
+        
+        # Create a specific prompt based on intent type
+        if intent_type == 'follow_up':
+            context_prompt = f"""
+            Customer is following up on their previous request about: {previous_service}
+            Session was closed {days_since_closed} days ago as WON (lead created).
+            This is follow-up message #{follow_up_count + 1}.
+            Customer's message: {msg_text}
+            
+            Generate a brief, professional acknowledgment that:
+            1. Thanks them for following up
+            2. Assures them their request is being processed
+            3. Mentions team will contact them soon
+            Keep response under 2 sentences.
+            """
+        elif intent_type == 'unclear':
+            context_prompt = f"""
+            Customer sent a message to a closed session from {days_since_closed} days ago.
+            Previous topic was: {previous_service}
+            Customer's message: {msg_text}
+            
+            Generate a polite, brief response that:
+            1. Thanks them for their message
+            2. Mentions team will review and respond if needed
+            Keep response under 2 sentences.
+            """
+        elif intent_type == 'new_request_transition':
+            context_prompt = f"""
+            Customer previously inquired about: {previous_service}
+            That request was processed {days_since_closed} days ago.
+            Now they're asking about something different: {msg_text}
+            
+            Generate a welcoming response that:
+            1. Acknowledges their new interest
+            2. Confirms we're happy to help with this new request
+            Keep response friendly and under 2 sentences.
+            """
+        else:
+            return None
+        
+        # Use the bot's system prompt + context
+        full_prompt = (bot.system_prompt or "") + "\n\nContext:\n" + context_prompt
+        
+        example_json = '''{
+  "message": [
+    "Response message here"
+  ]
+}'''
+        
+        reply_prompt = build_json_prompt(full_prompt, example_json)
+        
+        # Get AI response
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=256,
+            temperature=0.7,
+            system=reply_prompt,
+            messages=[{"role": "user", "content": context_prompt}]
+        )
+        
+        cleaned_response = strip_json_markdown_blocks(response.content[0].text)
+        ai_response = json.loads(cleaned_response)
+        
+        logger.info(f"[AI FOLLOW-UP] Generated response: {ai_response}")
+        return ai_response
+        
+    except Exception as e:
+        logger.error(f"[AI FOLLOW-UP ERROR] Failed to generate response: {e}")
+        return None
+
 
 def build_json_prompt_with_reasoning(base_prompt, example_json):
     reasoning_instruction = (
@@ -1123,10 +1206,12 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
                 info_fields[k] = v
         
         if (
+        if (
             parsed.get("instruction") == "close_session_and_notify_sales" and 
             close_reason.startswith("won") and 
             name and contact
         ):
+            # ACTION: Create lead
             lead = Lead(
                 name=name,
                 contact=contact,
@@ -1139,9 +1224,21 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
             )
             db.session.add(lead)
             db.session.commit()
-            logger.info(f"[LEAD] Lead saved: {lead.id}")
+            logger.info(f"[LEAD] ACTION: Lead saved with ID {lead.id}")
             
-            # Notify sales
+            # === IMPORTANT: Mark lead creation in session context ===
+            if session_obj:
+                if not session_obj.context:
+                    session_obj.context = {}
+                session_obj.context['lead_created'] = True
+                session_obj.context['lead_id'] = lead.id
+                # Store the service type for follow-up context
+                if 'desired_service' in info_fields:
+                    session_obj.context['desired_service'] = info_fields['desired_service']
+                db.session.commit()
+                logger.info(f"[SESSION] Marked lead creation in session {session_obj.id}")
+            
+            # ACTION: Notify sales (only once when lead is created)
             cfg = bot.config
             if isinstance(cfg, str):
                 import json as _json
@@ -1169,7 +1266,7 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
             
             logger.info(f"[NOTIFY SALES]: {final_note}")
             notify_sales_group(bot, final_note)
-        
+            
         # Send customer messages
         if "message" in parsed:
             send_messages_with_anchor(customer_phone, parsed["message"], device_id, bot_id=bot_id, session_id=session_id, gap_seconds=3)
@@ -1599,7 +1696,7 @@ def process_webhook_async(data):
                 logger.info(f"[SESSION] Already closed for {user_phone}")
                 return
             
-            # === ENHANCED: Handle recently closed sessions with BETTER INTENT DETECTION ===
+           # === ENHANCED: Handle recently closed sessions with BETTER INTENT DETECTION ===
             if hasattr(session, 'is_recently_closed') and session.is_recently_closed:
                 current_time_dt = get_current_datetime_utc8()
                 ended_at = make_timezone_aware(session.ended_at)
@@ -1619,7 +1716,7 @@ def process_webhook_async(data):
                     # Customer wants NEW service - open fresh session
                     logger.info(f"[SESSION] Customer wants NEW service, opening fresh session")
                     
-                    # Close the old session properly (mark it as superseded)
+                    # ACTION: Close the old session properly (mark it as superseded)
                     session.status = "closed"
                     session.ended_at = get_current_datetime_utc8() - timedelta(days=15)  # Bypass 14-day check
                     if not session.context:
@@ -1627,7 +1724,7 @@ def process_webhook_async(data):
                     session.context['superseded_by_new_request'] = True
                     db.session.commit()
                     
-                    # Create new session
+                    # ACTION: Create new session
                     new_session = Session(
                         customer_id=customer.id,
                         bot_id=bot.id,
@@ -1640,10 +1737,10 @@ def process_webhook_async(data):
                     
                     session_id = str(new_session.id)
                     
-                    # Save the message and process normally
+                    # ACTION: Save the message
                     save_message_safe(bot.id, user_phone, session_id, "in", msg_text, raw_media_url)
                     
-                    # Add to buffer for AI processing (debounced)
+                    # Process with normal AI flow (let AI generate appropriate response)
                     buffer_key = (bot.id, user_phone, session_id)
                     current_timestamp = time.time()
                     
@@ -1668,73 +1765,147 @@ def process_webhook_async(data):
                     # Customer following up on EXISTING request
                     logger.info(f"[SESSION] Customer following up on existing request")
                     
+                    # Check if this session already had a lead created
+                    lead_already_created = False
+                    if session and session.context:
+                        lead_already_created = (
+                            session.context.get('lead_created', False) or 
+                            session.context.get('close_reason', '').startswith('won')
+                        )
+                    
+                    # Track follow-up in session context
+                    if not session.context:
+                        session.context = {}
+                    
+                    follow_ups = session.context.get('follow_ups', [])
+                    follow_ups.append({
+                        'timestamp': get_current_datetime_utc8().isoformat(),
+                        'message': msg_text[:200]
+                    })
+                    session.context['follow_ups'] = follow_ups[-10]  # Keep last 10
+                    follow_up_count = len(follow_ups)
+                    
                     if ENABLE_FOLLOW_UP_RESPONSES:
-                        # ACKNOWLEDGEMENT — throttle to once per day (MYT)
-                        acknowledgment = (
-                            "Thank you for following up. "
-                            "Our team has been notified and will contact you soon."
-                        )
-                        maybe_send_daily(user_phone, "follow_up_ack_v1", acknowledgment, device_id, delay_seconds=1)
+                        # Check if we should send a response (once per day throttling)
+                        current_date_key = _myt_day_key()
+                        ack_cache_key = f"auto:follow_up_ack_v2:{user_phone}:{current_date_key}"
                         
-                        # Notify sales team
-                        notify_msg = (
-                            f"📌 Follow-up from {user_phone}\n"
-                            f"Message: {msg_text[:100]}...\n"
-                            f"Previous service: {session.context.get('desired_service', 'unknown')}\n"
-                            f"Closed {days_since_closed} days ago"
-                        )
-                        notify_sales_group(bot, notify_msg)
+                        should_respond = False
+                        with BUFFER_LOCK:
+                            if ack_cache_key not in MESSAGE_HASH_CACHE:
+                                MESSAGE_HASH_CACHE[ack_cache_key] = time.time()
+                                should_respond = True
+                                logger.info(f"[FOLLOW-UP] Will generate AI response for {user_phone}")
+                            else:
+                                logger.info(f"[FOLLOW-UP] Response already sent today to {user_phone}")
+                        
+                        # Generate and send AI response if needed
+                        if should_respond:
+                            ai_response = generate_follow_up_response(
+                                bot, user_phone, msg_text, session.context, 
+                                'follow_up', days_since_closed
+                            )
+                            
+                            if ai_response and "message" in ai_response:
+                                # Send the AI-generated response
+                                for idx, msg_part in enumerate(ai_response["message"]):
+                                    delay = 1 + (idx * 3)  # Stagger messages
+                                    send_wassenger_reply(user_phone, msg_part, device_id, delay_seconds=delay)
+                                logger.info(f"[FOLLOW-UP] Sent AI-generated acknowledgment to {user_phone}")
+                        
+                        # ACTION: Check if urgent escalation needed (3+ follow-ups)
+                        urgency_notified = session.context.get('urgency_notified', False)
+                        
+                        if follow_up_count >= 3 and not urgency_notified and not lead_already_created:
+                            # ACTION: Send urgent notification to sales
+                            urgent_msg = (
+                                f"🚨 URGENT FOLLOW-UP: Customer {user_phone} has sent {follow_up_count} follow-ups\n"
+                                f"Latest message: {msg_text[:200]}...\n"
+                                f"Previous service: {session.context.get('desired_service', 'unknown')}\n"
+                                f"Session closed {days_since_closed} days ago\n"
+                                f"Please contact customer immediately!"
+                            )
+                            notify_sales_group(bot, urgent_msg)
+                            session.context['urgency_notified'] = True
+                            logger.info(f"[FOLLOW-UP] ACTION: Sent urgency notification for {user_phone}")
+                        else:
+                            logger.info(f"[FOLLOW-UP] Tracked follow-up #{follow_up_count} from {user_phone}")
+                        
+                        db.session.commit()
                     else:
                         # Silent tracking only
-                        if not session.context:
-                            session.context = {}
-                        follow_ups = session.context.get('silent_follow_ups', [])
-                        follow_ups.append({
-                            'timestamp': get_current_datetime_utc8().isoformat(),
-                            'message': msg_text[:100]
-                        })
-                        session.context['silent_follow_ups'] = follow_ups[-5:]  # Keep last 5
+                        session.context['silent_follow_ups'] = follow_ups[-5:]
                         db.session.commit()
+                        logger.info(f"[FOLLOW-UP] Silently tracked message from {user_phone}")
                     
                     return
                 
                 else:  # intent == 'unclear'
-                    # Can't determine intent - use safe approach
-                    logger.info(f"[SESSION] Unclear intent - notifying sales team")
+                    # Can't determine intent
+                    logger.info(f"[SESSION] Unclear intent from {user_phone}")
                     
-                    # Track it
+                    # Track in session
                     if not session.context:
                         session.context = {}
-                    session.context['last_unclear_attempt'] = {
+                    
+                    unclear_attempts = session.context.get('unclear_attempts', [])
+                    unclear_attempts.append({
                         'timestamp': get_current_datetime_utc8().isoformat(),
-                        'message': msg_text[:100]
-                    }
-                    db.session.commit()
+                        'message': msg_text[:200]
+                    })
+                    session.context['unclear_attempts'] = unclear_attempts[-5:]
                     
-                    # Notify sales ONCE per day (hash-based throttle you already use)
-                    notification_key = f"unclear:{user_phone}:{current_time_dt.date().isoformat()}"
-                    notification_hash = hashlib.md5(notification_key.encode()).hexdigest()
-                    
-                    with BUFFER_LOCK:
-                        if f"notif_{notification_hash}" not in MESSAGE_HASH_CACHE:
-                            MESSAGE_HASH_CACHE[f"notif_{notification_hash}"] = time.time()
-                            # Notify sales about unclear intent
-                            notify_msg = (
-                                f"⚠️ Customer {user_phone} sent message to closed session.\n"
-                                f"Intent unclear - please review:\n"
-                                f"Message: {msg_text[:100]}...\n"
-                                f"Closed {days_since_closed} days ago"
-                            )
-                            notify_sales_group(bot, notify_msg)
+                    # Check if lead already created
+                    lead_already_created = (
+                        session.context.get('lead_created', False) or 
+                        session.context.get('close_reason', '').startswith('won')
+                    )
                     
                     if ENABLE_FOLLOW_UP_RESPONSES:
-                        # GENERIC RESPONSE — throttle to once per day (MYT)
-                        response = (
-                            "Thank you for your message. "
-                            "Our team will review and contact you if needed."
-                        )
-                        maybe_send_daily(user_phone, "closed_generic_v1", response, device_id, delay_seconds=1)
+                        # Check if we should respond (once per day)
+                        current_date_key = _myt_day_key()
+                        unclear_response_key = f"auto:unclear_response:{user_phone}:{current_date_key}"
+                        
+                        should_respond = False
+                        with BUFFER_LOCK:
+                            if unclear_response_key not in MESSAGE_HASH_CACHE:
+                                MESSAGE_HASH_CACHE[unclear_response_key] = time.time()
+                                should_respond = True
+                                logger.info(f"[UNCLEAR] Will generate AI response for {user_phone}")
+                            else:
+                                logger.info(f"[UNCLEAR] Response already sent today to {user_phone}")
+                        
+                        # Generate and send AI response if needed
+                        if should_respond:
+                            ai_response = generate_follow_up_response(
+                                bot, user_phone, msg_text, session.context,
+                                'unclear', days_since_closed
+                            )
+                            
+                            if ai_response and "message" in ai_response:
+                                # Send the AI-generated response
+                                for idx, msg_part in enumerate(ai_response["message"]):
+                                    delay = 1 + (idx * 3)
+                                    send_wassenger_reply(user_phone, msg_part, device_id, delay_seconds=delay)
+                                logger.info(f"[UNCLEAR] Sent AI-generated response to {user_phone}")
+                        
+                        # ACTION: Check if persistent unclear messages (3+)
+                        unclear_count = len(unclear_attempts)
+                        unclear_notified = session.context.get('unclear_notified', False)
+                        
+                        if unclear_count >= 3 and not unclear_notified and not lead_already_created:
+                            # ACTION: Notify sales for manual review
+                            notify_msg = (
+                                f"⚠️ Customer {user_phone} has sent {unclear_count} messages to closed session\n"
+                                f"Intent unclear - manual review needed\n"
+                                f"Latest: {msg_text[:200]}...\n"
+                                f"Session closed {days_since_closed} days ago"
+                            )
+                            notify_sales_group(bot, notify_msg)
+                            session.context['unclear_notified'] = True
+                            logger.info(f"[UNCLEAR] ACTION: Notified sales about persistent unclear messages")
                     
+                    db.session.commit()
                     return
 
             
