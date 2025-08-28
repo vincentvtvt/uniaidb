@@ -58,7 +58,6 @@ def maybe_send_daily(user_phone: str, template_key: str, text: str, device_id: s
     send_wassenger_reply(user_phone, text, device_id, delay_seconds=delay_seconds)
     return True
 
-
 # === ERROR TRACKING ===
 EXTRACTION_ERRORS = []  # Track extraction failures
 
@@ -72,8 +71,6 @@ def build_json_prompt(base_prompt, example_json):
         f"{example_json.strip()}"
     )
     return base_prompt.strip() + json_instruction
-
-
 
 @lru_cache(maxsize=256)
 def _bot_lookup_cached(variant: str):
