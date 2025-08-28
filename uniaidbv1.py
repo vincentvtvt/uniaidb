@@ -1778,7 +1778,7 @@ def process_webhook_async(data):
                         'timestamp': get_current_datetime_utc8().isoformat(),
                         'message': msg_text[:200]
                     })
-                    session.context['follow_ups'] = follow_ups[-10]  # Keep last 10
+                    session.context['follow_ups'] = follow_ups[-10:]  # Keep last 10
                     follow_up_count = len(follow_ups)
                     
                     if ENABLE_FOLLOW_UP_RESPONSES:
