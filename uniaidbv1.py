@@ -725,7 +725,7 @@ def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text
         return None
 
     payload = {k: v for k, v in payload.items() if v is not None}
-    logger.debug(f"[WASSENGER PAYLOAD]: {payload}")
+    #logger.debug(f"[WASSENGER PAYLOAD]: {payload}")
 
     try:
         resp = requests.post(url, json=payload, headers=headers, timeout=60)
