@@ -743,6 +743,16 @@ def send_messages_with_anchor(phone, lines, device_id, bot_id=None, session_id=N
         return
     
     lines = [l for l in (lines if isinstance(lines, list) else [str(lines)]) if l]
+
+    # === OUTBOUND IDEMPOTENCY (skip if same batch was sent very recently) ===
+    out_key = f"out:{bot_id}:{session_id}:{hashlib.md5('|'.join(lines).encode()).hexdigest()}"
+    with BUFFER_LOCK:
+        t = MESSAGE_HASH_CACHE.get(out_key)
+        if t and time.time() - t < 30:
+            logger.info("[OUTDUPE] Skipping duplicate outbound send")
+            return
+        MESSAGE_HASH_CACHE[out_key] = time.time()
+
     
     # Check session status before sending (can be bypassed)
     if session_id and not BYPASS_SESSION_CHECKS:
@@ -1573,24 +1583,12 @@ def process_webhook_async(data):
                 send_wassenger_reply(user_phone, "Session closed by agent.", device_id, delay_seconds=1)
                 return
             
-            # === Check for duplicates ===
-            msg_unique_key = f"{user_phone}:{msg_text}:{msg.get('id', '')}:{msg.get('timestamp', '')}"
-            msg_hash = hashlib.md5(msg_unique_key.encode()).hexdigest()
-            
-            current_time = time.time()
-            with BUFFER_LOCK:
-                if msg_hash in MESSAGE_HASH_CACHE:
-                    last_processed = MESSAGE_HASH_CACHE[msg_hash]
-                    if current_time - last_processed < 10:
-                        logger.info(f"[WEBHOOK] Duplicate message ignored")
-                        return
-                MESSAGE_HASH_CACHE[msg_hash] = current_time
-                
-                # Clean old entries
-                keys_to_remove = [k for k, v in MESSAGE_HASH_CACHE.items() 
-                                 if current_time - v > 60]
-                for k in keys_to_remove:
-                    MESSAGE_HASH_CACHE.pop(k, None)
+            # === CONTENT-BASED DEDUPE (providers may retry with new id/timestamp) ===
+            norm_text = re.sub(r'\s+', ' ', (msg_text or '').strip().lower())
+            if is_duplicate_message(user_phone, norm_text, window_seconds=45):
+                logger.info("[WEBHOOK] Duplicate message ignored (content dedupe)")
+                return
+
             
             # Get customer and session
             customer = find_or_create_customer(user_phone)
@@ -1754,12 +1752,18 @@ def process_webhook_async(data):
                 if buffer_key not in BUFFER_START_TIME:
                     BUFFER_START_TIME[buffer_key] = current_timestamp
                 
-                MESSAGE_BUFFER[buffer_key].append({
-                    "msg_text": msg_text,
-                    "raw_media_url": raw_media_url,
-                    "created_at": get_current_datetime_utc8().isoformat(),
-                    "device_id": device_id,
-                })
+                # Avoid pushing the same text twice into the buffer
+                last = MESSAGE_BUFFER.get(buffer_key, [])[-1] if MESSAGE_BUFFER.get(buffer_key) else None
+                if last and re.sub(r'\s+', ' ', (last.get("msg_text", "").strip().lower())) == norm_text:
+                    logger.info("[BUFFER] Skipping duplicate append for same text")
+                else:
+                    MESSAGE_BUFFER[buffer_key].append({
+                        "msg_text": msg_text,
+                        "raw_media_url": raw_media_url,
+                        "created_at": get_current_datetime_utc8().isoformat(),
+                        "device_id": device_id,
+                    })
+
                 
                 buffer_age = current_timestamp - BUFFER_START_TIME[buffer_key]
                 buffer_size = len(MESSAGE_BUFFER[buffer_key])
