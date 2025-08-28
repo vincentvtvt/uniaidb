@@ -1792,10 +1792,9 @@ def webhook():
     if msg.get("flow") == "outbound":
         return jsonify({"status": "ignored"}), 200
     
-    # Process in background
-    thread = Thread(target=process_webhook_async, args=(data,))
-    thread.daemon = True
-    thread.start()
+    # Process in background (bounded by EXECUTOR)
+    EXECUTOR.submit(process_webhook_async, data)
+
     
     # Return immediately
     return jsonify({"status": "queued"}), 200
