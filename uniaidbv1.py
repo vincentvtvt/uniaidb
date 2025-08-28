@@ -1,5 +1,3 @@
-
-
 import re
 import logging
 import time
@@ -39,6 +37,27 @@ PROCESSING_FLAGS = {}  # Prevent concurrent processing
 BUFFER_START_TIME = {}  # Track buffer age
 MESSAGE_HASH_CACHE = {}  # Deduplication
 BUFFER_LOCK = Lock()  # Thread safety
+
+def _myt_day_key():
+    # Malaysia Time (UTC+8)
+    return (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d")
+
+def maybe_send_daily(user_phone: str, template_key: str, text: str, device_id: str, delay_seconds: float = 1.0) -> bool:
+    """
+    Send 'text' to user_phone only once per MYT day, keyed by template_key.
+    Uses MESSAGE_HASH_CACHE and BUFFER_LOCK.
+    Returns True if sent, False if throttled.
+    """
+    day_key = _myt_day_key()
+    cache_key = f"auto:{template_key}:{user_phone}:{day_key}"
+    with BUFFER_LOCK:
+        if cache_key in MESSAGE_HASH_CACHE:
+            return False
+        MESSAGE_HASH_CACHE[cache_key] = time.time()
+    # Safe to send
+    send_wassenger_reply(user_phone, text, device_id, delay_seconds=delay_seconds)
+    return True
+
 
 # === ERROR TRACKING ===
 EXTRACTION_ERRORS = []  # Track extraction failures
@@ -1593,7 +1612,7 @@ def process_webhook_async(data):
                     days_since_closed = 0
                 
                 logger.info(f"[SESSION] Recently closed session ({days_since_closed} days ago)")
-                
+            
                 # === ENHANCED: Detect customer intent ===
                 intent = detect_customer_intent(msg_text, session.context or {}, bot)
                 logger.info(f"[INTENT] Customer intent detected: {intent}")
@@ -1626,7 +1645,7 @@ def process_webhook_async(data):
                     # Save the message and process normally
                     save_message_safe(bot.id, user_phone, session_id, "in", msg_text, raw_media_url)
                     
-                    # Add to buffer for AI processing
+                    # Add to buffer for AI processing (debounced)
                     buffer_key = (bot.id, user_phone, session_id)
                     current_timestamp = time.time()
                     
@@ -1652,12 +1671,12 @@ def process_webhook_async(data):
                     logger.info(f"[SESSION] Customer following up on existing request")
                     
                     if ENABLE_FOLLOW_UP_RESPONSES:
-                        # Send acknowledgment if enabled
+                        # ACKNOWLEDGEMENT — throttle to once per day (MYT)
                         acknowledgment = (
                             "Thank you for following up. "
                             "Our team has been notified and will contact you soon."
                         )
-                        send_wassenger_reply(user_phone, acknowledgment, device_id, delay_seconds=1)
+                        maybe_send_daily(user_phone, "follow_up_ack_v1", acknowledgment, device_id, delay_seconds=1)
                         
                         # Notify sales team
                         notify_msg = (
@@ -1671,7 +1690,6 @@ def process_webhook_async(data):
                         # Silent tracking only
                         if not session.context:
                             session.context = {}
-                        
                         follow_ups = session.context.get('silent_follow_ups', [])
                         follow_ups.append({
                             'timestamp': get_current_datetime_utc8().isoformat(),
@@ -1695,7 +1713,7 @@ def process_webhook_async(data):
                     }
                     db.session.commit()
                     
-                    # Notify sales ONCE per day
+                    # Notify sales ONCE per day (hash-based throttle you already use)
                     notification_key = f"unclear:{user_phone}:{current_time_dt.date().isoformat()}"
                     notification_hash = hashlib.md5(notification_key.encode()).hexdigest()
                     
@@ -1712,14 +1730,15 @@ def process_webhook_async(data):
                             notify_sales_group(bot, notify_msg)
                     
                     if ENABLE_FOLLOW_UP_RESPONSES:
-                        # Send a generic response
+                        # GENERIC RESPONSE — throttle to once per day (MYT)
                         response = (
                             "Thank you for your message. "
                             "Our team will review and contact you if needed."
                         )
-                        send_wassenger_reply(user_phone, response, device_id, delay_seconds=1)
+                        maybe_send_daily(user_phone, "closed_generic_v1", response, device_id, delay_seconds=1)
                     
                     return
+
             
             # === Normal flow for open sessions ===
             session_id = str(session.id)
