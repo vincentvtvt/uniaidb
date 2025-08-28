@@ -1206,7 +1206,6 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
                 info_fields[k] = v
         
         if (
-        if (
             parsed.get("instruction") == "close_session_and_notify_sales" and 
             close_reason.startswith("won") and 
             name and contact
