@@ -1783,60 +1783,27 @@ def process_webhook_async(data):
                     session.context['follow_ups'] = follow_ups[-10:]  # Keep last 10
                     follow_up_count = len(follow_ups)
                     
-                    if ENABLE_FOLLOW_UP_RESPONSES:
-                        # Check if we should send a response (once per day throttling)
-                        current_date_key = _myt_day_key()
-                        ack_cache_key = f"auto:follow_up_ack_v2:{user_phone}:{current_date_key}"
-                        
-                        should_respond = False
-                        with BUFFER_LOCK:
-                            if ack_cache_key not in MESSAGE_HASH_CACHE:
-                                MESSAGE_HASH_CACHE[ack_cache_key] = time.time()
-                                should_respond = True
-                                logger.info(f"[FOLLOW-UP] Will generate AI response for {user_phone}")
-                            else:
-                                logger.info(f"[FOLLOW-UP] Response already sent today to {user_phone}")
-                        
-                        # Generate and send AI response if needed
-                        if should_respond:
-                            ai_response = generate_follow_up_response(
-                                bot, user_phone, msg_text, session.context, 
-                                'follow_up', days_since_closed
-                            )
-                            
-                            if ai_response and "message" in ai_response:
-                                # Send the AI-generated response
-                                for idx, msg_part in enumerate(ai_response["message"]):
-                                    delay = 1 + (idx * 3)  # Stagger messages
-                                    send_wassenger_reply(user_phone, msg_part, device_id, delay_seconds=delay)
-                                logger.info(f"[FOLLOW-UP] Sent AI-generated acknowledgment to {user_phone}")
-                        
-                        # ACTION: Check if urgent escalation needed (3+ follow-ups)
-                        urgency_notified = session.context.get('urgency_notified', False)
-                        
-                        if follow_up_count >= 3 and not urgency_notified and not lead_already_created:
-                            # ACTION: Send urgent notification to sales
-                            urgent_msg = (
-                                f"🚨 URGENT FOLLOW-UP: Customer {user_phone} has sent {follow_up_count} follow-ups\n"
-                                f"Latest message: {msg_text[:200]}...\n"
-                                f"Previous service: {session.context.get('desired_service', 'unknown')}\n"
-                                f"Session closed {days_since_closed} days ago\n"
-                                f"Please contact customer immediately!"
-                            )
-                            notify_sales_group(bot, urgent_msg)
-                            session.context['urgency_notified'] = True
-                            logger.info(f"[FOLLOW-UP] ACTION: Sent urgency notification for {user_phone}")
-                        else:
-                            logger.info(f"[FOLLOW-UP] Tracked follow-up #{follow_up_count} from {user_phone}")
-                        
-                        db.session.commit()
-                    else:
-                        # Silent tracking only
-                        session.context['silent_follow_ups'] = follow_ups[-5:]
-                        db.session.commit()
-                        logger.info(f"[FOLLOW-UP] Silently tracked message from {user_phone}")
+                    # Just track without responding
+                    logger.info(f"[FOLLOW-UP] Tracked follow-up #{follow_up_count} from {user_phone} (no response sent)")
                     
-                    return
+                    # Check if urgent escalation needed (3+ follow-ups)
+                    urgency_notified = session.context.get('urgency_notified', False)
+                    
+                    if follow_up_count >= 3 and not urgency_notified and not lead_already_created:
+                        # Send urgent notification to sales
+                        urgent_msg = (
+                            f"🚨 URGENT FOLLOW-UP: Customer {user_phone} has sent {follow_up_count} follow-ups\n"
+                            f"Latest message: {msg_text[:200]}...\n"
+                            f"Previous service: {session.context.get('desired_service', 'unknown')}\n"
+                            f"Session closed {days_since_closed} days ago\n"
+                            f"Please contact customer immediately!"
+                        )
+                        notify_sales_group(bot, urgent_msg)
+                        session.context['urgency_notified'] = True
+                        logger.info(f"[FOLLOW-UP] ACTION: Sent urgency notification for {user_phone}")
+                    
+                    db.session.commit()
+                    return  # Exit without sending any message
                 
                 else:  # intent == 'unclear'
                     # Can't determine intent
