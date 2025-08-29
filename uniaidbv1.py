@@ -1171,12 +1171,21 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
                 if session_obj.status == "closed":
                     logger.info(f"[SESSION CLOSE] Session already closed by another process")
                     return
+                
+                # ACTUALLY CLOSE THE SESSION - THESE ARE THE CRITICAL LINES
+                session_obj.status = "closed"  # ADD THIS LINE
+                session_obj.ended_at = get_current_datetime_utc8()  # ADD THIS LINE
+                
                 if not session_obj.context:
                     session_obj.context = {}
                 session_obj.context["close_reason"] = close_reason
                 session_obj.context.update(info_to_save)
+                
                 db.session.commit()
-                logger.info(f"[SESSION CLOSE] Session {session_obj.id} closed")
+                
+                # Verify it actually closed
+                db.session.refresh(session_obj)
+                logger.info(f"[SESSION CLOSE] Session {session_obj.id} closed - status is now: {session_obj.status}")
         
         # Handle lead creation and notification
         notification = parsed.get("notification") or info_to_save.get("notification") or ""
@@ -1207,6 +1216,14 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
             close_reason.startswith("won") and 
             name and contact
         ):
+            # Check if lead already exists for this session
+            existing_lead = Lead.query.filter_by(session_id=session_obj.id).first()
+            if existing_lead:
+                logger.info(f"[LEAD] Lead already exists for session {session_obj.id}, skipping")
+                # Still send customer messages
+                if "message" in parsed:
+                    send_messages_with_anchor(customer_phone, parsed["message"], device_id, bot_id=bot_id, session_id=session_id, gap_seconds=3)
+                return
             # ACTION: Create lead
             lead = Lead(
                 name=name,
@@ -1315,22 +1332,7 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
                     if bot_id and user and session_id:
                         save_message_safe(bot_id, user, session_id, "out", "[PDF sent]")
 
-        # === NOW close the session cleanly (post-send) ===
-        try:
-            if session_obj:
-                with BUFFER_LOCK:
-                    db.session.refresh(session_obj)
-                    if session_obj.status != "closed":
-                        session_obj.status = "closed"
-                        session_obj.ended_at = get_current_datetime_utc8()
-                        if not session_obj.context:
-                            session_obj.context = {}
-                        session_obj.context["close_reason"] = close_reason
-                        session_obj.context.update(info_to_save)
-                        db.session.commit()
-                        logger.info(f"[SESSION CLOSE] Session {session_obj.id} closed (post-send)")
-        except Exception as _e_close_post:
-            logger.exception(f"[SESSION CLOSE][POST-SEND] Failed to close session: {_e_close_post}")
+        
 
 def find_or_create_customer(phone, name=None):
     customer = Customer.query.filter_by(phone_number=phone).first()
