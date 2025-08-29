@@ -83,7 +83,8 @@ def get_report(start_date, end_date, business_id=None):
     {exclude_test}
     """
     
-    params = exclude_params + [WON_REASONS, LOST_REASONS, WON_REASONS, start_date, end_date]
+    # FIXED: Correct parameter order - WON/LOST arrays first, then dates, then exclude params
+    params = [WON_REASONS, LOST_REASONS, WON_REASONS, start_date, end_date] + exclude_params
     
     if business_id:
         query += " AND bus.id = %s"
@@ -109,7 +110,8 @@ def get_report(start_date, end_date, business_id=None):
     {exclude_test}
     """
     
-    lose_params = exclude_params + [LOST_REASONS, start_date, end_date]
+    # FIXED: Correct parameter order - LOST array first, then dates, then exclude params
+    lose_params = [LOST_REASONS, start_date, end_date] + exclude_params
     
     if business_id:
         lose_query += " AND bus.id = %s"
