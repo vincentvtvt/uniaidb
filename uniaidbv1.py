@@ -1694,7 +1694,7 @@ def process_webhook_async(data):
                 logger.info(f"[SESSION] Already closed for {user_phone}")
                 return
             
-           # === ENHANCED: Handle recently closed sessions with BETTER INTENT DETECTION ===
+            # === ENHANCED: Handle recently closed sessions with BETTER INTENT DETECTION ===
             if hasattr(session, 'is_recently_closed') and session.is_recently_closed:
                 current_time_dt = get_current_datetime_utc8()
                 ended_at = make_timezone_aware(session.ended_at)
@@ -1759,120 +1759,40 @@ def process_webhook_async(data):
                     
                     return
                 
-                elif intent == 'follow_up':
-                    # Customer following up on EXISTING request
-                    logger.info(f"[SESSION] Customer following up on existing request")
+                else:  # intent == 'follow_up' or 'unclear'
+                    # NO RESPONSE AT ALL for follow-ups or unclear messages
+                    logger.info(f"[SESSION] {intent} intent - NO RESPONSE SENT")
                     
-                    # Check if this session already had a lead created
-                    lead_already_created = False
-                    if session and session.context:
-                        lead_already_created = (
-                            session.context.get('lead_created', False) or 
-                            session.context.get('close_reason', '').startswith('won')
-                        )
-                    
-                    # Track follow-up in session context
+                    # Just track in session context for monitoring
                     if not session.context:
                         session.context = {}
                     
-                    follow_ups = session.context.get('follow_ups', [])
-                    follow_ups.append({
+                    tracking_key = 'follow_ups' if intent == 'follow_up' else 'unclear_attempts'
+                    attempts = session.context.get(tracking_key, [])
+                    attempts.append({
                         'timestamp': get_current_datetime_utc8().isoformat(),
                         'message': msg_text[:200]
                     })
-                    session.context['follow_ups'] = follow_ups[-10:]  # Keep last 10
-                    follow_up_count = len(follow_ups)
+                    session.context[tracking_key] = attempts[-10:]  # Keep last 10
                     
-                    # Just track without responding
-                    logger.info(f"[FOLLOW-UP] Tracked follow-up #{follow_up_count} from {user_phone} (no response sent)")
-                    
-                    # Check if urgent escalation needed (3+ follow-ups)
-                    urgency_notified = session.context.get('urgency_notified', False)
-                    
-                    if follow_up_count >= 3 and not urgency_notified and not lead_already_created:
-                        # Send urgent notification to sales
-                        urgent_msg = (
-                            f"🚨 URGENT FOLLOW-UP: Customer {user_phone} has sent {follow_up_count} follow-ups\n"
-                            f"Latest message: {msg_text[:200]}...\n"
-                            f"Previous service: {session.context.get('desired_service', 'unknown')}\n"
-                            f"Session closed {days_since_closed} days ago\n"
-                            f"Please contact customer immediately!"
-                        )
-                        notify_sales_group(bot, urgent_msg)
-                        session.context['urgency_notified'] = True
-                        logger.info(f"[FOLLOW-UP] ACTION: Sent urgency notification for {user_phone}")
-                    
-                    db.session.commit()
-                    return  # Exit without sending any message
-                
-                else:  # intent == 'unclear'
-                    # Can't determine intent
-                    logger.info(f"[SESSION] Unclear intent from {user_phone}")
-                    
-                    # Track in session
-                    if not session.context:
-                        session.context = {}
-                    
-                    unclear_attempts = session.context.get('unclear_attempts', [])
-                    unclear_attempts.append({
-                        'timestamp': get_current_datetime_utc8().isoformat(),
-                        'message': msg_text[:200]
-                    })
-                    session.context['unclear_attempts'] = unclear_attempts[-5:]
-                    
-                    # Check if lead already created
-                    lead_already_created = (
-                        session.context.get('lead_created', False) or 
-                        session.context.get('close_reason', '').startswith('won')
-                    )
-                    
-                    if ENABLE_FOLLOW_UP_RESPONSES:
-                        # Check if we should respond (once per day)
-                        current_date_key = _myt_day_key()
-                        unclear_response_key = f"auto:unclear_response:{user_phone}:{current_date_key}"
-                        
-                        should_respond = False
-                        with BUFFER_LOCK:
-                            if unclear_response_key not in MESSAGE_HASH_CACHE:
-                                MESSAGE_HASH_CACHE[unclear_response_key] = time.time()
-                                should_respond = True
-                                logger.info(f"[UNCLEAR] Will generate AI response for {user_phone}")
-                            else:
-                                logger.info(f"[UNCLEAR] Response already sent today to {user_phone}")
-                        
-                        # Generate and send AI response if needed
-                        if should_respond:
-                            ai_response = generate_follow_up_response(
-                                bot, user_phone, msg_text, session.context,
-                                'unclear', days_since_closed
-                            )
-                            
-                            if ai_response and "message" in ai_response:
-                                # Send the AI-generated response
-                                for idx, msg_part in enumerate(ai_response["message"]):
-                                    delay = 1 + (idx * 3)
-                                    send_wassenger_reply(user_phone, msg_part, device_id, delay_seconds=delay)
-                                logger.info(f"[UNCLEAR] Sent AI-generated response to {user_phone}")
-                        
-                        # ACTION: Check if persistent unclear messages (3+)
-                        unclear_count = len(unclear_attempts)
-                        unclear_notified = session.context.get('unclear_notified', False)
-                        
-                        if unclear_count >= 3 and not unclear_notified and not lead_already_created:
-                            # ACTION: Notify sales for manual review
+                    # Check if urgent notification needed (3+ attempts)
+                    if len(attempts) >= 3:
+                        notified_key = 'urgency_notified' if intent == 'follow_up' else 'unclear_notified'
+                        if not session.context.get(notified_key, False):
+                            # Notify sales team
                             notify_msg = (
-                                f"⚠️ Customer {user_phone} has sent {unclear_count} messages to closed session\n"
-                                f"Intent unclear - manual review needed\n"
+                                f"⚠️ Customer {user_phone} has sent {len(attempts)} messages to closed session\n"
+                                f"Intent: {intent}\n"
                                 f"Latest: {msg_text[:200]}...\n"
-                                f"Session closed {days_since_closed} days ago"
+                                f"Session closed {days_since_closed} days ago\n"
+                                f"Manual review needed!"
                             )
                             notify_sales_group(bot, notify_msg)
-                            session.context['unclear_notified'] = True
-                            logger.info(f"[UNCLEAR] ACTION: Notified sales about persistent unclear messages")
+                            session.context[notified_key] = True
+                            logger.info(f"[{intent.upper()}] Notified sales team")
                     
                     db.session.commit()
-                    return
-
+                    return  # Exit without any customer response
             
             # === Normal flow for open sessions ===
             session_id = str(session.id)
