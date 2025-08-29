@@ -1217,7 +1217,7 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
             name and contact
         ):
             # Check if lead already exists for this session
-            existing_lead = Lead.query.filter_by(session_id=session_obj.id).first()
+            existing_lead = Lead.query.filter_by(session_id=str(session_obj.id)).first()
             if existing_lead:
                 logger.info(f"[LEAD] Lead already exists for session {session_obj.id}, skipping")
                 # Still send customer messages
@@ -1232,7 +1232,7 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
                 info=info_fields,
                 bot_id=bot_id,
                 business_id=getattr(bot, 'business_id', None),
-                session_id=session_obj.id if session_obj else None,
+                session_id=str(session_obj.id) if session_obj else None,
                 status="open"
             )
             db.session.add(lead)
