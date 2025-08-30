@@ -1120,6 +1120,10 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
     # Handle session closing instructions
     if parsed.get("instruction") in ("close_session_and_notify_sales", "close_session_drop"):
         logger.info("[AI REPLY] Session close detected")
+
+        # Send customer messages
+        if "message" in parsed:
+            send_messages_with_anchor(customer_phone, parsed["message"], device_id, bot_id=bot_id, session_id=session_id, gap_seconds=3)
         
         # Re-check session status before processing close
         if not is_session_still_open(session_id):
@@ -1280,9 +1284,7 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
             logger.info(f"[NOTIFY SALES]: {final_note}")
             notify_sales_group(bot, final_note)
             
-        # Send customer messages
-        if "message" in parsed:
-            send_messages_with_anchor(customer_phone, parsed["message"], device_id, bot_id=bot_id, session_id=session_id, gap_seconds=3)
+
         
         return
     
