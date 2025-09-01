@@ -1057,8 +1057,8 @@ def compose_reply(bot, tool, history, context_input):
             max_tokens=8192,
             temperature=0.7,
             system=reply_prompt,
-            messages=[{"role": "user", "content": context_input}]
-
+            messages=[{"role": "user", "content": context_input}],
+            response_format={"type": "json_object"}
         ) as stream:
             reply_accum = ""
             print("[STREAM] Streaming model reply:")
