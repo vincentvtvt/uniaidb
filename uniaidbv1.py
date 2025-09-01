@@ -1058,7 +1058,6 @@ def compose_reply(bot, tool, history, context_input):
             temperature=0.7,
             system=reply_prompt,
             messages=[{"role": "user", "content": context_input}],
-            response_format={"type": "json_object"}
         ) as stream:
             reply_accum = ""
             print("[STREAM] Streaming model reply:")
