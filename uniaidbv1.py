@@ -72,6 +72,25 @@ def build_json_prompt(base_prompt, example_json):
     )
     return base_prompt.strip() + json_instruction
 
+def build_json_prompt_enhanced(base_prompt, example_json):
+    """
+    Enhanced JSON prompt with stronger validation requirements
+    """
+    json_instruction = (
+        "\n\nCRITICAL INSTRUCTION: You MUST respond with ONLY a valid JSON object.\n"
+        "Before outputting, ensure:\n"
+        "1. ALL quotes are properly escaped (use \\\" for quotes inside strings)\n"
+        "2. NO trailing commas exist anywhere\n"
+        "3. ALL keys and string values use double quotes, not single quotes\n"
+        "4. NO text appears before or after the JSON object\n"
+        "5. NO markdown code blocks (```json) are used\n\n"
+        "Output ONLY the JSON object following this exact structure:\n"
+        f"{example_json.strip()}\n\n"
+        "If you cannot produce valid JSON, output exactly:\n"
+        '{"message": ["I need assistance processing this request. Please wait."]}'
+    )
+    return base_prompt.strip() + json_instruction
+
 @lru_cache(maxsize=256)
 def _bot_lookup_cached(variant: str):
     return Bot.query.filter_by(phone_number=variant).first()
@@ -188,7 +207,6 @@ def generate_follow_up_response(bot, customer_phone, msg_text, session_context, 
         logger.error(f"[AI FOLLOW-UP ERROR] Failed to generate response: {e}")
         return None
 
-
 def build_json_prompt_with_reasoning(base_prompt, example_json):
     reasoning_instruction = (
         "Before answering, briefly explain your reasoning for the tool selection in 1-2 sentences. "
@@ -236,8 +254,6 @@ app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv("DATABASE_URL")
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-
-
 # === Engine Pool Tuning ===
 USE_NULLPOOL = os.getenv("USE_NULLPOOL", "false").lower() in ("1","true","yes")
 if USE_NULLPOOL:
@@ -263,7 +279,6 @@ else:
         pass
 db = SQLAlchemy(app)
 
-
 # === Bounded worker pool ===
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))
 EXECUTOR = ThreadPoolExecutor(max_workers=MAX_WORKERS)
@@ -277,7 +292,6 @@ BUFFER_LOCK = RLock()
 TIMER_BUFFER = {}
 PROCESSING_FLAGS = {}
 BUFFER_START_TIME = {}
-
 
 # --- Models (keeping existing) ---
 class Bot(db.Model):
@@ -805,7 +819,6 @@ def send_wassenger_reply(phone, text, device_id, delay_seconds=0, msg_type="text
         return None
 
     payload = {k: v for k, v in payload.items() if v is not None}
-    #logger.debug(f"[WASSENGER PAYLOAD]: {payload}")
 
     try:
         resp = requests.post(url, json=payload, headers=headers, timeout=60)
@@ -1027,7 +1040,114 @@ def decide_tool_with_manager_prompt(bot, history):
         logger.error(f"[AI DECISION] Unexpected error: {e}")
         return "Default"
 
-def compose_reply(bot, tool, history, context_input):
+# === NEW ENHANCED COMPOSE REPLY FUNCTIONS ===
+def validate_json_structure(response):
+    """
+    Validate that the JSON has the expected structure
+    """
+    if response is None or not isinstance(response, dict):
+        return False
+    
+    # Check for required fields based on instruction type
+    if "instruction" in response:
+        if response["instruction"] == "close_session_and_notify_sales":
+            required = ["instruction", "notification", "message", "name"]
+        elif response["instruction"] == "close_session_drop":
+            required = ["instruction", "close_reason", "lose_reason", "message"]
+        else:
+            required = ["message"]
+    else:
+        required = ["message"]
+    
+    for field in required:
+        if field not in response:
+            logger.warning(f"[VALIDATE] Missing required field: {field}")
+            return False
+    
+    # Validate message is a list of strings
+    if "message" in response:
+        if not isinstance(response["message"], list):
+            logger.warning(f"[VALIDATE] 'message' is not a list")
+            return False
+        if not all(isinstance(msg, str) for msg in response["message"]):
+            logger.warning(f"[VALIDATE] 'message' contains non-string elements")
+            return False
+    
+    return True
+
+def repair_json_response(text):
+    """
+    Attempt to repair common JSON issues
+    """
+    if not text:
+        return None
+        
+    try:
+        # Remove any text before first { or [
+        json_match = re.search(r'[\{\[].*[\}\]]', text, re.DOTALL)
+        if not json_match:
+            return None
+        
+        json_str = json_match.group(0)
+        
+        # Fix common issues
+        json_str = re.sub(r'(?<!\\)\\n', '\\\\n', json_str)  # Properly escape newlines
+        json_str = re.sub(r',\s*}', '}', json_str)  # Remove trailing commas
+        json_str = re.sub(r',\s*]', ']', json_str)  # Remove trailing commas in arrays
+        
+        # Try parsing
+        result = json.loads(json_str)
+        logger.info("[JSON REPAIR] Successfully repaired JSON")
+        return result
+        
+    except Exception as e:
+        logger.error(f"[JSON REPAIR] Failed to repair: {e}")
+        return None
+
+def handle_json_failure(bot, history, context_input):
+    """
+    Handle complete JSON generation failure by notifying sales team
+    """
+    try:
+        # Extract customer info from history
+        customer_phone = history[-1].customer_phone if history else "Unknown"
+        last_messages = "\n".join([
+            f"{'Customer' if m.direction == 'in' else 'Bot'}: {m.content[:100]}..."
+            for m in history[-5:]  # Last 5 messages
+        ])
+        
+        # Create alert message for sales team
+        alert_message = (
+            "🚨 URGENT: AI RESPONSE FAILURE - MANUAL REPLY NEEDED 🚨\n\n"
+            f"Customer: {customer_phone}\n"
+            f"Time: {get_current_datetime_str_utc8()}\n\n"
+            "Recent conversation:\n"
+            f"{last_messages}\n\n"
+            "Latest customer input:\n"
+            f"{context_input[-500:]}\n\n"  # Last 500 chars of context
+            "⚠️ Please reply to customer manually ASAP!\n"
+            "The AI system failed to generate a proper response."
+        )
+        
+        # Send notification to sales group
+        notify_sales_group(bot, alert_message, error=True)
+        
+        # Log the failure for debugging
+        logger.critical(f"[JSON FAILURE] Complete failure for customer {customer_phone}")
+        
+        # Save to error tracking
+        save_extraction_error(
+            {"customer": customer_phone, "context": context_input[-1000:]},
+            "Complete JSON generation failure - all attempts exhausted"
+        )
+        
+    except Exception as e:
+        logger.error(f"[HANDLE JSON FAILURE] Error sending notification: {e}")
+
+def compose_reply_streaming_with_retry(bot, tool, history, context_input, max_retries=2):
+    """
+    Streaming version with retry logic
+    """
     if tool:
         prompt = (bot.system_prompt or "") + "\n" + (tool.prompt or "")
         example_json = '''{
@@ -1048,36 +1168,123 @@ def compose_reply(bot, tool, history, context_input):
   ]
 }'''
     
-    reply_prompt = build_json_prompt(prompt, example_json)
-    logger.info(f"[AI REPLY] Starting composition")
+    reply_prompt = build_json_prompt_enhanced(prompt, example_json)
+    
+    for attempt in range(max_retries):
+        try:
+            with client.messages.stream(
+                model="claude-sonnet-4-20250514",
+                max_tokens=8192,
+                temperature=0.7 if attempt == 0 else 0.3,  # Lower temperature on retries
+                system=reply_prompt,
+                messages=[{"role": "user", "content": context_input}]
+            ) as stream:
+                reply_accum = ""
+                for text in stream.text_stream:
+                    reply_accum += text
+                
+                logger.info(f"[AI REPLY STREAM ATTEMPT {attempt+1}]: {reply_accum[:500]}...")
+                cleaned_response = strip_json_markdown_blocks(reply_accum)
+                
+                # Try to parse JSON
+                tool_decision = json.loads(cleaned_response)
+                
+                # Validate structure
+                if validate_json_structure(tool_decision):
+                    return tool_decision
+                else:
+                    logger.warning(f"[AI REPLY] Invalid JSON structure on attempt {attempt+1}")
+                    continue
+                    
+        except json.JSONDecodeError as e:
+            logger.error(f"[AI REPLY] JSON decode error on attempt {attempt+1}: {e}")
+            if attempt < max_retries - 1:
+                # Add explicit JSON request in retry
+                context_input = context_input + "\n\nPLEASE OUTPUT ONLY VALID JSON AS SPECIFIED."
+        except Exception as e:
+            logger.error(f"[AI REPLY] Streaming error on attempt {attempt+1}: {e}")
+    
+    return None
+
+def compose_reply_non_streaming(bot, tool, history, context_input):
+    """
+    Non-streaming version for more reliable JSON output
+    """
+    if tool:
+        prompt = (bot.system_prompt or "") + "\n" + (tool.prompt or "")
+        example_json = '''{
+  "template": "bf_UGnkL24bhtCQBIJr7hbT",
+  "message": [
+    "example template 1",
+    "example template 2",
+    "example template 3"
+  ]
+}'''
+    else:
+        prompt = bot.system_prompt or ""
+        example_json = '''{
+  "message": [
+    "example message 1",
+    "example message 2",
+    "example message 3"
+  ]
+}'''
+    
+    reply_prompt = build_json_prompt_enhanced(prompt, example_json)
     
     try:
-        with client.messages.stream(
+        response = client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=8192,
-            temperature=0.7,
+            temperature=0.3,  # Lower temperature for consistency
             system=reply_prompt,
-            messages=[{"role": "user", "content": context_input}],
-        ) as stream:
-            reply_accum = ""
-            print("[STREAM] Streaming model reply:")
-            for text in stream.text_stream:
-                reply_accum += text
-                print(text, end="", flush=True)
-            
-            logger.info(f"\n[AI REPLY STREAMED]: {reply_accum}")
-            cleaned_response = strip_json_markdown_blocks(reply_accum)
-            
-            try:
-                tool_decision = json.loads(cleaned_response)
-                return tool_decision
-            except json.JSONDecodeError as e:
-                logger.error(f"[AI REPLY] JSON decode error: {e}")
-                return {"message": ["I apologize, there was an error processing your request. Please try again."]}
-                
+            messages=[{"role": "user", "content": context_input}]
+        )
+        
+        raw_response = response.content[0].text
+        logger.info(f"[AI REPLY NON-STREAM]: {raw_response[:500]}...")
+        cleaned_response = strip_json_markdown_blocks(raw_response)
+        
+        tool_decision = json.loads(cleaned_response)
+        return tool_decision
+        
+    except json.JSONDecodeError as e:
+        logger.error(f"[AI REPLY NON-STREAM] JSON decode error: {e}")
+        # Try to repair JSON
+        return repair_json_response(cleaned_response)
     except Exception as e:
-        logger.error(f"[AI REPLY] Unexpected error: {e}")
-        return {"message": ["I apologize, there was an error processing your request. Please try again."]}
+        logger.error(f"[AI REPLY NON-STREAM] Error: {e}")
+        return None
+
+def compose_reply(bot, tool, history, context_input):
+    """
+    Main compose reply function with fallback mechanisms
+    """
+    # Try streaming with validation first
+    result = compose_reply_streaming_with_retry(bot, tool, history, context_input, max_retries=2)
+    
+    if result and validate_json_structure(result):
+        return result
+    
+    # Fallback to non-streaming
+    logger.info("[AI REPLY] Falling back to non-streaming")
+    result = compose_reply_non_streaming(bot, tool, history, context_input)
+    
+    if result and validate_json_structure(result):
+        return result
+    
+    # All attempts failed - notify sales for manual intervention
+    logger.error("[AI REPLY CRITICAL] All JSON generation attempts failed - notifying sales")
+    handle_json_failure(bot, history, context_input)
+    
+    # Return safe fallback message to customer
+    return {
+        "message": [
+            "thank you for your message. i'm experiencing a technical issue right now",
+            "our team has been notified and will respond to you manually shortly",
+            "we appreciate your patience and will get back to you as soon as possible"
+        ]
+    }
 
 # === ENHANCED AI REPLY PROCESSING WITH SESSION CHECKS ===
 def is_session_still_open(session_id):
@@ -1280,8 +1487,6 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
             
             logger.info(f"[NOTIFY SALES]: {final_note}")
             notify_sales_group(bot, final_note)
-            
-
         
         return
     
@@ -1330,8 +1535,6 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
                     send_wassenger_reply(customer_phone, file_id, device_id, msg_type="media", caption=caption, delay_seconds=delay)
                     if bot_id and user and session_id:
                         save_message_safe(bot_id, user, session_id, "out", "[PDF sent]")
-
-        
 
 def find_or_create_customer(phone, name=None):
     customer = Customer.query.filter_by(phone_number=phone).first()
@@ -1491,7 +1694,7 @@ def detect_customer_intent(message_text, session_context, bot):
 
 # === ENHANCED BUFFER PROCESSING WITH CONCURRENCY CONTROL ===
 def process_buffered_messages(buffer_key):
-    """Enhanced with processing flags and better error handling"""
+    """Enhanced with better error handling and fallback notifications"""
     with app.app_context():
         # Check if already processing
         with BUFFER_LOCK:
@@ -1537,7 +1740,7 @@ def process_buffered_messages(buffer_key):
                 ] + [f"User: {combined_text}"])
             )
             
-            # Get tool and compose reply
+            # Get tool and compose reply with new robust system
             tool_id = decide_tool_with_manager_prompt(bot, history)
             tool = None
             if tool_id and tool_id.lower() != "default":
@@ -1546,11 +1749,30 @@ def process_buffered_messages(buffer_key):
                         tool = t
                         break
             
+            # Use the new compose_reply with all fallbacks
             ai_reply = compose_reply(bot, tool, history, context_input)
+            
+            # Process and send the AI reply
             process_ai_reply_and_send(user_phone, ai_reply, device_id, bot_id=bot.id, user=user_phone, session_id=session_id)
             
         except Exception as e:
             logger.error(f"[BUFFER PROCESS ERROR] {e}", exc_info=True)
+            # Send fallback message to customer
+            try:
+                send_wassenger_reply(
+                    user_phone,
+                    "We're experiencing a technical issue. Our team has been notified and will respond shortly.",
+                    device_id,
+                    delay_seconds=1
+                )
+                # Notify sales team
+                notify_sales_group(
+                    bot,
+                    f"🚨 Buffer processing error for {user_phone}. Manual intervention needed.\nError: {str(e)}",
+                    error=True
+                )
+            except:
+                pass
         finally:
             db.session.remove()
             # Clean up
@@ -1838,6 +2060,7 @@ def process_webhook_async(data):
 
         finally:
             db.session.remove()
+
 # === MAIN WEBHOOK ENDPOINT ===
 @app.route('/webhook', methods=['POST'])
 def webhook():
