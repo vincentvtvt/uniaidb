@@ -432,7 +432,7 @@ def extract_text_from_image(img_url, prompt=None):
 def transcribe_audio_from_url(audio_url):
     try:
         audio_bytes = download_wassenger_media(audio_url)
-        if not audio_bytes or len(audio_bytes) < 1024:
+        if not audio_bytes or len(audio_bytes) < 128:
             logger.error("[AUDIO DOWNLOAD] Failed or too small")
             return "[audio received, transcription failed]"
         temp_path = "/tmp/temp_audio.ogg"
