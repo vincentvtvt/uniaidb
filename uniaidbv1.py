@@ -1280,9 +1280,7 @@ def compose_reply(bot, tool, history, context_input):
     # Return safe fallback message to customer
     return {
         "message": [
-            "thank you for your message. i'm experiencing a technical issue right now",
-            "our team has been notified and will respond to you manually shortly",
-            "we appreciate your patience and will get back to you as soon as possible"
+            "ok hold on, will check and revert"
         ]
     }
 
@@ -1761,7 +1759,7 @@ def process_buffered_messages(buffer_key):
             try:
                 send_wassenger_reply(
                     user_phone,
-                    "We're experiencing a technical issue. Our team has been notified and will respond shortly.",
+                    "ok hold on",
                     device_id,
                     delay_seconds=1
                 )
