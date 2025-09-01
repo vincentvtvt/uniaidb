@@ -1260,7 +1260,7 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
                 cfg = _json.loads(cfg) if cfg else {}
             notify_whatsapp = (cfg or {}).get("notification_group") or ""
             
-            header = f"{customer_phone}\n\n{notify_whatsapp}".strip()
+            header = f"{customer_phone}".strip()
             notification_text = parsed.get("notification") or ""
             
             whitelist = ["desired_service", "industry", "area", "facebook_link", "tiktok_link", "current_challenges"]
