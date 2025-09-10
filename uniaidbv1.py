@@ -163,7 +163,7 @@ def generate_follow_up_response(bot, customer_phone, msg_text, session_context, 
             2. Mentions team will review and respond if needed
             Keep response under 2 sentences.
             """
-        elif intent_type == 'new_request_transition':
+        elif intent_type == '_transition':
             context_prompt = f"""
             Customer previously inquired about: {previous_service}
             That request was processed {days_since_closed} days ago.
@@ -1380,10 +1380,9 @@ def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, 
                 if session_obj.status == "closed":
                     logger.info(f"[SESSION CLOSE] Session already closed by another process")
                     return
-                
-                # ACTUALLY CLOSE THE SESSION - THESE ARE THE CRITICAL LINES
-                session_obj.status = "closed"  # ADD THIS LINE
-                session_obj.ended_at = get_current_datetime_utc8()  # ADD THIS LINE
+
+                session_obj.status = "closed" 
+                session_obj.ended_at = get_current_datetime_utc8() 
                 
                 if not session_obj.context:
                     session_obj.context = {}
@@ -1605,14 +1604,14 @@ def close_session(session, reason, info: dict = None):
     session.context['close_reason'] = reason
     db.session.commit()
 
-def detect_customer_intent(message_text, session_context, bot):
+def detect_customer_intent(message_text, session_context, bot, session_id=None, customer_phone=None, bot_id=None):
     """
-    Enhanced intent detection with better follow-up handling
-    Returns: 'new_request', 'follow_up', or 'unclear'
+    Enhanced intent detection with conversation history from closed session
+    Returns: '', 'follow_up', or 'unclear'
     """
     
     # Keywords that indicate NEW request
-    new_request_keywords = [
+    _keywords = [
         'another', 'different', 'new', 'other', 'else', 'lagi', 'baru', 'lain',
         'change', 'switch', 'upgrade', 'downgrade', 'cancel and', 'instead',
         'also want', 'additionally', 'one more', 'extra', 'tambah', 'tukar'
@@ -1625,31 +1624,64 @@ def detect_customer_intent(message_text, session_context, bot):
         'heard back', 'reply', 'response', 'answered', 'contacted', 'called'
     ]
     
-    # Use AI for more sophisticated detection
+    # Get previous conversation history if session_id provided
+    previous_messages_text = ""
+    if session_id and customer_phone and bot_id:
+        try:
+            # Get last 10 messages from the closed session
+            previous_messages = (Message.query
+                .filter_by(bot_id=bot_id, customer_phone=customer_phone, session_id=str(session_id))
+                .order_by(Message.created_at.desc())
+                .limit(10)
+                .all())
+            
+            if previous_messages:
+                # Reverse to get chronological order
+                previous_messages = previous_messages[::-1]
+                
+                # Format messages for context
+                msg_history = []
+                for msg in previous_messages:
+                    role = "Customer" if msg.direction == "in" else "Assistant"
+                    msg_history.append(f"{role}: {msg.content[:200]}")  # Limit each message to 200 chars
+                
+                previous_messages_text = "\n".join(msg_history)
+                logger.info(f"[INTENT DETECTION] Retrieved {len(previous_messages)} messages for context")
+        except Exception as e:
+            logger.error(f"[INTENT DETECTION] Failed to get message history: {e}")
+    
+    # Use AI for sophisticated detection with full context
     try:
         # Get previous service/product from session context
         previous_service = session_context.get('desired_service', 'unknown service')
         close_reason = session_context.get('close_reason', 'unknown')
+        lead_created = session_context.get('lead_created', False)
         
-        # Build prompt for AI intent detection
+        # Build enhanced prompt with conversation history
         intent_prompt = f"""
-        Analyze this customer message to determine their intent.
+        Analyze this customer message to determine their intent, considering the full conversation history.
         
-        Previous context:
+        Previous conversation context:
         - Service discussed: {previous_service}
         - Session close reason: {close_reason}
+        - Lead was created: {lead_created}
         - Days since closed: Within 14 days
         
-        Customer's new message: "{message_text}"
+        Previous conversation (last 10 messages):
+        {previous_messages_text if previous_messages_text else "No previous messages available"}
         
-        Determine if this is:
-        1. "new_request" - Customer wants a DIFFERENT or ADDITIONAL service/product
-        2. "follow_up" - Customer is asking about their EXISTING request/application
-        3. "unclear" - Cannot determine intent clearly
+        Customer's NEW message: {message_text}
         
-        Look for:
-        - New request indicators: asking about different products, new requirements, additional services
-        - Follow-up indicators: asking for status, updates, when they'll be contacted, checking on progress
+        Based on the conversation history and context, determine if this is:
+        1.  - Customer wants a DIFFERENT or ADDITIONAL service/product than what was discussed
+        2. follow_up - Customer is asking about their EXISTING request/application that was already processed
+        3. unclear - Cannot determine intent clearly or message is too vague
+        
+        Important considerations:
+        - If the lead was already created (session was WON), and customer is asking about status/updates, it's a follow_up
+        - If customer explicitly mentions wanting something different from {previous_service}, it's a 
+        - Simple greetings, acknowledgments, or thank you messages after a closed session are usually follow_up
+        - Look at the conversation flow to understand if this is continuation or new topic
         
         Respond with ONLY one word: new_request, follow_up, or unclear
         """
@@ -1660,7 +1692,7 @@ def detect_customer_intent(message_text, session_context, bot):
                 {"role": "system", "content": "You are an intent classifier. Reply with only: new_request, follow_up, or unclear"},
                 {"role": "user", "content": intent_prompt}
             ],
-            max_tokens=10,
+            max_tokens=1000,
             temperature=0.1
         )
         
@@ -1925,8 +1957,15 @@ def process_webhook_async(data):
                 
                 logger.info(f"[SESSION] Recently closed session ({days_since_closed} days ago)")
             
-                # === ENHANCED: Detect customer intent ===
-                intent = detect_customer_intent(msg_text, session.context or {}, bot)
+                # === ENHANCED: Detect customer intent with full context ===
+                intent = detect_customer_intent(
+                    msg_text, 
+                    session.context or {}, 
+                    bot,
+                    session_id=session.id,  # Pass session ID for history
+                    customer_phone=user_phone,  # Pass customer phone
+                    bot_id=bot.id  # Pass bot ID
+                )
                 logger.info(f"[INTENT] Customer intent detected: {intent}")
                 
                 if intent == 'new_request':
@@ -1938,7 +1977,7 @@ def process_webhook_async(data):
                     session.ended_at = get_current_datetime_utc8() - timedelta(days=15)  # Bypass 14-day check
                     if not session.context:
                         session.context = {}
-                    session.context['superseded_by_new_request'] = True
+                    session.context['superseded_by_'] = True
                     db.session.commit()
                     
                     # ACTION: Create new session
