@@ -1679,7 +1679,7 @@ def detect_customer_intent(message_text, session_context, bot, session_id=None, 
         
         Important considerations:
         - If the lead was already created (session was WON), and customer is asking about status/updates, it's a follow_up
-        - If customer explicitly mentions wanting something different from {previous_service}, it's a 
+        - Only classify as new_request if the customer explicitly states they want to start an additional application. Otherwise, assume it’s a follow_up — even if the message content looks unrelated (like bills, IDs, or statements)
         - Simple greetings, acknowledgments, or thank you messages after a closed session are usually follow_up
         - Look at the conversation flow to understand if this is continuation or new topic
         
