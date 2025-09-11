@@ -24,6 +24,8 @@ from functools import lru_cache
 from sqlalchemy.pool import NullPool
 import subprocess
 import tempfile
+from openai import OpenAI
+
 
 UTC_PLUS_8 = timezone(timedelta(hours=8))
 
