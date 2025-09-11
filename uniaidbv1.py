@@ -22,6 +22,8 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import RLock
 from functools import lru_cache
 from sqlalchemy.pool import NullPool
+import tempfile
+from openai import OpenAI
 
 UTC_PLUS_8 = timezone(timedelta(hours=8))
 
@@ -220,7 +222,7 @@ def build_json_prompt_with_reasoning(base_prompt, example_json):
     return base_prompt.strip() + "\n\n" + json_instruction
 
 # === MESSAGE DEDUPLICATION ===
-def is_duplicate_message(user_phone, msg_text, window_seconds=5):
+def is_duplicate_message(user_phone, msg_text, window_seconds=180):
     """Check if message is duplicate within time window"""
     msg_hash = hashlib.md5(f"{user_phone}:{msg_text}".encode()).hexdigest()
     current_time = time.time()
@@ -233,7 +235,7 @@ def is_duplicate_message(user_phone, msg_text, window_seconds=5):
         MESSAGE_HASH_CACHE[msg_hash] = current_time
         # Clean old entries
         keys_to_remove = [k for k, v in MESSAGE_HASH_CACHE.items() 
-                         if current_time - v > 60]
+                         if current_time - v > window_seconds]
         for k in keys_to_remove:
             MESSAGE_HASH_CACHE.pop(k, None)
     
@@ -429,23 +431,50 @@ def extract_text_from_image(img_url, prompt=None):
         save_extraction_error({"url": img_url}, str(e))
         return "[Image extraction failed]"
 
+client = OpenAI()
+
 def transcribe_audio_from_url(audio_url):
+    """
+    Download audio from Wassenger and transcribe using GPT-4o mini.
+    Always attempts transcription regardless of duration.
+    """
     try:
+        # Download raw audio from Wassenger
         audio_bytes = download_wassenger_media(audio_url)
         if not audio_bytes or len(audio_bytes) < 128:
             logger.error("[AUDIO DOWNLOAD] Failed or too small")
             return "[audio received, transcription failed]"
-        temp_path = "/tmp/temp_audio.ogg"
-        with open(temp_path, "wb") as f:
-            f.write(audio_bytes)
-        with open(temp_path, "rb") as audio_file:
-            transcript = openai.audio.transcriptions.create(model="whisper-1", file=audio_file)
-        logger.info(f"[WHISPER] Transcript: {transcript.text.strip()}")
-        return transcript.text.strip()
+
+        # Encode audio as base64 string
+        audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+
+        # Send to GPT-4o mini
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            modalities=["text", "audio"],
+            messages=[
+                {"role": "system", "content": "You are a transcription assistant. Output only the spoken words clearly."},
+                {"role": "user", "content": [
+                    {
+                        "type": "input_audio",
+                        "audio": {
+                            "data": audio_b64,
+                            "format": "ogg"   # can also be "mp3" depending on source
+                        }
+                    }
+                ]}
+            ]
+        )
+
+        transcript = response.choices[0].message["content"][0]["text"].strip()
+        logger.info(f"[GPT-4o TRANSCRIPT] {transcript}")
+        return transcript
+
     except Exception as e:
-        logger.error(f"[WHISPER ERROR] {e}", exc_info=True)
+        logger.error(f"[GPT-4o ERROR] {e}", exc_info=True)
         save_extraction_error({"url": audio_url}, str(e))
         return "[audio received, transcription failed]"
+
 
 def download_to_bytes(url):
     resp = requests.get(url, timeout=60)
@@ -1679,7 +1708,7 @@ def detect_customer_intent(message_text, session_context, bot, session_id=None, 
         
         Important considerations:
         - If the lead was already created (session was WON), and customer is asking about status/updates, it's a follow_up
-        - If customer explicitly mentions wanting something different from {previous_service}, it's a 
+        - Only classify as new_request if the customer explicitly states they want to start an additional. Otherwise, assume it’s a follow_up — even if the message content looks unrelated (like bills, IDs, or statements).
         - Simple greetings, acknowledgments, or thank you messages after a closed session are usually follow_up
         - Look at the conversation flow to understand if this is continuation or new topic
         
@@ -1692,7 +1721,7 @@ def detect_customer_intent(message_text, session_context, bot, session_id=None, 
                 {"role": "system", "content": "You are an intent classifier. Reply with only: new_request, follow_up, or unclear"},
                 {"role": "user", "content": intent_prompt}
             ],
-            max_tokens=1000,
+            max_tokens=8192,
             temperature=0.1
         )
         
