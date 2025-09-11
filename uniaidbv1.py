@@ -22,8 +22,6 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import RLock
 from functools import lru_cache
 from sqlalchemy.pool import NullPool
-import tempfile
-from openai import OpenAI
 
 UTC_PLUS_8 = timezone(timedelta(hours=8))
 
@@ -191,7 +189,7 @@ def generate_follow_up_response(bot, customer_phone, msg_text, session_context, 
         reply_prompt = build_json_prompt(full_prompt, example_json)
         
         # Get AI response
-        response = anthropic_client.messages.create(
+        response = client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=256,
             temperature=0.7,
@@ -222,7 +220,7 @@ def build_json_prompt_with_reasoning(base_prompt, example_json):
     return base_prompt.strip() + "\n\n" + json_instruction
 
 # === MESSAGE DEDUPLICATION ===
-def is_duplicate_message(user_phone, msg_text, window_seconds=180):
+def is_duplicate_message(user_phone, msg_text, window_seconds=5):
     """Check if message is duplicate within time window"""
     msg_hash = hashlib.md5(f"{user_phone}:{msg_text}".encode()).hexdigest()
     current_time = time.time()
@@ -235,7 +233,7 @@ def is_duplicate_message(user_phone, msg_text, window_seconds=180):
         MESSAGE_HASH_CACHE[msg_hash] = current_time
         # Clean old entries
         keys_to_remove = [k for k, v in MESSAGE_HASH_CACHE.items() 
-                         if current_time - v > window_seconds]
+                         if current_time - v > 60]
         for k in keys_to_remove:
             MESSAGE_HASH_CACHE.pop(k, None)
     
@@ -420,7 +418,7 @@ def extract_text_from_image(img_url, prompt=None):
             {"role": "system", "content": prompt or "Extract all visible text from this image. If no text, describe what you see."},
             {"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}]}
         ]
-        result = openai_client.chat.completions.create(
+        result = openai.chat.completions.create(
             model="gpt-4o",
             messages=messages,
             max_tokens=8192
@@ -431,50 +429,23 @@ def extract_text_from_image(img_url, prompt=None):
         save_extraction_error({"url": img_url}, str(e))
         return "[Image extraction failed]"
 
-client = OpenAI()
-
 def transcribe_audio_from_url(audio_url):
-    """
-    Download audio from Wassenger and transcribe using GPT-4o mini.
-    Always attempts transcription regardless of duration.
-    """
     try:
-        # Download raw audio from Wassenger
         audio_bytes = download_wassenger_media(audio_url)
         if not audio_bytes or len(audio_bytes) < 128:
             logger.error("[AUDIO DOWNLOAD] Failed or too small")
             return "[audio received, transcription failed]"
-
-        # Encode audio as base64 string
-        audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
-
-        # Send to GPT-4o mini
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            modalities=["text", "audio"],
-            messages=[
-                {"role": "system", "content": "You are a transcription assistant. Output only the spoken words clearly."},
-                {"role": "user", "content": [
-                    {
-                        "type": "input_audio",
-                        "audio": {
-                            "data": audio_b64,
-                            "format": "ogg"   # can also be "mp3" depending on source
-                        }
-                    }
-                ]}
-            ]
-        )
-
-        transcript = response.choices[0].message["content"][0]["text"].strip()
-        logger.info(f"[GPT-4o TRANSCRIPT] {transcript}")
-        return transcript
-
+        temp_path = "/tmp/temp_audio.ogg"
+        with open(temp_path, "wb") as f:
+            f.write(audio_bytes)
+        with open(temp_path, "rb") as audio_file:
+            transcript = openai.audio.transcriptions.create(model="whisper-1", file=audio_file)
+        logger.info(f"[WHISPER] Transcript: {transcript.text.strip()}")
+        return transcript.text.strip()
     except Exception as e:
-        logger.error(f"[GPT-4o ERROR] {e}", exc_info=True)
+        logger.error(f"[WHISPER ERROR] {e}", exc_info=True)
         save_extraction_error({"url": audio_url}, str(e))
         return "[audio received, transcription failed]"
-
 
 def download_to_bytes(url):
     resp = requests.get(url, timeout=60)
@@ -550,7 +521,7 @@ def extract_text_from_message(msg):
                             {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
                         ]}
                     ]
-                    result = openai_client.chat.completions.create(
+                    result = openai.chat.completions.create(
                         model="gpt-4o",
                         messages=vision_msg,
                         max_tokens=8192
@@ -575,7 +546,7 @@ def extract_text_from_message(msg):
                             {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
                         ]}
                     ]
-                    result = openai_client.chat.completions.create(
+                    result = openai.chat.completions.create(
                         model="gpt-4o",
                         messages=vision_msg,
                         max_tokens=8192
@@ -603,7 +574,7 @@ def extract_text_from_message(msg):
                                 {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
                             ]}
                         ]
-                        result = openai_client.chat.completions.create(
+                        result = openai.chat.completions.create(
                             model="gpt-4o",
                             messages=vision_msg,
                             max_tokens=128
@@ -625,7 +596,7 @@ def extract_text_from_message(msg):
                     transcript = transcribe_audio_from_url(audio_url)
                     if transcript and transcript.lower() not in ("[audio received, no url]", "[audio received, transcription failed]"):
                         gpt_prompt = f"This is a WhatsApp audio message transcribed as: '{transcript}'. Reply in a short, natural phrase."
-                        result = openai_client.chat.completions.create(
+                        result = openai.chat.completions.create(
                             model="gpt-4o",
                             messages=[{"role": "system", "content": gpt_prompt}],
                             max_tokens=64
@@ -659,7 +630,7 @@ def extract_text_from_message(msg):
                                     {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
                                 ]}
                             ]
-                            result = openai_client.chat.completions.create(
+                            result = openai.chat.completions.create(
                                 model="gpt-4o",
                                 messages=vision_msg,
                                 max_tokens=128
@@ -674,7 +645,7 @@ def extract_text_from_message(msg):
                                 {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
                             ]}
                         ]
-                        result = openai_client.chat.completions.create(
+                        result = openai.chat.completions.create(
                             model="gpt-4o",
                             messages=vision_msg,
                             max_tokens=128
@@ -1201,7 +1172,7 @@ def compose_reply_streaming_with_retry(bot, tool, history, context_input, max_re
     
     for attempt in range(max_retries):
         try:
-            with anthropic_client.messages.stream(
+            with client.messages.stream(
                 model="claude-sonnet-4-20250514",
                 max_tokens=8192,
                 temperature=0.7 if attempt == 0 else 0.3,  # Lower temperature on retries
@@ -1262,7 +1233,7 @@ def compose_reply_non_streaming(bot, tool, history, context_input):
     reply_prompt = build_json_prompt_enhanced(prompt, example_json)
     
     try:
-        response = anthropic_client.messages.create(
+        response = client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=8192,
             temperature=0.3,  # Lower temperature for consistency
@@ -1708,20 +1679,20 @@ def detect_customer_intent(message_text, session_context, bot, session_id=None, 
         
         Important considerations:
         - If the lead was already created (session was WON), and customer is asking about status/updates, it's a follow_up
-        - Only classify as new_request if the customer explicitly states they want to start an additional. Otherwise, assume it’s a follow_up — even if the message content looks unrelated (like bills, IDs, or statements).
+        - If customer explicitly mentions wanting something different from {previous_service}, it's a 
         - Simple greetings, acknowledgments, or thank you messages after a closed session are usually follow_up
         - Look at the conversation flow to understand if this is continuation or new topic
         
         Respond with ONLY one word: new_request, follow_up, or unclear
         """
         
-        response = openai_client.chat.completions.create(
+        response = openai.chat.completions.create(
             model="gpt-4o",
             messages=[
                 {"role": "system", "content": "You are an intent classifier. Reply with only: new_request, follow_up, or unclear"},
                 {"role": "user", "content": intent_prompt}
             ],
-            max_tokens=8192,
+            max_tokens=1000,
             temperature=0.1
         )
         
