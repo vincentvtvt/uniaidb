@@ -191,7 +191,7 @@ def generate_follow_up_response(bot, customer_phone, msg_text, session_context, 
         reply_prompt = build_json_prompt(full_prompt, example_json)
         
         # Get AI response
-        response = client.messages.create(
+        response = anthropic_client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=256,
             temperature=0.7,
@@ -420,7 +420,7 @@ def extract_text_from_image(img_url, prompt=None):
             {"role": "system", "content": prompt or "Extract all visible text from this image. If no text, describe what you see."},
             {"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}]}
         ]
-        result = openai.chat.completions.create(
+        result = openai_client.chat.completions.create(
             model="gpt-4o",
             messages=messages,
             max_tokens=8192
@@ -550,7 +550,7 @@ def extract_text_from_message(msg):
                             {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
                         ]}
                     ]
-                    result = openai.chat.completions.create(
+                    result = openai_client.chat.completions.create(
                         model="gpt-4o",
                         messages=vision_msg,
                         max_tokens=8192
@@ -575,7 +575,7 @@ def extract_text_from_message(msg):
                             {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
                         ]}
                     ]
-                    result = openai.chat.completions.create(
+                    result = openai_client.chat.completions.create(
                         model="gpt-4o",
                         messages=vision_msg,
                         max_tokens=8192
@@ -603,7 +603,7 @@ def extract_text_from_message(msg):
                                 {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
                             ]}
                         ]
-                        result = openai.chat.completions.create(
+                        result = openai_client.chat.completions.create(
                             model="gpt-4o",
                             messages=vision_msg,
                             max_tokens=128
@@ -625,7 +625,7 @@ def extract_text_from_message(msg):
                     transcript = transcribe_audio_from_url(audio_url)
                     if transcript and transcript.lower() not in ("[audio received, no url]", "[audio received, transcription failed]"):
                         gpt_prompt = f"This is a WhatsApp audio message transcribed as: '{transcript}'. Reply in a short, natural phrase."
-                        result = openai.chat.completions.create(
+                        result = openai_client.chat.completions.create(
                             model="gpt-4o",
                             messages=[{"role": "system", "content": gpt_prompt}],
                             max_tokens=64
@@ -659,7 +659,7 @@ def extract_text_from_message(msg):
                                     {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
                                 ]}
                             ]
-                            result = openai.chat.completions.create(
+                            result = openai_client.chat.completions.create(
                                 model="gpt-4o",
                                 messages=vision_msg,
                                 max_tokens=128
@@ -674,7 +674,7 @@ def extract_text_from_message(msg):
                                 {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
                             ]}
                         ]
-                        result = openai.chat.completions.create(
+                        result = openai_client.chat.completions.create(
                             model="gpt-4o",
                             messages=vision_msg,
                             max_tokens=128
@@ -1201,7 +1201,7 @@ def compose_reply_streaming_with_retry(bot, tool, history, context_input, max_re
     
     for attempt in range(max_retries):
         try:
-            with client.messages.stream(
+            with anthropic_client.messages.stream(
                 model="claude-sonnet-4-20250514",
                 max_tokens=8192,
                 temperature=0.7 if attempt == 0 else 0.3,  # Lower temperature on retries
@@ -1262,7 +1262,7 @@ def compose_reply_non_streaming(bot, tool, history, context_input):
     reply_prompt = build_json_prompt_enhanced(prompt, example_json)
     
     try:
-        response = client.messages.create(
+        response = anthropic_client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=8192,
             temperature=0.3,  # Lower temperature for consistency
@@ -1715,7 +1715,7 @@ def detect_customer_intent(message_text, session_context, bot, session_id=None, 
         Respond with ONLY one word: new_request, follow_up, or unclear
         """
         
-        response = openai.chat.completions.create(
+        response = openai_client.chat.completions.create(
             model="gpt-4o",
             messages=[
                 {"role": "system", "content": "You are an intent classifier. Reply with only: new_request, follow_up, or unclear"},
