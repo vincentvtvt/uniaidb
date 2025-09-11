@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 import requests
-import openai
+from openai import OpenAI
 import base64
 from PIL import Image
 from io import BytesIO
@@ -24,7 +24,6 @@ from functools import lru_cache
 from sqlalchemy.pool import NullPool
 import subprocess
 import tempfile
-from openai import OpenAI
 
 
 UTC_PLUS_8 = timezone(timedelta(hours=8))
@@ -446,31 +445,27 @@ def transcribe_audio_from_url(audio_url):
         if not audio_bytes or len(audio_bytes) < 128:
             logger.error("[AUDIO DOWNLOAD] Failed or too small")
             return "[audio received, transcription failed]"
-        
-        # Save to a temp file (keep original format like .ogg or .mp3)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as temp_in:
-            temp_in.write(audio_bytes)
-            temp_in.flush()
-            input_path = temp_in.name
 
-        # Send to GPT-4o mini with audio modality
-        with open(input_path, "rb") as f:
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                modalities=["text", "audio"],
-                messages=[
+        # Encode audio as base64 string
+        audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+
+        # Send to GPT-4o mini
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            modalities=["text", "audio"],
+            messages=[
+                {"role": "system", "content": "You are a transcription assistant. Output only the spoken words clearly."},
+                {"role": "user", "content": [
                     {
-                        "role": "system",
-                        "content": "You are a transcription assistant. Output only the spoken words clearly."
-                    },
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "input_audio", "audio": f}
-                        ]
+                        "type": "input_audio",
+                        "audio": {
+                            "data": audio_b64,
+                            "format": "ogg"   # can also be "mp3" depending on source
+                        }
                     }
-                ]
-            )
+                ]}
+            ]
+        )
 
         transcript = response.choices[0].message["content"][0]["text"].strip()
         logger.info(f"[GPT-4o TRANSCRIPT] {transcript}")
@@ -480,12 +475,7 @@ def transcribe_audio_from_url(audio_url):
         logger.error(f"[GPT-4o ERROR] {e}", exc_info=True)
         save_extraction_error({"url": audio_url}, str(e))
         return "[audio received, transcription failed]"
-    finally:
-        try:
-            if os.path.exists(input_path):
-                os.remove(input_path)
-        except:
-            pass
+
 
 def download_to_bytes(url):
     resp = requests.get(url, timeout=60)
