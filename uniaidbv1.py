@@ -22,6 +22,8 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import RLock
 from functools import lru_cache
 from sqlalchemy.pool import NullPool
+import subprocess
+import tempfile
 
 UTC_PLUS_8 = timezone(timedelta(hours=8))
 
@@ -429,23 +431,77 @@ def extract_text_from_image(img_url, prompt=None):
         save_extraction_error({"url": img_url}, str(e))
         return "[Image extraction failed]"
 
-def transcribe_audio_from_url(audio_url):
+def transcribe_audio_from_url(audio_url, language_hint=None):
+    """
+    Download, normalize, and transcribe audio from a URL.
+    
+    Args:
+        audio_url (str): URL to fetch audio from.
+        language_hint (str): Optional ISO language code ("ms", "zh", "en").
+    
+    Returns:
+        str: Transcript or failure message.
+    """
     try:
+        # Download raw audio from Wassenger
         audio_bytes = download_wassenger_media(audio_url)
         if not audio_bytes or len(audio_bytes) < 128:
             logger.error("[AUDIO DOWNLOAD] Failed or too small")
             return "[audio received, transcription failed]"
-        temp_path = "/tmp/temp_audio.ogg"
-        with open(temp_path, "wb") as f:
-            f.write(audio_bytes)
-        with open(temp_path, "rb") as audio_file:
-            transcript = openai.audio.transcriptions.create(model="whisper-1", file=audio_file)
-        logger.info(f"[WHISPER] Transcript: {transcript.text.strip()}")
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as temp_in:
+            temp_in.write(audio_bytes)
+            temp_in.flush()
+            input_path = temp_in.name
+
+        # Prepare clean WAV file
+        output_wav = input_path + ".wav"
+
+        # Run ffmpeg to convert any format → 16kHz mono WAV
+        cmd = [
+            "ffmpeg", "-y", "-i", input_path,
+            "-ar", "16000", "-ac", "1", output_wav
+        ]
+        subprocess.run(cmd, capture_output=True)
+
+        # Probe duration using ffprobe (for logging only)
+        try:
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", output_wav],
+                capture_output=True, text=True
+            )
+            duration = float(probe.stdout.strip()) if probe.stdout.strip() else 0.0
+        except Exception:
+            duration = 0.0
+
+        # Always attempt transcription, regardless of duration
+        with open(output_wav, "rb") as audio_file:
+            transcript = openai.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file,
+                language=language_hint  # None = auto detect
+            )
+
+        logger.info(
+            f"[WHISPER] Transcript ({duration:.2f}s, lang={language_hint or 'auto'}): {transcript.text.strip()}"
+        )
         return transcript.text.strip()
+
     except Exception as e:
         logger.error(f"[WHISPER ERROR] {e}", exc_info=True)
         save_extraction_error({"url": audio_url}, str(e))
         return "[audio received, transcription failed]"
+    finally:
+        # Clean temp files
+        try:
+            if os.path.exists(input_path):
+                os.remove(input_path)
+            if os.path.exists(output_wav):
+                os.remove(output_wav)
+        except:
+            pass
+
 
 def download_to_bytes(url):
     resp = requests.get(url, timeout=60)
