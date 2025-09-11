@@ -220,7 +220,7 @@ def build_json_prompt_with_reasoning(base_prompt, example_json):
     return base_prompt.strip() + "\n\n" + json_instruction
 
 # === MESSAGE DEDUPLICATION ===
-def is_duplicate_message(user_phone, msg_text, window_seconds=5):
+def is_duplicate_message(user_phone, msg_text, window_seconds=180):
     """Check if message is duplicate within time window"""
     msg_hash = hashlib.md5(f"{user_phone}:{msg_text}".encode()).hexdigest()
     current_time = time.time()
@@ -233,7 +233,7 @@ def is_duplicate_message(user_phone, msg_text, window_seconds=5):
         MESSAGE_HASH_CACHE[msg_hash] = current_time
         # Clean old entries
         keys_to_remove = [k for k, v in MESSAGE_HASH_CACHE.items() 
-                         if current_time - v > 60]
+                         if current_time - v > window_seconds]
         for k in keys_to_remove:
             MESSAGE_HASH_CACHE.pop(k, None)
     
@@ -1632,7 +1632,7 @@ def detect_customer_intent(message_text, session_context, bot, session_id=None, 
             previous_messages = (Message.query
                 .filter_by(bot_id=bot_id, customer_phone=customer_phone, session_id=str(session_id))
                 .order_by(Message.created_at.desc())
-                .limit(10)
+                .limit(20)
                 .all())
             
             if previous_messages:
