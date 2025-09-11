@@ -431,16 +431,12 @@ def extract_text_from_image(img_url, prompt=None):
         save_extraction_error({"url": img_url}, str(e))
         return "[Image extraction failed]"
 
-def transcribe_audio_from_url(audio_url, language_hint=None):
+client = OpenAI()
+
+def transcribe_audio_from_url(audio_url):
     """
-    Download, normalize, and transcribe audio from a URL.
-    
-    Args:
-        audio_url (str): URL to fetch audio from.
-        language_hint (str): Optional ISO language code ("ms", "zh", "en").
-    
-    Returns:
-        str: Transcript or failure message.
+    Download audio from Wassenger and transcribe using GPT-4o mini.
+    Always attempts transcription regardless of duration.
     """
     try:
         # Download raw audio from Wassenger
@@ -449,59 +445,45 @@ def transcribe_audio_from_url(audio_url, language_hint=None):
             logger.error("[AUDIO DOWNLOAD] Failed or too small")
             return "[audio received, transcription failed]"
         
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as temp_in:
+        # Save to a temp file (keep original format like .ogg or .mp3)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as temp_in:
             temp_in.write(audio_bytes)
             temp_in.flush()
             input_path = temp_in.name
 
-        # Prepare clean WAV file
-        output_wav = input_path + ".wav"
-
-        # Run ffmpeg to convert any format → 16kHz mono WAV
-        cmd = [
-            "ffmpeg", "-y", "-i", input_path,
-            "-ar", "16000", "-ac", "1", output_wav
-        ]
-        subprocess.run(cmd, capture_output=True)
-
-        # Probe duration using ffprobe (for logging only)
-        try:
-            probe = subprocess.run(
-                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                 "-of", "default=noprint_wrappers=1:nokey=1", output_wav],
-                capture_output=True, text=True
-            )
-            duration = float(probe.stdout.strip()) if probe.stdout.strip() else 0.0
-        except Exception:
-            duration = 0.0
-
-        # Always attempt transcription, regardless of duration
-        with open(output_wav, "rb") as audio_file:
-            transcript = openai.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file,
-                language=language_hint  # None = auto detect
+        # Send to GPT-4o mini with audio modality
+        with open(input_path, "rb") as f:
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                modalities=["text", "audio"],
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a transcription assistant. Output only the spoken words clearly."
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_audio", "audio": f}
+                        ]
+                    }
+                ]
             )
 
-        logger.info(
-            f"[WHISPER] Transcript ({duration:.2f}s, lang={language_hint or 'auto'}): {transcript.text.strip()}"
-        )
-        return transcript.text.strip()
+        transcript = response.choices[0].message["content"][0]["text"].strip()
+        logger.info(f"[GPT-4o TRANSCRIPT] {transcript}")
+        return transcript
 
     except Exception as e:
-        logger.error(f"[WHISPER ERROR] {e}", exc_info=True)
+        logger.error(f"[GPT-4o ERROR] {e}", exc_info=True)
         save_extraction_error({"url": audio_url}, str(e))
         return "[audio received, transcription failed]"
     finally:
-        # Clean temp files
         try:
             if os.path.exists(input_path):
                 os.remove(input_path)
-            if os.path.exists(output_wav):
-                os.remove(output_wav)
         except:
             pass
-
 
 def download_to_bytes(url):
     resp = requests.get(url, timeout=60)
