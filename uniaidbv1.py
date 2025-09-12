@@ -1689,7 +1689,7 @@ def detect_customer_intent(message_text, session_context, bot, session_id=None, 
         response = openai.chat.completions.create(
             model="gpt-4o",
             messages=[
-                {"role": "system", "content": "You are an intent classifier. Reply with only: new_request, follow_up, or unclear"},
+                {"role": "system", "content": "You are an intent classifier. Reply with only:  follow_up, or unclear"},
                 {"role": "user", "content": intent_prompt}
             ],
             max_tokens=1000,
