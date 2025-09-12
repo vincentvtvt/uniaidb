@@ -1673,13 +1673,13 @@ def detect_customer_intent(message_text, session_context, bot, session_id=None, 
         Customer's NEW message: {message_text}
         
         Based on the conversation history and context, determine if this is:
-        1.  - Customer wants a DIFFERENT or ADDITIONAL service/product than what was discussed
+        1. NewApplication - Customer wants a DIFFERENT or ADDITIONAL service/product than what was discussed
         2. follow_up - Customer is asking about their EXISTING request/application that was already processed
         3. unclear - Cannot determine intent clearly or message is too vague
         
         Important considerations:
         - If the lead was already created (session was WON), and customer is asking about status/updates, it's a follow_up
-        - If customer explicitly mentions wanting something different from {previous_service}, it's a 
+        - If customer explicitly mentions wanting something different from {previous_service}, it's a new application
         - Simple greetings, acknowledgments, or thank you messages after a closed session are usually follow_up
         - Look at the conversation flow to understand if this is continuation or new topic
         
