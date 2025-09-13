@@ -222,28 +222,18 @@ def build_json_prompt_with_reasoning(base_prompt, example_json):
 # === MESSAGE DEDUPLICATION ===
 def is_duplicate_message(user_phone, msg_text, window_seconds=180):
     """Check if message is duplicate within time window"""
-    # Normalize the text BEFORE hashing
-    normalized_text = re.sub(r'\s+', ' ', (msg_text or '').strip().lower())
-    msg_hash = hashlib.md5(f"{user_phone}:{normalized_text}".encode()).hexdigest()
-    
+    msg_hash = hashlib.md5(f"{user_phone}:{msg_text}".encode()).hexdigest()
     current_time = time.time()
     
     with BUFFER_LOCK:
         if msg_hash in MESSAGE_HASH_CACHE:
-            last_seen = MESSAGE_HASH_CACHE[msg_hash]
-            time_diff = current_time - last_seen
-            
-            if time_diff < window_seconds:
-                logger.info(f"[DUPLICATE] Message seen {time_diff:.1f}s ago (within {window_seconds}s window)")
+            if current_time - MESSAGE_HASH_CACHE[msg_hash] < window_seconds:
                 return True
-            else:
-                logger.info(f"[DUPLICATE] Message seen {time_diff:.1f}s ago (outside window, allowing)")
         
         MESSAGE_HASH_CACHE[msg_hash] = current_time
-        
-        # Clean old entries more conservatively
+        # Clean old entries
         keys_to_remove = [k for k, v in MESSAGE_HASH_CACHE.items() 
-                         if current_time - v > window_seconds * 2]  # Keep for 2x the window
+                         if current_time - v > window_seconds]
         for k in keys_to_remove:
             MESSAGE_HASH_CACHE.pop(k, None)
     
