@@ -220,7 +220,7 @@ def build_json_prompt_with_reasoning(base_prompt, example_json):
     return base_prompt.strip() + "\n\n" + json_instruction
 
 # === MESSAGE DEDUPLICATION ===
-def is_duplicate_message(user_phone, msg_text, window_seconds=180):
+def is_duplicate_message(user_phone, msg_text, window_seconds=300):
     """Check if message is duplicate within time window"""
     msg_hash = hashlib.md5(f"{user_phone}:{msg_text}".encode()).hexdigest()
     current_time = time.time()
@@ -1607,7 +1607,7 @@ def close_session(session, reason, info: dict = None):
 def detect_customer_intent(message_text, session_context, bot, session_id=None, customer_phone=None, bot_id=None):
     """
     Enhanced intent detection with conversation history from closed session
-    Returns: '', 'follow_up', or 'unclear'
+    Returns: 'follow_up', or 'unclear'
     """
     
     # Keywords that indicate NEW request
@@ -1665,7 +1665,7 @@ def detect_customer_intent(message_text, session_context, bot, session_id=None, 
         - Service discussed: {previous_service}
         - Session close reason: {close_reason}
         - Lead was created: {lead_created}
-        - Days since closed: Within 14 days
+        - Days since closed: Within 30 days
         
         Previous conversation (last 10 messages):
         {previous_messages_text if previous_messages_text else "No previous messages available"}
@@ -1673,9 +1673,8 @@ def detect_customer_intent(message_text, session_context, bot, session_id=None, 
         Customer's NEW message: {message_text}
         
         Based on the conversation history and context, determine if this is:
-        1. NewApplication - Customer wants a DIFFERENT or ADDITIONAL service/product than what was discussed
-        2. follow_up - Customer is asking about their EXISTING request/application that was already processed
-        3. unclear - Cannot determine intent clearly or message is too vague
+        1. follow_up - Customer is asking about their EXISTING request/application that was already processed
+        2. unclear - Cannot determine intent clearly or message is too vague
         
         Important considerations:
         - If the lead was already created (session was WON), and customer is asking about status/updates, it's a follow_up
@@ -1683,7 +1682,7 @@ def detect_customer_intent(message_text, session_context, bot, session_id=None, 
         - Simple greetings, acknowledgments, or thank you messages after a closed session are usually follow_up
         - Look at the conversation flow to understand if this is continuation or new topic
         
-        Respond with ONLY one word: new_request, follow_up, or unclear
+        Respond with ONLY one word: follow_up, or unclear
         """
         
         response = openai.chat.completions.create(
@@ -1710,14 +1709,11 @@ def detect_customer_intent(message_text, session_context, bot, session_id=None, 
     message_lower = message_text.lower()
     
     # Check for explicit new request keywords
-    new_score = sum(1 for keyword in new_request_keywords if keyword in message_lower)
     follow_score = sum(1 for keyword in follow_up_keywords if keyword in message_lower)
     
-    logger.info(f"[INTENT DETECTION] Keyword scores - New: {new_score}, Follow-up: {follow_score}")
+    logger.info(f"[INTENT DETECTION] Keyword scores - Follow-up: {follow_score}")
     
-    if new_score > follow_score:
-        return 'new_request'
-    elif follow_score > new_score:
+    if follow_score > new_score:
         return 'follow_up'
     else:
         return 'unclear'
