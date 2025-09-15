@@ -1700,7 +1700,7 @@ def detect_customer_intent(message_text, session_context, bot, session_id=None, 
         logger.info(f"[INTENT DETECTION] AI detected: {ai_intent} for message: {message_text[:50]}...")
         
         # Validate AI response
-        if ai_intent in ['new_request', 'follow_up', 'unclear']:
+        if ai_intent in ['follow_up', 'unclear']:
             return ai_intent
         
     except Exception as e:
