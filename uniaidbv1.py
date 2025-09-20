@@ -595,7 +595,7 @@ def extract_text_from_message(msg):
                 try:
                     transcript = transcribe_audio_from_url(audio_url)
                     if transcript and transcript.lower() not in ("[audio received, no url]", "[audio received, transcription failed]"):
-                        gpt_prompt = f"This is a WhatsApp audio message transcribed as: '{transcript}'. Summarize it."
+                        gpt_prompt = f"The following is a WhatsApp audio message in its original language. Summarize it in the same language without translation: '{transcript}'."
                         result = openai.chat.completions.create(
                             model="gpt-4o",
                             messages=[{"role": "system", "content": gpt_prompt}],
